@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "aicratedigger-backend"
+version = "0.1.0"
+description = "AiCrateDigg FastAPI backend"
+authors = ["AiCrateDigg Team"]
+readme = "README.md"
+packages = [{ include = "app" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "*"
+uvicorn = { extras = ["standard"], version = "*" }
+pydantic-settings = "*"
+sqlalchemy = "*"
+asyncpg = "*"
+openai = "*"
+httpx = "*"
+crawl4ai = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

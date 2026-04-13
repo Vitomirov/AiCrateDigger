@@ -1,0 +1,64 @@
+# AiCrateDigg — Cursor Rules (v2.0)
+
+## Project Identity
+AI-powered global music format search. Finding real listings for Vinyl, CD, and Cassettes 
+worldwide using "Local-First" search logic. User types natural language, and the app finds buyable items.
+
+## Tech Stack — NEVER DEVIATE
+- **Backend:** Python 3.11, FastAPI, Pydantic v2, SQLAlchemy 2.0, Crawl4AI, httpx, Poetry
+- **Frontend:** Next.js 14 (App Router), TypeScript 5 (Strict), Tailwind CSS 3, Shadcn/UI
+- **AI:** OpenAI `gpt-4o-mini` only (using AsyncOpenAI)
+- **Search:** Tavily API (Search Depth: Advanced)
+- **Music API:** Discogs REST API v2
+- **Database:** PostgreSQL 15 + SQLAlchemy
+- **Infrastructure:** Docker, Docker Compose
+
+## Global Search & Language Logic (CRITICAL)
+- **Local-First Rule:** If the query is in a specific language (e.g., Serbian), Agent 2 MUST generate queries targeting that country's top marketplaces (e.g., KupujemProdajem, Kupindo) using `.rs` or `.com` with local keywords.
+- **Ambiguous English/Spanish:** Default to UK (for English) or Spain (for Spanish) unless a country is explicitly mentioned.
+- **Domain Heuristics:** Agent 2 must use its internal knowledge to identify the top 3 marketplace brands for the target country (e.g., "Mercado Libre" for LatAm, "Yahoo Auctions" for Japan, "OLX" for Bulgaria).
+- **No Global Noise:** Strictly avoid US-based results (eBay.com, Amazon) when a local European, Asian, or Balkan country is detected, unless requested.
+
+## Folder Structure — STRICT
+- `backend/app/agents/` (parser.py, query_generator.py, extractor.py)
+- `backend/app/services/` (tavily_service.py, crawl_service.py, discogs_service.py)
+- `backend/app/routers/` (search.py, stream.py)
+- `backend/app/models/` (search_query.py, result.py)
+- `backend/app/db/` (database.py, cache.py)
+- `frontend/components/` (ChatInput.tsx, ResultCard.tsx, ReasoningPanel.tsx)
+- `frontend/lib/api.ts` (SSE EventSource & Fetch logic)
+
+## AI Agent Rules
+- **Agent 1 (Parser):** Temperature 0. Resolves artist/album (e.g., "2nd album" -> "Strange Days") and extracts Lang/Country.
+- **Agent 2 (Query Gen):** Temperature 0.3. Generates 3-5 localized search strings. MUST include local marketplace names.
+- **Agent 3 (Extractor):** Temperature 0. Converts Crawl4AI Markdown into strict `ListingResult` JSON.
+- **Strict JSON:** Always use `response_format={"type": "json_object"}`.
+
+## Scraping Rules (Crawl4AI)
+- Always use `AsyncWebCrawler`.
+- Use `magic_markdown=True` to minimize token usage for Agent 3.
+- Set `bypass_cache=True` for fresh results.
+- Implement a 15-second timeout per URL.
+- Handle common selectors for Price and Condition in markdown extraction.
+
+## Frontend & UI (ChatGPT Minimalist)
+- **Theme:** Deep Dark (`bg-zinc-950`).
+- **Layout:** Centered single column (max-w-3xl).
+- **Input:** Large ChatGPT-like sticky input at the bottom or center.
+- **Streaming:** Use Server-Sent Events (SSE). Results must "pop in" one by one.
+- **ReasoningPanel:** Show AI thoughts (e.g., "Identifying top Serbian marketplaces...") before and during result streaming.
+- **Cards:** `bg-zinc-900` with `border-zinc-800`. Clean typography using Inter/Geist.
+
+## Python & Async Rules
+- All route handlers, agents, and services MUST be `async def`.
+- Use `asyncio.gather` for parallel Tavily/Discogs calls.
+- Type hints are mandatory for all function arguments and return values.
+- No `print()` — use `logging`.
+
+## Environment Variables
+- `OPENAI_API_KEY`, `TAVILY_API_KEY`, `DISCOGS_TOKEN`, `DATABASE_URL`
+
+## General Rules
+- Comments in English.
+- Use `httpx` for all async HTTP requests.
+- Error handling: Every service call must be wrapped in try/except; return empty defaults on failure.

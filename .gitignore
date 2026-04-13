@@ -1,0 +1,19 @@
+# Credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+
+# Node/Next.js
+node_modules/
+.next/
+out/
+build/
+
+# Docker/OS
+.DS_Store
+*.log
