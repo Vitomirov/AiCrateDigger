@@ -16,6 +16,7 @@ asyncpg = "*"
 openai = "*"
 httpx = "*"
 crawl4ai = "*"
+tavily-python = "^0.3.5"
 
 [build-system]
 requires = ["poetry-core"]

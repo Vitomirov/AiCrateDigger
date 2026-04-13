@@ -41,6 +41,13 @@ worldwide using "Local-First" search logic. User types natural language, and the
 - Implement a 15-second timeout per URL.
 - Handle common selectors for Price and Condition in markdown extraction.
 
+## Validation & Ranking Logic (Mathematical Approach)
+- **Zero-Hardcode Policy:** Never use static lists of keywords for filtering (e.g., no hardcoded "vinyl", "kassette").
+- **Vector-Based Scoring:** Every search result MUST be evaluated using a scoring function: $Score = (ArtistMatch \times W1) + (MarketplaceSignal \times W2) + (ContextIntersection \times W3)$.
+- **URL Normalization:** Always strip tracking parameters (e.g., `?srsltid=...`) before deduplication to prevent duplicate listings.
+- **Stemming-Lite:** For token comparison, use case-insensitive substring matching or basic character-overlap (Levenshtein) to handle grammatical inflections (padeži) without language-specific dictionaries.
+- **Location Decoupling:** Use Location (City/Country) only for Query Generation (Tavily). In Searcher validation, treat Location as an optional "boost" rather than a hard constraint to avoid false negatives.
+
 ## Frontend & UI (ChatGPT Minimalist)
 - **Theme:** Deep Dark (`bg-zinc-950`).
 - **Layout:** Centered single column (max-w-3xl).

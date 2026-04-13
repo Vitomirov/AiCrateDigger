@@ -27,3 +27,18 @@ class SearchQueries(BaseModel):
         max_length=5,
         description="3-5 generated localized search query strings",
     )
+
+
+class SearchResult(BaseModel):
+    title: str = Field(..., description="Listing page title")
+    url: str = Field(..., description="Listing URL")
+    content: str = Field(..., description="Extracted snippet/content from search engine")
+    score: float = Field(..., description="Relevance score from Tavily")
+    raw_price: str | None = Field(default=None, description="Raw price text if available")
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResult] = Field(
+        default_factory=list,
+        description="Aggregated deduplicated search results",
+    )
