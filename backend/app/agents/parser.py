@@ -17,13 +17,13 @@ Your task:
    - Examples: "first album", "debut", "latest release", "2nd album".
    - Convert these to an explicit album/release title whenever possible.
 3) Detect the language of the user query and map it to a primary country:
-   - Example: Serbian -> Serbia. Norvegian -> Norway.
+   - Example: Serbian -> Serbia.
    - If the language is ambiguous (English/Spanish), default to UK for English and Spain for Spanish.
 4) Normalize format to exactly one of: Vinyl, CD, Cassette.
-5) Detect the city of the user query and map it to a city name.
-6) The language field must always match the language of the original_query. 
-example: If the user asks in Serbian about Germany, language is 'Serbian' and country is 'Germany'
-6) Preserve the original user text in original_query.
+5) Detect the city in the query when present; otherwise set city to null.
+6) The language field must always match the language of original_query.
+   Example: if the user writes in Serbian about Germany, language is Serbian and country is Germany.
+7) Preserve the original user text in original_query.
 
 Output requirements:
 - Return ONLY valid JSON.
@@ -33,7 +33,7 @@ Output requirements:
     "album": "string",
     "format": "Vinyl|CD|Cassette",
     "country": "string",
-    "city": "string",
+    "city": "string|null",
     "language": "string",
     "original_query": "string"
   }
