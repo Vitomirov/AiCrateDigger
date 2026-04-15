@@ -12,7 +12,7 @@ from app.models.search_query import SearchResult
 logger = logging.getLogger(__name__)
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-MAX_RESULTS_PER_QUERY = 6
+MAX_RESULTS_PER_QUERY = 10
 REQUEST_TIMEOUT_SECONDS = 15.0
 MAX_AI_BATCH_SIZE = 10
 MAX_FINAL_RESULTS = 4
@@ -33,7 +33,7 @@ async def _verify_results_with_ai(
     music_format: str,
     country: str,
     city: str | None,
-) -> dict[str, float]:
+) -> dict[str, dict[str, float | str | None]]:
     if not results:
         return {}
 
@@ -56,41 +56,46 @@ async def _verify_results_with_ai(
     }
 
     system_prompt = """
-You are a professional crate-digger.
-For each result, determine if it is a REAL listing (sale/offer) for the requested artist/release and format in or near the requested location.
-You must recognize prices in ANY currency (symbols or local words) and formats in ANY language.
-Return strict JSON only with this shape:
+### ROLE
+You are the World's Best Crate-Digger. You have spent years in dusty basements from New Delhi to Apatin. You know how people sell music online: sometimes they are messy, sometimes they use slang, but you always find the prize.
+
+### OBJECTIVE
+Analyze the search results to find REAL listings (sales/offers) for the requested [Artist], [Album], and [Format] in the [Location]. 
+
+### THE CRATE-DIGGER'S BRAIN (Logic)
+1.  **Bridge the Language:** You know that "Vinyl" is "Ploča" in Serbia, "Disco de vinil" in Brazil, and "ЛП" in Bulgaria. You treat these as 100% matches.
+2.  **Sniff Out the Price:** Don't wait for a "Price:" label. Look for numbers near currency symbols ($, €, £, руб, din, R$, ₹). If the title says "The Clash - CD - 15.67", you grab 15.67. NO ROUNDING.
+3.  **Geographic Intuition:** - If the site is local (e.g., .rs, .br, .in, .bg) and the language is local, it's a LOCAL MATCH.
+    - If the title or content mentions a neighborhood, street, or shop name (e.g., "Dorćol", "Rua Augusta", "Northern Quarter"), extract that as the location.
+    - Use your global knowledge: A listing on "KupujemProdajem" with a Serbian description is a "Serbia" match, even if the city isn't explicitly typed out.
+
+### EXTRACTION RULES (Critical)
+* **Price vs. Shipping:** NEVER extract shipping costs (e.g., "Shipping starts at 5.99 €") as the product price. Look for the main item price near "Add to Cart" or "Price:" labels. If a number is followed by "shipping" or "dostava", IGNORE IT for the price field.
+* **Origin vs. Location:** Do NOT confuse the artist's origin (e.g., "Origin: Norway") with the store's location. 
+    - Check the TLD (.fi is Finland, .no is Norway, .rs is Serbia). 
+    - Use the page language as a hint (e.g., Finnish text = Finland location).
+    - If the text says 'Produced in [City]' or 'Based in [City]', treat that city as the location.
+* **Location Details:** Look for phone area codes, district names, or shop names (e.g., "Record Shop X"). If it's just a country-wide site, use the Country name. Only use 'null' if it's a total ghost town.
+
+### SCORING SYSTEM (The "Vibe" Meter)
+- **1.0 - 0.8 (The Jackpot):** Perfect Artist/Format match + Local domain OR local address mentioned. It's in the user's backyard.
+- **0.7 - 0.6 (The Road Trip):** Perfect Artist/Format match + National site (ships to the user's city).
+- **0.5 - 0.3 (The Long Haul):** Global giants (eBay, Discogs, Amazon). Only use these if local shops are empty.
+- **0.0 (The Trash):** Not the right artist, out of stock, or just a review/YouTube link.
+
+### OUTPUT SCHEMA (STRICT JSON)
 {
   "scores": [
-    {"url": "string", "score": 0.0}
+    {
+      "url": "string",
+      "score": float,
+      "price": "string|null",
+      "location": "string|null"
+    }
   ]
 }
-Rules:
-- score must be a float from 0.0 to 1.0.
-- evaluate each URL independently.
-- use title and snippet content evidence.
 
-RANKING-FIRST POLICY (do not be overly strict):
-- Prefer scoring and ranking over discarding.
-- Do NOT return an empty set of good candidates if there are any results that match the requested Artist and Format.
-
-LOCATION + LOCALITY (high-intensity local ranking):
-- TLD SUPREMACY: always rank target-country TLDs at the very top when location is specified (e.g., .ru for Russia, .rs for Serbia).
-- Contextual inference is allowed: if the page language appears local (e.g., Russian) and the domain is the target TLD, treat it as a LOCAL MATCH even if the city name is not present.
-- If the domain is a known local marketplace (e.g., Avito, Youla) and language appears local, treat it as LOCAL MATCH for a city within that country (e.g., Moscow).
-
-LOCAL VS GLOBAL WEIGHTS:
-- Local Match score band (1.0 - 0.8): correct Artist + correct Format + (target-country TLD OR strong local-language signals).
-- Regional/nearby score band (0.8 - 0.6): correct Artist + correct Format + in-country marketplace/shop that ships nationally (even if city unclear).
-- Global/Proxy score band (0.5 - 0.3): correct Artist + correct Format + global site (Discogs/eBay/etc.) — ONLY use this band if no meaningful local/regional matches exist.
-
-LANGUAGE BRIDGE:
-- Treat these as identical for scoring purposes: "кассета", "kaseti", "cassette".
-- Apply the same equivalence logic for the requested format in any language (you must bridge synonyms/transliterations).
-
-OUTPUT GUIDANCE:
-- Use score 0.0 only when it is clearly NOT a relevant listing for the requested Artist and Format.
-- Otherwise always assign a score, and enforce the strict local-first ordering via higher scores.
+Final instruction: Be a detective, be precise, and find that music!
 """.strip()
 
     try:
@@ -111,7 +116,7 @@ OUTPUT GUIDANCE:
     try:
         parsed = json.loads(content)
         rows = parsed.get("scores", [])
-        normalized_scores: dict[str, float] = {}
+        normalized_scores: dict[str, dict[str, float | str | None]] = {}
         for row in rows:
             url = _normalize_url(str(row.get("url", "")))
             if not url:
@@ -121,7 +126,15 @@ OUTPUT GUIDANCE:
             except (TypeError, ValueError):
                 score = 0.0
             bounded_score = max(0.0, min(1.0, score))
-            normalized_scores[url] = bounded_score
+            extracted_price = row.get("price")
+            extracted_location = row.get("location")
+            normalized_scores[url] = {
+                "score": bounded_score,
+                "price": str(extracted_price).strip() if extracted_price is not None else None,
+                "location": (
+                    str(extracted_location).strip() if extracted_location is not None else None
+                ),
+            }
         return normalized_scores
     except Exception:
         logger.exception("AI verification returned invalid payload: %s", content)
@@ -141,6 +154,8 @@ async def _search_single_query(
         "include_answer": False,
         "include_images": False,
         "include_raw_content": False,
+        "include_domains": [],
+        "exclude_domains": []
     }
 
     try:
@@ -173,12 +188,12 @@ async def _search_single_query(
             url=_normalize_url(url=url),
             content=content,
             score=score,
-            raw_price=None,
+            price=None,
+            extracted_location=None,
         )
         results.append(candidate)
 
     return results
-
 
 async def run_tavily_search(
     queries: list[str],
@@ -229,8 +244,16 @@ async def run_tavily_search(
 
     verified_results: list[SearchResult] = []
     for candidate in ai_batch:
-        ai_score = ai_scores.get(candidate.url, 0.0)
-        candidate.score = ai_score
+        ai_row = ai_scores.get(candidate.url, {})
+        ai_score = ai_row.get("score", 0.0)
+        try:
+            candidate.score = float(ai_score)
+        except (TypeError, ValueError):
+            candidate.score = 0.0
+        candidate.price = ai_row.get("price") if isinstance(ai_row.get("price"), str) else None
+        candidate.extracted_location = (
+            ai_row.get("location") if isinstance(ai_row.get("location"), str) else None
+        )
         verified_results.append(candidate)
 
     verified_results.sort(key=lambda result: result.score, reverse=True)

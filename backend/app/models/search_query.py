@@ -34,7 +34,11 @@ class SearchResult(BaseModel):
     url: str = Field(..., description="Listing URL")
     content: str = Field(..., description="Extracted snippet/content from search engine")
     score: float = Field(..., description="Relevance score from Tavily")
-    raw_price: str | None = Field(default=None, description="Raw price text if available")
+    price: str | None = Field(default=None, description="Extracted listing price with currency")
+    extracted_location: str | None = Field(
+        default=None,
+        description="Most specific extracted location from snippet",
+    )
 
 
 class SearchResponse(BaseModel):

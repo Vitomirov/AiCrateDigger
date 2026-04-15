@@ -9,7 +9,7 @@ from app.models.search_query import ParsedQuery
 logger = logging.getLogger(__name__)
 
 PARSER_SYSTEM_PROMPT = """
-You are Agent 1 (Parser) for AiCrateDigg.
+You are Agent 1 (Parser) for AiCrateDigger.
 
 Your task:
 1) Parse a user music search query into a strict JSON object that matches the ParsedQuery schema.
