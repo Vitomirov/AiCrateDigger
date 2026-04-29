@@ -2,8 +2,8 @@
 references ("2nd album", "latest", "debut") DETERMINISTICALLY instead of letting
 the LLM hallucinate a title.
 
-We intentionally keep this module small and stateless — one public coroutine
-(`resolve_album_by_index`) is all the parser needs.
+The parser also uses `resolve_album_by_index`, `get_artist_discography`,
+and `search_release_by_track`.
 """
 
 from __future__ import annotations
@@ -223,3 +223,122 @@ async def resolve_album_by_index(*, artist: str, album_index: int) -> DiscogsRes
         },
     )
     return DiscogsResolution(album=picked, index=idx, confidence=confidence)
+
+
+async def get_artist_discography(artist: str) -> list[DiscogsAlbum]:
+    """Filtered studio-main release rows for ``artist``, chronological order."""
+
+    settings = get_settings()
+    if not artist.strip():
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=settings.discogs_timeout_seconds) as client:
+            artist_id = await _search_artist(client, artist)
+            if not artist_id:
+                return []
+            releases = await _fetch_releases(client, artist_id)
+        return _filter_studio_albums(releases)
+    except Exception:
+        logger.exception("get_artist_discography_failed")
+        return []
+
+
+def _album_from_track_search_hit(hit: dict, track: str) -> DiscogsAlbum | None:
+    """Map one Discogs database/search row to a candidate album title."""
+
+    tit = str(hit.get("title") or "").strip()
+    ht = hit.get("type")
+    if not tit:
+        return None
+    hid = hit.get("id")
+    try:
+        hid_i = int(hid) if hid is not None else None
+    except (TypeError, ValueError):
+        hid_i = None
+
+    if ht == "master":
+        return DiscogsAlbum(
+            title=tit,
+            year=None,
+            artist_id=0,
+            master_id=hid_i,
+        )
+    if ht != "release":
+        return None
+
+    tr_l = track.lower()
+    for sep in (" – ", " - "):
+        if sep not in tit:
+            continue
+        _left, right = [p.strip() for p in tit.split(sep, maxsplit=1)]
+        rl = right.lower()
+        if len(right) > 2 and (tr_l not in rl or rl != tr_l):
+            return DiscogsAlbum(
+                title=right,
+                year=None,
+                artist_id=0,
+                master_id=None,
+            )
+
+    for sep in (" – ", " - "):
+        if sep in tit:
+            sub = tit.split(sep, maxsplit=1)[1].strip()
+            if len(sub) > 2:
+                return DiscogsAlbum(
+                    title=sub,
+                    year=None,
+                    artist_id=0,
+                    master_id=None,
+                )
+
+    return DiscogsAlbum(
+        title=tit,
+        year=None,
+        artist_id=0,
+        master_id=None,
+    )
+
+
+async def search_release_by_track(artist: str, track: str) -> list[DiscogsAlbum]:
+    """Discogs database/search hits for ``artist`` + ``track`` (deduped by title)."""
+
+    settings = get_settings()
+    artist = artist.strip()
+    track = track.strip()
+    if not artist or not track:
+        return []
+
+    queries = (f'{artist} "{track}"', f"{artist} {track}")
+    collected: list[DiscogsAlbum] = []
+    seen_titles: set[str] = set()
+    try:
+        async with httpx.AsyncClient(timeout=settings.discogs_timeout_seconds) as client:
+            for q in queries:
+                for kind in ("master", "release"):
+                    try:
+                        resp = await client.get(
+                            f"{settings.discogs_base_url}/database/search",
+                            params={"q": q, "type": kind, "per_page": 25, "page": 1},
+                            headers=_headers(),
+                        )
+                        resp.raise_for_status()
+                        blob = resp.json() or {}
+                    except httpx.HTTPError:
+                        continue
+                    except Exception:
+                        logger.exception("search_release_by_track_http")
+                        continue
+
+                    for hit in blob.get("results") or []:
+                        album = _album_from_track_search_hit(hit, track)
+                        if album is None:
+                            continue
+                        key = album.title.strip().lower()
+                        if key in seen_titles:
+                            continue
+                        seen_titles.add(key)
+                        collected.append(album)
+    except Exception:
+        logger.exception("search_release_by_track_failed")
+        return []
+    return collected

@@ -39,6 +39,18 @@ class TavilyIntent:
 
 logger = logging.getLogger(__name__)
 
+FORBIDDEN_DOMAINS = (
+    "ebay.com",
+    "amazon.",
+    "acousticsounds.com",
+)
+
+
+def is_valid_result(url: str) -> bool:
+    u = url.lower()
+    return not any(domain in u for domain in FORBIDDEN_DOMAINS)
+
+
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 MAX_RESULTS_PER_QUERY = 10
 MAX_RESULTS_PER_DOMAIN = 3
@@ -148,6 +160,8 @@ async def run_tavily_search(
         if isinstance(task_result, list):
             for res in task_result:
                 if res.score < MIN_TAVILY_SCORE:
+                    continue
+                if not is_valid_result(res.url):
                     continue
                 existing = unique_by_url.get(res.url)
                 if existing is None or res.score > existing.score:
