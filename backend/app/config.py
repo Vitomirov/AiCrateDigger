@@ -1,23 +1,20 @@
 from functools import lru_cache
 
+import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     openai_api_key: str
     tavily_api_key: str
-    discogs_token: str
+    discogs_token: str | None = None
     database_url: str
-    # Local persistent directory for Chroma vector store.
+
     chroma_db_dir: str = "./chroma_db"
 
-    # --- Observability / behavior flags ---
-    # When `debug=true`, API handlers attach the full PipelineContext trace under
-    # the `debug` key of the response body. Driven by the `DEBUG` env var.
     debug: bool = False
     log_level: str = "INFO"
 
-    # --- Discogs (used by the parser to deterministically resolve "nth album") ---
     discogs_base_url: str = "https://api.discogs.com"
     discogs_user_agent: str = "AiCrateDigger/0.1 (+https://github.com/ai-cratedigger)"
     discogs_timeout_seconds: float = 8.0
@@ -28,7 +25,37 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    def verify_discogs(self) -> bool:
+        """
+        Minimal runtime check:
+        - verifies API reachable
+        - verifies auth header works (if token exists)
+        """
+        headers = {
+            "User-Agent": self.discogs_user_agent,
+            "Accept": "application/json",
+        }
+
+        if self.discogs_token:
+            headers["Authorization"] = f"Discogs token={self.discogs_token}"
+
+        try:
+            with httpx.Client(timeout=self.discogs_timeout_seconds) as client:
+                r = client.get(
+                    f"{self.discogs_base_url}/",
+                    headers=headers,
+                )
+                return r.status_code == 200
+        except Exception:
+            return False
+
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+
+    # 🔥 QUICK DISC0GS CHECK (runs once per process)
+    ok = s.verify_discogs()
+    print(f"[DISC0GS CHECK] API OK = {ok}")
+
+    return s
