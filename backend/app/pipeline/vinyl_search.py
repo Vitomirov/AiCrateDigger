@@ -16,9 +16,9 @@ from app.llm.parse_user_query import parse_user_query
 from app.models.result import ListingResult
 from app.pipeline_context import stage_timer
 from app.policies.eu_stores import get_active_stores
-from app.policies.search_dsl import build_query
+from app.policies.search_dsl import build_query_core, build_tavily_core_query
 from app.services.discogs_service import resolve_album_by_index
-from app.services.tavily_service import run_tavily_search
+from app.services.tavily_service import run_tavily_for_store_domains
 from app.validators.listings import validate_listing
 
 logger = logging.getLogger(__name__)
@@ -67,11 +67,12 @@ def _listing_to_api_row(listing: Any) -> ListingResult:
     if len(title) < 5:
         title = f"{title} · shop"
     price_str = None
+    cur = listing.currency or "EUR"
     try:
         if listing.price is not None and float(listing.price) > 0:
-            price_str = f"{float(listing.price):.2f} {listing.currency}".rstrip("0").rstrip(".")
+            price_str = f"{float(listing.price):.2f} {cur}".rstrip("0").rstrip(".")
     except (TypeError, ValueError):
-        price_str = f"{listing.price} {listing.currency}" if listing.price else None
+        price_str = f"{listing.price} {cur}" if listing.price else None
     return ListingResult(
         url=listing.url,
         title=title,
@@ -120,7 +121,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         1. parse        — LLM parses the user query into ParsedQuery.
         2. discogs      — deterministic album resolution (ordinal or literal).
         3. stores       — load active EU vinyl stores from the whitelist.
-        4. query_build  — one `site:` query per store via search_dsl.
+        4. query_build  — one shared intent string + batched ``include_domains`` (not one Tavily call per store).
         5. tavily       — constrained web search backend.
         6. extract      — LLM extracts Listing JSON from the survivors.
         7. validate     — hard rules: domain allowlist, title match, price.
@@ -129,6 +130,8 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     debug_enabled = settings.debug
 
     queries: list[str] = []
+    core_query: str = ""
+    store_domains: list[str] = []
     raw_results: list[Any] = []
     listings: list[Any] = []
     validated: list[Any] = []
@@ -212,26 +215,34 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         album_title=album_title,
     )
 
-    # 4. Build queries
+    # 4. Build search intent + allowlisted domains (compression: one core query for Tavily)
     with stage_timer("query_build", input={"album": album_title}) as rec:
-        queries = [
-            build_query(parsed.artist, album_title, store.domain, parsed.location)
-            for store in stores
-        ]
-        rec.output = {"count": len(queries)}
+        # Tavily: quoted album, no location (avoids skew + junk pages; domains are EU allowlist).
+        core_query = build_tavily_core_query(parsed.artist, album_title)
+        store_domains = [s.domain for s in stores]
+        rec.output = {
+            "core_query_len": len(core_query),
+            "domains": len(store_domains),
+            "user_location_omitted_from_tavily": bool((parsed.location or "").strip()),
+        }
+
+    queries = [core_query]
 
     _log_stage(
         "after_query_build",
-        counts={"queries": len(queries)},
-        preview={"queries": [_trunc(q, 200) for q in queries[:_PREVIEW_N]]},
+        counts={"domains": len(store_domains)},
+        preview={
+            "core_query": _trunc(core_query, 200),
+            "domains_head": [_trunc(d, 80) for d in store_domains[:_PREVIEW_N]],
+        },
         artist=parsed.artist,
         album_title=album_title,
         queries=queries,
     )
 
-    # 5. Search
-    with stage_timer("tavily", input={"query_count": len(queries)}) as rec:
-        raw_results = await run_tavily_search(queries)
+    # 5. Search (batched Tavily: ceil(|domains| / chunk) HTTP calls)
+    with stage_timer("tavily", input={"domains": len(store_domains)}) as rec:
+        raw_results = await run_tavily_for_store_domains(core_query, store_domains)
         rec.output = {"count": len(raw_results)}
 
     _log_stage(
@@ -245,13 +256,36 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
 
     # 6. Extract
     with stage_timer("extract", input={"raw_count": len(raw_results)}) as rec:
-        listings = await extract_listings(
+        extract_report = await extract_listings(
             [r.model_dump() for r in raw_results],
             artist=parsed.artist,
             album=album_title,
-            allowed_domains={store.domain for store in stores},
+            allowed_domains=set(store_domains),
         )
-        rec.output = {"count": len(listings)}
+        listings = extract_report.listings
+        rec.output = {"count": len(listings), **extract_report.diagnostic}
+
+    if len(listings) == 0:
+        diag = extract_report.diagnostic
+        reason = diag.get("empty_reason") or "unknown"
+        parts = [
+            f"empty_reason={reason}",
+            f"prefilter_candidates={diag.get('prefilter_candidates')}",
+            f"llm_rows={diag.get('llm_rows_returned')}",
+            f"json_parse_ok={diag.get('json_parse_ok')}",
+            f"drop_url={diag.get('drop_url_not_in_candidates')}",
+            f"drop_title_gate={diag.get('drop_title_gate')}",
+            f"drop_pydantic={diag.get('drop_pydantic')}",
+        ]
+        logger.info(
+            "vinyl_search_extract_zero_results",
+            extra={
+                "stage": "vinyl_search",
+                "album_title": album_title,
+                "diagnostic": diag,
+                "summary": "; ".join(str(p) for p in parts),
+            },
+        )
 
     _log_stage(
         "after_extract_listings",
@@ -293,8 +327,10 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     }
     if debug_enabled:
         out["debug"] = {
-            "queries": list(queries),
-            "allowed_domains_head": sorted({store.domain for store in stores})[:25],
+            "search_core": core_query,
+            "search_core_with_location": build_query_core(parsed.artist, album_title, parsed.location),
+            "store_domains": list(store_domains),
+            "allowed_domains_head": sorted(set(store_domains))[:25],
             "stores_count": len(stores),
             "raw_results_count": len(raw_results),
             "raw_results_preview": [
@@ -306,6 +342,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 for r in raw_results[:8]
             ],
             "extracted_count": len(listings),
+            "extract_diagnostic": extract_report.diagnostic,
             "listings_preview": _preview_listings_dicts(listings, n=8),
             "validated_count": len(validated),
             "validated_preview": _preview_listings_dicts(validated, n=8),

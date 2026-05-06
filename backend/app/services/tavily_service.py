@@ -36,6 +36,9 @@ def is_valid_result(url: str) -> bool:
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 MAX_RESULTS_PER_QUERY = 10
+# Batched include_domains: fewer API calls; slightly higher cap per call for coverage.
+MAX_RESULTS_PER_BATCHED_CALL = 16
+TAVILY_DOMAIN_CHUNK_SIZE = 10
 MAX_RESULTS_PER_DOMAIN = 3
 REQUEST_TIMEOUT_SECONDS = 15.0
 # Tavily-reported relevance below this is usually noise (wrong artist/topic).
@@ -54,6 +57,33 @@ def _include_domains_for_query(query: str) -> list[str] | None:
     return [dom] if dom else None
 
 
+def _normalize_store_domain(domain: str) -> str | None:
+    d = domain.strip().lower()
+    if not d:
+        return None
+    if d.startswith("www."):
+        d = d[4:]
+    return d or None
+
+
+def _dedupe_domains(domains: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in domains:
+        n = _normalize_store_domain(raw)
+        if n is None or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
+def _chunk_domains(domains: list[str], chunk_size: int) -> list[list[str]]:
+    if chunk_size <= 0:
+        return [domains]
+    return [domains[i : i + chunk_size] for i in range(0, len(domains), chunk_size)]
+
+
 def normalize_url(url: str) -> str:
     """Strip query string, fragment, trailing slash. Lowercase host."""
     try:
@@ -65,16 +95,23 @@ def normalize_url(url: str) -> str:
         return url
 
 
-async def _search_single_query(client: httpx.AsyncClient, query: str) -> list[SearchResult]:
+async def _search_single_query(
+    client: httpx.AsyncClient,
+    query: str,
+    *,
+    include_domains: list[str] | None = None,
+    max_results: int | None = None,
+) -> list[SearchResult]:
     settings = get_settings()
+    inc = include_domains if include_domains is not None else _include_domains_for_query(query)
+    max_r = max_results if max_results is not None else MAX_RESULTS_PER_QUERY
     payload: dict[str, str | int | list[str]] = {
         "api_key": settings.tavily_api_key,
         "query": query,
         "search_depth": "advanced",
-        "max_results_per_query": MAX_RESULTS_PER_QUERY,
+        "max_results_per_query": max_r,
         "max_results_per_domain": MAX_RESULTS_PER_DOMAIN,
     }
-    inc = _include_domains_for_query(query)
     if inc:
         payload["include_domains"] = inc
 
@@ -123,6 +160,81 @@ async def _search_single_query(client: httpx.AsyncClient, query: str) -> list[Se
         return results
 
 
+async def run_tavily_for_store_domains(core_query: str, store_domains: list[str]) -> list[SearchResult]:
+    """Run one batched Tavily strategy per intent: same ``core_query``, shared ``include_domains``.
+
+    Collapses N near-duplicate ``… vinyl site:`` strings into ≤ ceil(N / chunk) HTTP calls
+    while preserving the same allowlisted domain union.
+    """
+    if not (core_query or "").strip() or not store_domains:
+        return []
+
+    q = core_query.strip()
+    domains = _dedupe_domains(list(store_domains))
+    if not domains:
+        return []
+
+    chunks = _chunk_domains(domains, TAVILY_DOMAIN_CHUNK_SIZE)
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        tasks = [
+            _search_single_query(
+                client,
+                q,
+                include_domains=chunk,
+                max_results=MAX_RESULTS_PER_BATCHED_CALL,
+            )
+            for chunk in chunks
+        ]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    unique_by_url: dict[str, SearchResult] = {}
+    for task_result in gathered:
+        if isinstance(task_result, list):
+            for res in task_result:
+                if res.score < MIN_TAVILY_SCORE:
+                    continue
+                if not is_valid_result(res.url):
+                    continue
+                existing = unique_by_url.get(res.url)
+                if existing is None or res.score > existing.score:
+                    unique_by_url[res.url] = res
+
+    sorted_candidates = sorted(unique_by_url.values(), key=lambda x: x.score, reverse=True)
+    final_results: list[SearchResult] = []
+    domain_counts: dict[str, int] = {}
+    dropped_by_domain_cap = 0
+
+    for res in sorted_candidates:
+        domain = urlparse(res.url).netloc.lower()
+        count = domain_counts.get(domain, 0)
+        if count >= MAX_RESULTS_PER_DOMAIN:
+            dropped_by_domain_cap += 1
+            continue
+        final_results.append(res)
+        domain_counts[domain] = count + 1
+
+    logger.info(
+        "tavily_aggregate",
+        extra={
+            "stage": "tavily",
+            "status": "success" if final_results else "empty",
+            "count": len(final_results),
+            "output": {
+                "batched": True,
+                "tavily_http_calls": len(chunks),
+                "unique_domains_requested": len(domains),
+                "unique_urls": len(unique_by_url),
+                "kept": len(final_results),
+                "dropped_domain_cap": dropped_by_domain_cap,
+                "top_domains": _top_domains(final_results, limit=5),
+            },
+        },
+    )
+
+    return final_results
+
+
 def _top_domains(results: list[SearchResult], *, limit: int) -> list[str]:
     counts: dict[str, int] = {}
     for r in results:
@@ -133,7 +245,11 @@ def _top_domains(results: list[SearchResult], *, limit: int) -> list[str]:
 
 
 async def run_tavily_search(queries: list[str]) -> list[SearchResult]:
-    """Run all queries in parallel, apply per-domain diversity, return unique candidates."""
+    """Run legacy per-query Tavily calls (one HTTP request per query string).
+
+    Prefer :func:`run_tavily_for_store_domains` when all queries share one intent
+    and differ only by trailing ``site:``.
+    """
     if not queries:
         return []
 
@@ -175,6 +291,8 @@ async def run_tavily_search(queries: list[str]) -> list[SearchResult]:
             "status": "success" if final_results else "empty",
             "count": len(final_results),
             "output": {
+                "batched": False,
+                "tavily_http_calls": len(queries),
                 "unique_urls": len(unique_by_url),
                 "kept": len(final_results),
                 "dropped_domain_cap": dropped_by_domain_cap,

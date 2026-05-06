@@ -1,15 +1,7 @@
-"""LLM step 2 — turn raw web-search snippets into validated `Listing` objects.
+"""LLM step 2 — turn raw web-search snippets into ``Listing`` objects.
 
-Three deterministic stages around ONE LLM call:
-
-    1. pre-filter    — domain whitelist + currency-hint sanity. Pure Python.
-    2. LLM extract   — gpt-4o-mini cleans price / currency / in_stock / title.
-                       The model NEVER decides validity.
-    3. hard validate — strict substring match (artist + album), domain
-                       re-check, Pydantic `Listing` schema (price > 0,
-                       3-letter currency, etc.). Pure Python.
-
-There is NO RAG, NO marketplace DB, NO scoring, NO fuzzy match, NO retries.
+One LLM call with lenient extraction (unknown price/currency allowed), then
+deterministic assembly. Returns :class:`ExtractListingsReport` with diagnostics.
 """
 
 from __future__ import annotations
@@ -17,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -28,72 +21,47 @@ from app.domain.listing_schema import Listing
 
 logger = logging.getLogger(__name__)
 
-# Cap candidates fed into the single LLM call. Tavily's per-domain cap means
-# survivors above this are highly diminishing returns.
 _LLM_MAX_INPUT = 15
 
-# Optional pre-filter: prefer snippets that mention money (reduces junk) but
-# do not drop allowlisted product URLs when no hint — Tavily excerpts often omit €.
-_CURRENCY_HINT_PATTERN = re.compile(
-    r"(?:€|£|\$|¥|kr\b|zł\b|"
-    r"EUR|GBP|USD|SEK|DKK|NOK|PLN|CZK|RSD|HUF|BGN|RON|CHF|HRK|ISK)",
-    re.IGNORECASE,
-)
-
-# Snippet content cap — extractor input length is the dominant cost driver.
 _SNIPPET_CHAR_CAP = 1500
 
-EXTRACTOR_SYSTEM_PROMPT = """You are a strict listing extractor. Convert each raw \
-search snippet into a structured candidate. You DO NOT decide validity — the caller \
-filters deterministically. NEVER invent data.
+EXTRACTOR_SYSTEM_PROMPT = """You extract product listings from search snippets (title + content) for vinyl record shops.
 
-OUTPUT JSON (single object, no markdown, no commentary):
+RULES
+- You MUST output exactly one JSON object per input row, in the same order, with matching "url".
+- ALWAYS emit a listing for every input row unless the snippet has no product URL (never skip a row you were given).
+- **price**: Extract from snippet if present; otherwise use `null` or `0.0` (unknown is allowed).
+- **currency**: Use ISO 4217 (EUR, GBP, USD, …) when clear from € £ $ or text; otherwise `null` (caller defaults to EUR).
+- **in_stock**:
+    - `true` only if the snippet clearly says available / in stock / can buy / add to cart.
+    - `false` ONLY if the snippet explicitly says sold out / out of stock / unavailable / nicht verfügbar.
+    - If availability is unclear, use `null` — do NOT guess "out of stock".
+- **title**: Prefer the real product title from the snippet; never invent an unrelated title.
+- **store**: Shop name or domain hint if obvious; else `null`.
+
+OUTPUT MUST BE JSON ONLY:
 {
   "listings": [
     {
-      "url":      "string",
-      "title":    "string",
-      "price":    number | null,
-      "currency": "string (ISO 4217, e.g. EUR/GBP/USD/SEK/DKK/NOK/PLN/CZK/RSD) | null",
+      "url": "string",
+      "title": "string",
+      "price": number | null,
+      "currency": "string | null",
       "in_stock": true | false | null,
-      "store":    "string | null"
+      "store": "string | null"
     }
   ]
 }
-
-RULES
-- Emit exactly ONE entry per input snippet, preserving `url` verbatim.
-- TITLE: copy the exact listing / product title. Strip ONLY marketplace
-  boilerplate ("| HHV", "Buy at JPC", "- Recordsale", "kaufen", "Online Shop").
-  Do NOT translate, paraphrase, or rewrite.
-- PRICE: parse the numeric listing price from title+content
-  ("29,99 €" → 29.99, "£24.00" → 24.00, "1.890 RSD" → 1890).
-  Always use period as decimal separator. If no clear price → null.
-- CURRENCY: 3-letter ISO 4217 derived from the symbol or text:
-    €  → EUR
-    £  → GBP
-    $  → USD
-    kr → SEK / DKK / NOK (use whichever the page hints at)
-    written codes (RSD, PLN, CZK, …) → use as-is.
-  If you cannot tell → null.
-- IN_STOCK:
-    true   ⇔ snippet explicitly says available ("in stock", "auf Lager",
-            "verfügbar", "available", "preorder available", "na zalogi").
-    false  ⇔ explicit sold-out signal ("sold out", "ausverkauft",
-            "indisponible", "épuisé", "agotado", "rasprodato").
-    null   otherwise.
-- STORE: domain or readable store name (e.g. "hhv.de", "JPC", "Recordsale").
-  If unsure → null.
-
-Output JSON only. Null over fabrication."""
+"""
 
 
-# ---------------------------------------------------------------------------
-# Domain helpers (deterministic, no logic beyond URL parsing)
-# ---------------------------------------------------------------------------
+@dataclass
+class ExtractListingsReport:
+    listings: list[Listing]
+    diagnostic: dict[str, Any] = field(default_factory=dict)
+
 
 def _normalize_domain(url_or_domain: str) -> str | None:
-    """Return a stable lowercase base domain (no scheme, no `www.`, no port)."""
     if not url_or_domain:
         return None
     candidate = url_or_domain.strip()
@@ -107,43 +75,34 @@ def _normalize_domain(url_or_domain: str) -> str | None:
         return None
     if netloc.startswith("www."):
         netloc = netloc[4:]
-    netloc = netloc.split(":", maxsplit=1)[0]
-    return netloc or None
+    return netloc.split(":", 1)[0]
 
 
 def _normalize_allowed_domains(domains: set[str]) -> set[str]:
-    out: set[str] = set()
-    for raw in domains:
-        norm = _normalize_domain(raw)
-        if norm:
-            out.add(norm)
+    out = set()
+    for d in domains:
+        n = _normalize_domain(d)
+        if n:
+            out.add(n)
     return out
 
 
 def _host_matches_whitelist(host: str, allowed: set[str]) -> bool:
-    """True if ``host`` equals a whitelisted store domain or is a subdomain of one."""
     if not host:
         return False
-    h = host.strip().lower()
+    h = host.lower()
     if h.startswith("www."):
         h = h[4:]
-    if h in allowed:
-        return True
-    return any(h.endswith("." + d) for d in allowed)
+    return h in allowed or any(h.endswith("." + d) for d in allowed)
 
 
-def _has_currency_hint(text: str) -> bool:
-    return bool(_CURRENCY_HINT_PATTERN.search(text or ""))
-
-
-# ---------------------------------------------------------------------------
-# LLM call (the ONLY LLM use in this module)
-# ---------------------------------------------------------------------------
-
-async def _llm_extract(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One JSON-mode call. Returns the LLM's raw `listings` array or []."""
+async def _llm_extract(
+    candidates: list[dict[str, Any]],
+    diagnostic: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    """Returns (parsed listing dicts, raw message content string)."""
     if not candidates:
-        return []
+        return [], ""
 
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -156,20 +115,55 @@ async def _llm_extract(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
             {"role": "system", "content": EXTRACTOR_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": json.dumps({"listings": candidates}, ensure_ascii=False),
+                "content": "json\n" + json.dumps({"listings": candidates}, ensure_ascii=False),
             },
         ],
     )
 
     raw = response.choices[0].message.content or "{}"
-    data = json.loads(raw)
-    items = data.get("listings", []) or []
-    return [it for it in items if isinstance(it, dict)]
+    logger.info(
+        "extract_listings_llm_raw_json",
+        extra={"stage": "extractor", "raw_response": raw[:20000]},
+    )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        diagnostic["json_parse_ok"] = False
+        logger.warning(
+            "extract_listings_json_decode_error",
+            extra={"stage": "extractor", "error": str(exc), "raw_head": raw[:500]},
+        )
+        return [], raw
+
+    items = [x for x in data.get("listings", []) if isinstance(x, dict)]
+    return items, raw
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+def _coerce_price_currency(item: dict[str, Any]) -> tuple[float, str]:
+    raw_p = item.get("price")
+    try:
+        p = float(raw_p) if raw_p is not None else 0.0
+    except (TypeError, ValueError):
+        p = 0.0
+    if p < 0.0:
+        p = 0.0
+
+    cur = item.get("currency")
+    s = str(cur).strip().upper() if cur is not None else ""
+    if len(s) != 3 or not s.isalpha():
+        s = "EUR"
+    return p, s
+
+
+def _coerce_in_stock(item: dict[str, Any]) -> bool:
+    """Ambiguous → treat as available; only False when explicitly sold out."""
+    v = item.get("in_stock")
+    if v is True:
+        return True
+    if v is False:
+        return False
+    return True
+
 
 async def extract_listings(
     raw_results: list[dict[str, Any]],
@@ -177,154 +171,126 @@ async def extract_listings(
     artist: str | None,
     album: str,
     allowed_domains: set[str],
-) -> list[Listing]:
-    """Convert noisy search snippets into clean, validated `Listing` objects.
+) -> ExtractListingsReport:
+    diagnostic: dict[str, Any] = {
+        "empty_reason": None,
+        "prefilter_candidates": 0,
+        "dropped_intent_mismatch": 0,
+        "llm_rows_returned": 0,
+        "json_parse_ok": True,
+        "drop_url_not_in_candidates": 0,
+        "drop_title_gate": 0,
+        "drop_pydantic": 0,
+    }
 
-    Parameters
-    ----------
-    raw_results
-        Tavily-shaped dicts with at least `url`, `title`, `content`.
-    artist
-        Parsed artist string. Used as a case-insensitive substring gate
-        against each candidate's title. `None` skips the artist gate.
-    album
-        Canonical album title (post-Discogs). Required substring gate.
-    allowed_domains
-        Whitelist of base domains (e.g. ``hhv.de``). Hosts must match exactly
-        or be subdomains (e.g. ``shop.hhv.de``).
-    """
-    if not raw_results or not (album or "").strip():
-        return []
+    if not raw_results or not album:
+        diagnostic["empty_reason"] = "no_raw_results_or_album"
+        return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
     allowed = _normalize_allowed_domains(allowed_domains)
     if not allowed:
-        logger.warning(
-            "extract_listings_empty_allowed_domains",
-            extra={"stage": "extractor", "status": "empty", "raw_count": len(raw_results)},
-        )
-        return []
+        diagnostic["empty_reason"] = "empty_allowed_domains"
+        return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
-    # ===== Stage 1: deterministic pre-filter =====
+    artist_l = (artist or "").strip().lower() or None
+    album_l = album.strip().lower()
+
     candidates: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
-    for raw in raw_results:
-        url = str(raw.get("url") or "").strip()
-        if not url or url in seen_urls:
+    seen: set[str] = set()
+    dropped_intent = 0
+
+    for r in raw_results:
+        url = str(r.get("url") or "").strip()
+        if not url or url in seen:
             continue
+
         domain = _normalize_domain(url)
         if not domain or not _host_matches_whitelist(domain, allowed):
             continue
-        seen_urls.add(url)
+
+        raw_title = str(r.get("title") or "").strip()
+        raw_content = str(r.get("content") or "")[:_SNIPPET_CHAR_CAP]
+        blob = f"{raw_title} {raw_content}".lower()
+
+        if album_l not in blob:
+            dropped_intent += 1
+            continue
+        if artist_l and artist_l not in blob:
+            dropped_intent += 1
+            continue
+
+        seen.add(url)
         candidates.append(
             {
                 "url": url,
-                "title": str(raw.get("title") or "").strip(),
-                "content": str(raw.get("content") or "")[:_SNIPPET_CHAR_CAP],
+                "title": raw_title,
+                "content": raw_content,
             }
         )
 
-    with_currency = sum(
-        1
-        for c in candidates
-        if _has_currency_hint(f"{c.get('title', '')} {c.get('content', '')}")
-    )
+    diagnostic["prefilter_candidates"] = len(candidates)
+    diagnostic["dropped_intent_mismatch"] = dropped_intent
+
     logger.info(
         "extract_listings_prefilter",
         extra={
             "stage": "extractor",
-            "status": "success" if candidates else "empty",
-            "raw_count": len(raw_results),
             "candidate_count": len(candidates),
-            "candidates_with_currency_hint": with_currency,
+            "dropped_intent_mismatch": dropped_intent,
         },
     )
 
     if not candidates:
-        logger.warning(
-            "extract_listings_prefilter_empty",
-            extra={"stage": "extractor", "status": "empty", "input": len(raw_results)},
-        )
-        return []
+        diagnostic["empty_reason"] = "prefilter_zero_candidates_intent_mismatch"
+        return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
-    # ===== Stage 2: single LLM extraction call =====
-    extracted = await _llm_extract(candidates[:_LLM_MAX_INPUT])
-    settings = get_settings()
-    logger.info(
-        "extract_listings_llm",
-        extra={
-            "stage": "extractor",
-            "status": "success" if extracted else "empty",
-            "llm_row_count": len(extracted),
-            "candidates_to_llm": min(len(candidates), _LLM_MAX_INPUT),
-        },
-    )
+    extracted, raw_json = await _llm_extract(candidates[:_LLM_MAX_INPUT], diagnostic)
+    diagnostic["llm_rows_returned"] = len(extracted)
+    if not raw_json.strip() or raw_json.strip() == "{}":
+        diagnostic["empty_reason"] = "llm_empty_response"
+    if not extracted:
+        diagnostic["empty_reason"] = diagnostic.get("empty_reason") or "llm_returned_empty_listings_array"
 
-    # ===== Stage 3: hard validation =====
-    artist_lower: str | None = (artist or "").strip().lower() or None
-    album_lower: str = album.strip().lower()
+    by_url_blob = {c["url"]: (c["title"] + " " + c["content"]).lower() for c in candidates}
+    by_url_raw_title = {c["url"]: c["title"] for c in candidates}
+    allowed_urls = set(by_url_blob.keys())
 
-    by_url: dict[str, Listing] = {}
+    results: dict[str, Listing] = {}
 
     for item in extracted:
         url = str(item.get("url") or "").strip()
-        # LLM hallucinated a URL we never sent → drop.
-        if url not in seen_urls:
-            continue
-        domain = _normalize_domain(url)
-        if not domain or not _host_matches_whitelist(domain, allowed):
+        if url not in allowed_urls:
+            diagnostic["drop_url_not_in_candidates"] += 1
             continue
 
-        title = str(item.get("title") or "").strip()
-        if not title:
+        blob = by_url_blob.get(url, "")
+        llm_title = (item.get("title") or "").strip()
+        raw_title = (by_url_raw_title.get(url) or "").strip()
+
+        if album_l in llm_title.lower():
+            pick_title = llm_title
+        elif album_l in raw_title.lower():
+            pick_title = raw_title
+        else:
+            pick_title = f"{(artist or '').strip()} {album}".strip() or album
+
+        if album_l not in pick_title.lower():
+            diagnostic["drop_title_gate"] += 1
             continue
-        title_lower = title.lower()
-        if artist_lower and artist_lower not in title_lower:
-            logger.info(
-                "extract_listings_gate_drop",
-                extra={
-                    "stage": "extractor",
-                    "status": "reject",
-                    "reason": "artist_not_in_title",
-                    "url": url[:400],
-                    "title_sample": title[:120],
-                },
-            )
-            continue
-        if album_lower not in title_lower:
-            logger.info(
-                "extract_listings_gate_drop",
-                extra={
-                    "stage": "extractor",
-                    "status": "reject",
-                    "reason": "album_not_in_title",
-                    "url": url[:400],
-                    "title_sample": title[:120],
-                },
-            )
+        if artist_l and artist_l not in pick_title.lower():
+            diagnostic["drop_title_gate"] += 1
             continue
 
-        currency_raw = item.get("currency")
-        currency = str(currency_raw).strip().upper() if currency_raw else ""
-
-        in_stock_raw = item.get("in_stock")
-        in_stock = in_stock_raw if isinstance(in_stock_raw, bool) else False
-
+        domain = _normalize_domain(url) or ""
         store_raw = item.get("store")
         store = (str(store_raw).strip() if store_raw else "") or domain
 
-        price_v = item.get("price")
-        if settings.debug:
-            try:
-                pnum = float(price_v) if price_v is not None else 0.0
-            except (TypeError, ValueError):
-                pnum = 0.0
-            if pnum <= 0 or len(currency) != 3:
-                price_v = 0.01
-                currency = "EUR"
+        in_stock = _coerce_in_stock(item)
+        price_v, currency = _coerce_price_currency(item)
 
         try:
             listing = Listing(
-                title=title,
+                title=pick_title,
                 price=price_v,
                 currency=currency,
                 in_stock=in_stock,
@@ -332,22 +298,22 @@ async def extract_listings(
                 store=store,
             )
         except (ValidationError, TypeError, ValueError):
-            logger.info(
-                "extract_listings_schema_drop",
-                extra={
-                    "stage": "extractor",
-                    "status": "reject",
-                    "reason": "Listing_validation_failed",
-                    "url": url[:500],
-                },
-            )
+            diagnostic["drop_pydantic"] += 1
             continue
 
-        # ===== Stage 4: dedup by URL — prefer in_stock survivor =====
-        existing = by_url.get(url)
-        if existing is None:
-            by_url[url] = listing
-        elif listing.in_stock and not existing.in_stock:
-            by_url[url] = listing
+        existing = results.get(url)
+        if existing is None or (listing.in_stock and not existing.in_stock):
+            results[url] = listing
 
-    return list(by_url.values())
+    out_list = list(results.values())
+    if out_list:
+        diagnostic["empty_reason"] = None
+    elif extracted:
+        diagnostic["empty_reason"] = "post_llm_all_dropped"
+    else:
+        diagnostic["empty_reason"] = diagnostic.get("empty_reason") or (
+            "llm_json_empty_or_failed" if not diagnostic.get("json_parse_ok", True) else "llm_returned_empty_listings_array"
+        )
+
+    diagnostic["final_count"] = len(out_list)
+    return ExtractListingsReport(listings=out_list, diagnostic=diagnostic)

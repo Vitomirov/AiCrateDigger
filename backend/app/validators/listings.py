@@ -1,8 +1,10 @@
 """Hard-rule validators for extracted Listing objects.
 
-Strict checks when ``settings.debug`` is false. When ``debug`` is true, only
-minimal URL + allowlist checks pass (for diagnosing downstream issues).
-Rejections log a deterministic ``reason`` — never silent drops.
+Strict checks when ``settings.debug`` is false. When ``debug`` is true, URL /
+domain / non-empty title plus **rapidfuzz** partial_ratio ≥ 80 on artist & album
+needles (when present).
+
+Rejections log a deterministic ``reason``.
 """
 
 from __future__ import annotations
@@ -11,11 +13,15 @@ import logging
 import math
 from urllib.parse import urlsplit
 
+from rapidfuzz import fuzz
+
 from app.config import get_settings
 from app.domain.listing_schema import Listing
 from app.policies.eu_stores import ALLOWED_STORES
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_FUZZ_THRESHOLD = 80
 
 
 def _normalize_store_domain(domain: str) -> str:
@@ -75,6 +81,13 @@ def _debug_minimal_pass(listing: Listing) -> tuple[bool, str | None]:
     return True, None
 
 
+def _fuzzy_needle_ok(needle: str, title: str) -> tuple[bool, int]:
+    if not needle.strip():
+        return True, 100
+    score = int(fuzz.partial_ratio(needle.lower(), title.lower()))
+    return score >= _DEBUG_FUZZ_THRESHOLD, score
+
+
 def validate_listing(listing: Listing) -> bool:
     """Return True iff validation passes. Always logs on reject in strict mode."""
 
@@ -82,18 +95,40 @@ def validate_listing(listing: Listing) -> bool:
 
     if settings.debug:
         ok, reason = _debug_minimal_pass(listing)
-        if ok:
-            logger.info(
-                "listing_validation",
-                extra={
-                    "stage": "validate_listing",
-                    "status": "accept_debug",
-                    "reason": "debug_minimal",
-                    "url": listing.url[:500],
-                },
-            )
-            return True
-        return _reject(reason or "debug_minimal_fail", listing=listing)
+        if not ok:
+            return _reject(reason or "debug_minimal_fail", listing=listing)
+
+        album_needle = (listing.validation_album or "").strip()
+        artist_needle = (listing.validation_artist or "").strip()
+        title = (listing.title or "").strip()
+
+        if album_needle:
+            ok_a, score_a = _fuzzy_needle_ok(album_needle, title)
+            if not ok_a:
+                return _reject(
+                    "debug_album_fuzzy_below_threshold",
+                    listing=listing,
+                    extra={"needle": album_needle[:80], "partial_ratio": score_a, "min": _DEBUG_FUZZ_THRESHOLD},
+                )
+        if artist_needle:
+            ok_ar, score_ar = _fuzzy_needle_ok(artist_needle, title)
+            if not ok_ar:
+                return _reject(
+                    "debug_artist_fuzzy_below_threshold",
+                    listing=listing,
+                    extra={"needle": artist_needle[:80], "partial_ratio": score_ar, "min": _DEBUG_FUZZ_THRESHOLD},
+                )
+
+        logger.info(
+            "listing_validation",
+            extra={
+                "stage": "validate_listing",
+                "status": "accept_debug",
+                "reason": "debug_fuzzy_minimal",
+                "url": listing.url[:500],
+            },
+        )
+        return True
 
     url = listing.url
     host = _normalize_listing_url_domain(url)
@@ -119,10 +154,15 @@ def validate_listing(listing: Listing) -> bool:
         )
 
     price = listing.price
-    if not isinstance(price, float) or math.isnan(price) or price <= 0.0:
+    if price is None:
+        pass
+    elif isinstance(price, float):
+        if math.isnan(price) or price < 0.0:
+            return _reject("invalid_price", listing=listing, extra={"price": repr(price)})
+    else:
         return _reject("invalid_price", listing=listing, extra={"price": repr(price)})
 
-    cur = listing.currency
+    cur = listing.currency or "EUR"
     if len(cur) != 3 or cur != cur.upper() or not cur.isascii() or not cur.isalpha():
         return _reject("invalid_currency", listing=listing, extra={"currency": cur})
 
