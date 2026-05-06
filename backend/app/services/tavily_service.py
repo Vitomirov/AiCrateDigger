@@ -11,31 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import re
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 
 from app.config import get_settings
-from app.db.marketplace_db import (
-    TavilyObservation,
-    get_marketplace_db,
-    ingest_tavily_batch,
-)
 from app.models.search_query import SearchResult
 from app.pipeline_context import stage_timer
-
-
-@dataclass(slots=True)
-class TavilyIntent:
-    """Per-request intent tokens handed in by the caller. Used to score
-    relevance (artist/album/format mention density) as Tavily results are
-    fed back into the emergent `marketplaces` RAG."""
-
-    artist: str
-    album: str
-    music_format: str
-    location_hint: str | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +39,19 @@ MAX_RESULTS_PER_QUERY = 10
 MAX_RESULTS_PER_DOMAIN = 3
 REQUEST_TIMEOUT_SECONDS = 15.0
 # Tavily-reported relevance below this is usually noise (wrong artist/topic).
-MIN_TAVILY_SCORE = 0.20
+MIN_TAVILY_SCORE = 0.12
+
+_SITE_TAIL_RE = re.compile(r"\bsite:([^\s]+)\s*$", re.IGNORECASE)
+
+
+def _include_domains_for_query(query: str) -> list[str] | None:
+    m = _SITE_TAIL_RE.search(query.strip())
+    if not m:
+        return None
+    dom = m.group(1).strip().lower()
+    if dom.startswith("www."):
+        dom = dom[4:]
+    return [dom] if dom else None
 
 
 def normalize_url(url: str) -> str:
@@ -72,13 +67,16 @@ def normalize_url(url: str) -> str:
 
 async def _search_single_query(client: httpx.AsyncClient, query: str) -> list[SearchResult]:
     settings = get_settings()
-    payload = {
+    payload: dict[str, str | int | list[str]] = {
         "api_key": settings.tavily_api_key,
         "query": query,
         "search_depth": "advanced",
         "max_results_per_query": MAX_RESULTS_PER_QUERY,
         "max_results_per_domain": MAX_RESULTS_PER_DOMAIN,
     }
+    inc = _include_domains_for_query(query)
+    if inc:
+        payload["include_domains"] = inc
 
     with stage_timer("tavily", input={"query": query}) as rec:
         try:
@@ -134,16 +132,8 @@ def _top_domains(results: list[SearchResult], *, limit: int) -> list[str]:
     return [d for d, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:limit]]
 
 
-async def run_tavily_search(
-    queries: list[str],
-    intent: TavilyIntent | None = None,
-) -> list[SearchResult]:
-    """Run all queries in parallel, apply per-domain diversity, return unique candidates.
-
-    If `intent` is supplied, every Tavily hit (both kept and dropped-for-domain-cap)
-    is also forwarded to `marketplace_db` as a `TavilyObservation` — this is the
-    system's self-improvement feedback loop. Every search teaches the next one.
-    """
+async def run_tavily_search(queries: list[str]) -> list[SearchResult]:
+    """Run all queries in parallel, apply per-domain diversity, return unique candidates."""
     if not queries:
         return []
 
@@ -151,10 +141,6 @@ async def run_tavily_search(
         tasks = [_search_single_query(client, q) for q in queries]
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Flatten and dedup per-URL before the domain cap. We DO ingest all
-    # candidates (including ones later dropped by the per-domain cap) so that
-    # the emergent scorer observes full frequency signal, not just the top of
-    # the funnel.
     unique_by_url: dict[str, SearchResult] = {}
     for task_result in gathered:
         if isinstance(task_result, list):
@@ -197,45 +183,4 @@ async def run_tavily_search(
         },
     )
 
-    # Feedback loop — non-blocking in spirit (we await, but it's fast and we
-    # want the trace to reflect what landed in RAG for this request).
-    if intent is not None and unique_by_url:
-        await _ingest_tavily_feedback(list(unique_by_url.values()), intent)
-
     return final_results
-
-
-async def _ingest_tavily_feedback(
-    results: list[SearchResult],
-    intent: TavilyIntent,
-) -> None:
-    with stage_timer(
-        "rag_ingest_tavily",
-        input={"candidate_count": len(results)},
-    ) as rec:
-        observations = [
-            TavilyObservation(
-                url=r.url,
-                title=r.title,
-                content=r.content,
-                tavily_score=r.score,
-                artist=intent.artist,
-                album=intent.album,
-                music_format=intent.music_format,
-                location_hint=intent.location_hint,
-            )
-            for r in results
-        ]
-        try:
-            service = get_marketplace_db()
-            domains = await ingest_tavily_batch(service, observations)
-        except Exception as exc:
-            rec.status = "fail"
-            rec.error = str(exc)
-            logger.exception(
-                "rag_ingest_tavily_failed",
-                extra={"stage": "rag_ingest_tavily", "status": "fail"},
-            )
-            return
-        rec.output = {"domains_written": domains, "count": len(domains)}
-        rec.status = "success" if domains else "empty"

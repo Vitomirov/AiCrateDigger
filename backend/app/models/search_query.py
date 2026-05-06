@@ -107,26 +107,6 @@ class ParseRequest(BaseModel):
     )
 
 
-class QueryGenDebug(BaseModel):
-    """Debug envelope attached to `SearchQueries` — always populated for traceability."""
-
-    rag_hits: list[dict] = Field(
-        default_factory=list,
-        description="Top marketplace candidates returned by the RAG retrieval (as-debug dicts).",
-    )
-    discovered_marketplaces: list[str] = Field(
-        default_factory=list,
-        description="Base domains actually used to generate queries, in rank order.",
-    )
-    bootstrap_used: bool = Field(
-        default=False,
-        description=(
-            "True when RAG coverage was below threshold and the generator emitted "
-            "bootstrap-only (discovery) queries instead of `site:` queries."
-        ),
-    )
-
-
 class SearchQueries(BaseModel):
     queries: list[str] = Field(
         ...,
@@ -141,7 +121,6 @@ class SearchQueries(BaseModel):
             "Empty string at index `i` means the query is a bootstrap/discovery probe."
         ),
     )
-    debug: QueryGenDebug = Field(default_factory=QueryGenDebug)
 
 
 class SearchResult(BaseModel):

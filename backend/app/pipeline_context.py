@@ -11,7 +11,7 @@ Design notes:
   compact `StageRecord` into the context so DEBUG mode can echo the whole
   trace back in the HTTP response.
 - Emit conventions (aligned with the task spec):
-      stage     ∈ {parser, query_gen, tavily, crawl, extractor, rag_store, rag_retrieve}
+      stage     ∈ {parser, tavily, extractor, pipeline}
       status    ∈ {success, fail, empty}
 - "empty" is logged at WARNING so stages that return nothing never silently
   slip past a grep.
@@ -29,7 +29,7 @@ from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
-Stage = str  # one of: parser | query_gen | tavily | crawl | extractor | rag_store | rag_retrieve
+Stage = str  # one of: parser | tavily | extractor | pipeline
 Status = str  # one of: success | fail | empty
 
 

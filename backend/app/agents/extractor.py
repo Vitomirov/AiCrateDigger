@@ -4,7 +4,6 @@ Pipeline per candidate:
     1. Deterministic pre-filter  (gates: url / title-length / artist fuzzy match / merch keywords)
     2. LLM structured extraction (price, location, availability, seller_type, reason)
     3. Pydantic validation       (ListingResult contract; bad shapes rejected)
-    4. RAG feedback loop         (high-score "store" seller -> marketplace_db.record_store_confirmation)
 
 Hard rules (NON-NEGOTIABLE):
 - `price` is explicitly set to null when absent (never omitted).
@@ -17,26 +16,39 @@ Hard rules (NON-NEGOTIABLE):
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 from rapidfuzz import fuzz
 
 from app.config import get_settings
-from app.db.marketplace_db import (
-    StoreConfirmation,
-    get_marketplace_db,
-    normalize_domain,
-)
 from app.models.result import ListingResult
 from app.models.search_query import SearchResult
 from app.pipeline_context import stage_timer
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_domain(url_or_domain: str) -> str | None:
+    """Return a stable lowercase base domain (no `www.`, no port)."""
+    if not url_or_domain:
+        return None
+    try:
+        candidate = url_or_domain.strip()
+        if "://" not in candidate:
+            candidate = f"https://{candidate}"
+        netloc = urlsplit(candidate).netloc.lower().strip()
+        if not netloc:
+            return None
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        netloc = netloc.split(":", maxsplit=1)[0]
+        return netloc or None
+    except Exception:
+        return None
 
 MAX_AI_BATCH_SIZE = 10
 MAX_FINAL_RESULTS = 10
@@ -46,9 +58,6 @@ MIN_TITLE_LEN = 5
 # RapidFuzz partial_ratio ∈ [0, 100]. Against title+content this threshold eliminates
 # Taylor-Swift-when-searching-EKV cases while tolerating diacritic variants (EKV vs E.K.V.).
 MIN_ARTIST_FUZZY = 60
-# Stores below this LLM-reported score (after artist-match gating) are not promoted to RAG memory.
-STORE_PERSIST_SCORE_THRESHOLD = 0.5
-
 # Keywords that indicate non-music merch / accessories. Checked against the lowercased
 # concatenation of title + first 1500 chars of snippet content.
 _REJECTION_KEYWORDS: tuple[str, ...] = (
@@ -162,7 +171,6 @@ async def extract_and_score_results(
             return []
 
         batch = candidates[:MAX_AI_BATCH_SIZE]
-        location_fallback = ", ".join(filter(None, [city, country])) or country
 
         # -------- PASS 1: deterministic pre-filter --------
         survivors, pre_artist_scores, pre_album_scores = _pre_filter(
@@ -193,8 +201,6 @@ async def extract_and_score_results(
 
         # -------- PASS 3: assemble validated ListingResult objects --------
         validated: list[ListingResult] = []
-        persist_tasks: list[asyncio.Task[None]] = []
-        seen_persist_domains: set[str] = set()
         rejections_post = 0
 
         for survivor, artist_match, album_match in zip(
@@ -238,48 +244,6 @@ async def extract_and_score_results(
                 continue
 
             validated.append(listing)
-
-            # -------- RAG feedback loop (store confirmation) --------
-            if (
-                listing.seller_type == "store"
-                and listing.score >= STORE_PERSIST_SCORE_THRESHOLD
-                and domain
-                and domain not in seen_persist_domains
-            ):
-                seen_persist_domains.add(domain)
-                confirmation = StoreConfirmation(
-                    url=listing.url,
-                    title=listing.title,
-                    location=listing.location or location_fallback,
-                    tavily_score=survivor.score,
-                    artist=artist,
-                    album=album,
-                    music_format=music_format,
-                    content=survivor.content,
-                )
-                logger.info(
-                    "rag_store_queued",
-                    extra={
-                        "stage": "rag_store",
-                        "status": "success",
-                        "domain": domain,
-                        "url": listing.url,
-                    },
-                )
-                persist_tasks.append(asyncio.create_task(_safe_persist(confirmation)))
-
-        # -------- Await persist tasks so writes are confirmed before return --------
-        if persist_tasks:
-            persist_results = await asyncio.gather(*persist_tasks, return_exceptions=True)
-            persisted = sum(1 for r in persist_results if not isinstance(r, Exception))
-            logger.info(
-                "rag_store_done",
-                extra={
-                    "stage": "rag_store",
-                    "status": "success" if persisted else "empty",
-                    "count": persisted,
-                },
-            )
 
         final = sorted(validated, key=lambda x: x.score, reverse=True)[:MAX_FINAL_RESULTS]
         rec.output = {
@@ -407,16 +371,3 @@ def _log_reject(url: str, reason: str, *, artist_match: float | None = None, det
     logger.info("extractor_reject", extra=extras)
 
 
-async def _safe_persist(confirmation: StoreConfirmation) -> None:
-    """Background task wrapper — must never propagate to the request scope."""
-    try:
-        await get_marketplace_db().record_store_confirmation(confirmation)
-    except Exception:
-        logger.exception(
-            "rag_store_failed",
-            extra={
-                "stage": "rag_store",
-                "status": "fail",
-                "url": confirmation.url,
-            },
-        )

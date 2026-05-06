@@ -1,344 +1,595 @@
-"""Discogs REST API client. Used by the Parser agent to resolve relative album
-references ("2nd album", "latest", "debut") DETERMINISTICALLY instead of letting
-the LLM hallucinate a title.
+"""Discogs Studio-Album Canonical Index.
 
-The parser also uses `resolve_album_by_index`, `get_artist_discography`,
-and `search_release_by_track`.
+Builds a deterministic, ordered list of an artist's STUDIO albums from the
+Discogs REST API. Resolution is strict: only **masters** whose **main release**
+formats indicate a full **Album** or **LP** survive — singles/EPs posing as
+masters (e.g. "Jump In The Fire") are dropped.
+
+Index rules: ``album_index`` 1 = debut studio album (by year), 2 = second, …;
+``-1`` = latest.
+
+Rules are deterministic — no LLM, no fuzzy matching; prefer precision over recall.
+
+Usage::
+
+    albums = await get_studio_albums("Metallica")
+    resolution = await resolve_album_by_index(artist="Metallica", album_index=2)
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from dataclasses import dataclass
-from functools import lru_cache
+from typing import Any
 
 import httpx
 
 from app.config import get_settings
-from app.pipeline_context import get_context
 
 logger = logging.getLogger(__name__)
 
-_ARTIST_SEARCH_PATH = "/database/search"
-_ARTIST_RELEASES_PATH = "/artists/{artist_id}/releases"
 
-# Types that Discogs uses for a "Master" (canonical studio album) are sorted
-# into the releases list when sorted by year. We filter to albums only.
-_ALBUM_FORMATS: tuple[str, ...] = ("Vinyl", "CD", "Cassette", "Album", "LP")
+# ---------------------------------------------------------------------------
+# Public schemas
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
-class DiscogsAlbum:
+class Album:
+    """One canonical studio album in an artist's chronological discography."""
+
     title: str
     year: int | None
-    artist_id: int
-    master_id: int | None
+    discogs_id: str  # master id
 
 
 @dataclass(frozen=True, slots=True)
-class DiscogsResolution:
-    """Return envelope from `resolve_album_by_index`."""
+class AlbumResolution:
+    """Return envelope from ``resolve_album_by_index``."""
 
-    album: DiscogsAlbum | None
-    # Position in the (year-sorted) discography: 1-based. None if no resolution.
+    album: Album | None
     index: int | None
-    # "high" if Discogs returned a confident single match, "medium" if we picked
-    # from multiple candidates, "low" if nothing actionable came back.
-    confidence: str
+    confidence: float
+    detail: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Paths & limits
+# ---------------------------------------------------------------------------
+
+_SEARCH_PATH = "/database/search"
+_RELEASES_PATH = "/artists/{artist_id}/releases"
+_MASTER_PATH = "/masters/{master_id}"
+_RELEASE_PATH = "/releases/{release_id}"
+
+_PER_PAGE = 100
+_MAX_PAGES = 10
+# Cap concurrent master↔release enrich calls to stay polite to Discogs.
+_ENRICH_CONCURRENCY = 8
+_MIN_ALBUM_YEAR = 1900
+
+# Section 1 — titles must NOT contain (word tokens / phrases where noted).
+_TITLE_PHRASE_REJECT: tuple[str, ...] = (
+    "best of",
+    "greatest hits",
+    "live at",
+    "live in",
+    "live from",
+    "compilation",
+    "the collection",
+)
+
+_TITLE_TOKEN_REJECT: frozenset[str] = frozenset(
+    {
+        "single",
+        "ep",
+        "live",
+        "compilation",
+        "bootleg",
+        "demo",
+        "radio",
+        "broadcast",
+        "session",
+        "sessions",
+        "soundtrack",
+        "ost",
+        "promo",
+        "unofficial",
+        "concert",
+        "mixtape",
+        "anthology",
+        "split",
+        "remix",
+        "remixes",
+        "remixed",
+        "demos",
+        "rarities",
+    }
+)
+
+# Section 2 — scoring penalty tokens (same as aggressive list; word tokens).
+_SCORE_PENALTY_TITLE_TOKENS: frozenset[str] = frozenset(
+    {
+        "single",
+        "ep",
+        "live",
+        "bootleg",
+        "demo",
+        "radio",
+        "broadcast",
+    }
+)
+
+# Format description/name tokens that forbid treating the main release as a studio LP.
+_FORMAT_REJECT: frozenset[str] = frozenset(
+    {
+        "single",
+        "ep",
+        "compilation",
+        "maxi-single",
+        "mixtape",
+        "promo",
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+_DISCOGRAPHY_CACHE: dict[str, list[Album]] = {}
+
+
+def _cache_key(artist: str) -> str:
+    return (artist or "").strip().lower()
+
+
+def clear_discography_cache() -> None:
+    _DISCOGRAPHY_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 
 
 def _headers() -> dict[str, str]:
     settings = get_settings()
+    headers = {
+        "User-Agent": settings.discogs_user_agent,
+        "Accept": "application/json",
+    }
     token = (settings.discogs_token or "").strip()
-    headers = {"User-Agent": settings.discogs_user_agent, "Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Discogs token={token}"
     return headers
 
 
-@lru_cache(maxsize=256)
-def _cache_key(artist: str, album_index: int) -> str:
-    return f"{artist.strip().lower()}::{album_index}"
+async def _get_json(client: httpx.AsyncClient, url: str) -> dict[str, Any] | None:
+    try:
+        resp = await client.get(url, headers=_headers())
+        resp.raise_for_status()
+        out = resp.json()
+        return out if isinstance(out, dict) else None
+    except httpx.HTTPError:
+        return None
 
 
-async def _search_artist(client: httpx.AsyncClient, artist: str) -> int | None:
+async def _resolve_artist_id(client: httpx.AsyncClient, artist: str) -> int | None:
     settings = get_settings()
     params = {"q": artist, "type": "artist", "per_page": 5}
-    resp = await client.get(
-        f"{settings.discogs_base_url}{_ARTIST_SEARCH_PATH}", params=params, headers=_headers()
-    )
-    resp.raise_for_status()
-    data = resp.json() or {}
-    results = data.get("results") or []
+    try:
+        resp = await client.get(
+            f"{settings.discogs_base_url}{_SEARCH_PATH}",
+            params=params,
+            headers=_headers(),
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "discogs_artist_search_error",
+            extra={"stage": "discogs", "status": "fail", "reason": str(exc), "artist": artist},
+        )
+        return None
+
+    results = (resp.json() or {}).get("results") or []
     if not results:
         return None
-    first = results[0]
-    artist_id = first.get("id")
+
+    aid = results[0].get("id")
     try:
-        return int(artist_id) if artist_id is not None else None
+        return int(aid) if aid is not None else None
     except (TypeError, ValueError):
         return None
 
 
-async def _fetch_releases(client: httpx.AsyncClient, artist_id: int) -> list[dict]:
+async def _fetch_releases(client: httpx.AsyncClient, artist_id: int) -> list[dict[str, Any]]:
     settings = get_settings()
-    # Discogs will paginate; for our purposes the main-release sort on year, asc
-    # is enough to pick "nth album". We fetch 100 — plenty for any real artist.
-    params = {"sort": "year", "sort_order": "asc", "per_page": 100, "page": 1}
-    url = f"{settings.discogs_base_url}{_ARTIST_RELEASES_PATH.format(artist_id=artist_id)}"
-    resp = await client.get(url, params=params, headers=_headers())
-    resp.raise_for_status()
-    data = resp.json() or {}
-    return data.get("releases", []) or []
-
-
-def _filter_studio_albums(releases: list[dict]) -> list[DiscogsAlbum]:
-    """Keep only main studio albums; drop singles/comps/bootlegs/live etc.
-
-    Discogs flags releases with role="Main" + type="master" for canonical studio
-    releases. We also defensively skip titles that look like live/compilation.
-    """
-    noisy_keywords = (
-        "live", "bootleg", "compilation", "greatest hits", "best of",
-        "single", "ep", "sampler", "promo", "soundtrack",
-    )
-    albums: list[DiscogsAlbum] = []
-    seen_titles: set[str] = set()
-
-    for rel in releases:
-        role = (rel.get("role") or "").lower()
-        rel_type = (rel.get("type") or "").lower()
-        title = str(rel.get("title") or "").strip()
-        if not title or rel_type not in {"master", "release"}:
-            continue
-        # Skip non-main contributions (e.g., compilations where the artist appears).
-        if role and role not in {"main", "artist"}:
-            continue
-        lower_title = title.lower()
-        if any(kw in lower_title for kw in noisy_keywords):
-            continue
-        # Same studio album can appear multiple times (reissues). Dedup by lowercase title.
-        if lower_title in seen_titles:
-            continue
-        seen_titles.add(lower_title)
-
-        year = rel.get("year")
+    rows: list[dict[str, Any]] = []
+    for page in range(1, _MAX_PAGES + 1):
+        params = {
+            "sort": "year",
+            "sort_order": "asc",
+            "per_page": _PER_PAGE,
+            "page": page,
+        }
         try:
-            year_int = int(year) if year else None
-        except (TypeError, ValueError):
-            year_int = None
-
-        artist_id = rel.get("artist_id") or rel.get("main_release_id") or 0
-        master_id = rel.get("master_id") or rel.get("id")
-        try:
-            albums.append(
-                DiscogsAlbum(
-                    title=title,
-                    year=year_int,
-                    artist_id=int(artist_id) if artist_id else 0,
-                    master_id=int(master_id) if master_id else None,
-                )
+            resp = await client.get(
+                f"{settings.discogs_base_url}{_RELEASES_PATH.format(artist_id=artist_id)}",
+                params=params,
+                headers=_headers(),
             )
+            resp.raise_for_status()
+            data = resp.json() or {}
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "discogs_releases_error",
+                extra={
+                    "stage": "discogs",
+                    "status": "fail",
+                    "reason": str(exc),
+                    "artist_id": artist_id,
+                    "page": page,
+                },
+            )
+            break
+
+        page_rows = data.get("releases") or []
+        if not page_rows:
+            break
+        rows.extend(page_rows)
+
+        pagination = data.get("pagination") or {}
+        try:
+            total_pages = int(pagination.get("pages", 1))
         except (TypeError, ValueError):
+            total_pages = 1
+        if page >= total_pages:
+            break
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Normalization & title rules
+# ---------------------------------------------------------------------------
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]+", re.IGNORECASE)
+
+
+def _normalize_title_key(title: str) -> str:
+    t = title.lower()
+    t = _NON_ALNUM_RE.sub(" ", t)
+    return " ".join(t.split())
+
+
+def _title_tokens(title_lower: str) -> set[str]:
+    cleaned = title_lower.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ")
+    return set(cleaned.split())
+
+
+def _title_rejected_hard(title: str) -> bool:
+    tl = title.lower()
+    for phrase in _TITLE_PHRASE_REJECT:
+        if phrase in tl:
+            return True
+    return bool(_title_tokens(tl) & _TITLE_TOKEN_REJECT)
+
+
+def _too_short_probable_track(norm_key: str) -> bool:
+    """Reject very short one-word titles (e.g. 'One'); strict, not fuzzy."""
+    parts = norm_key.split()
+    return bool(len(parts) == 1 and len(parts[0]) <= 3)
+
+
+def _normalize_year_from_row(row: dict[str, Any]) -> int | None:
+    raw = row.get("year")
+    try:
+        year = int(raw) if raw is not None and raw != "" else 0
+    except (TypeError, ValueError):
+        return None
+    if year < _MIN_ALBUM_YEAR:
+        return None
+    return year
+
+
+# ---------------------------------------------------------------------------
+# Main release format + scoring
+# ---------------------------------------------------------------------------
+
+
+def _format_vocab_from_release(release_data: dict[str, Any]) -> set[str]:
+    """Lowercased tokens from format names, text, and descriptions."""
+    out: set[str] = set()
+    for fmt in release_data.get("formats") or []:
+        if not isinstance(fmt, dict):
             continue
+        for key in ("name", "text"):
+            raw = fmt.get(key)
+            if not raw or not isinstance(raw, str):
+                continue
+            for part in raw.replace(";", ",").replace("/", " ").split():
+                p = part.strip().lower()
+                if p:
+                    out.add(p)
+        for d in fmt.get("descriptions") or []:
+            if isinstance(d, str) and d.strip():
+                out.add(d.strip().lower())
+    return out
 
-    # Stable sort oldest-first so index 1 = debut, index -1 = latest.
-    albums.sort(key=lambda a: (a.year or 10**6, a.title.lower()))
-    return albums
+
+def _main_release_id(master_blob: dict[str, Any]) -> int | None:
+    mr = master_blob.get("main_release")
+    if isinstance(mr, dict):
+        rid = mr.get("id")
+    else:
+        rid = mr
+    try:
+        return int(rid) if rid is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
-async def resolve_album_by_index(*, artist: str, album_index: int) -> DiscogsResolution:
-    """Return the nth studio album for `artist` according to Discogs.
+def _master_release_type_album_ok(master_blob: dict[str, Any]) -> bool:
+    """When Discogs provides release_type on the master, require 'album'."""
+    raw = master_blob.get("release_type")
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return True
+    return str(raw).strip().lower() == "album"
 
-    `album_index`:
-        1, 2, 3, ... -> 1-based from debut
-        -1           -> latest studio album
 
-    Always returns a `DiscogsResolution`; .album is None if nothing could be resolved.
-    Errors are swallowed and reported as `confidence="low"` so the parser can fall
-    back to the LLM.
-    """
-    settings = get_settings()
-    ctx = get_context()
-    request_id = ctx.request_id if ctx else None
+def _format_studio_ok(vocab: set[str]) -> bool:
+    """True when descriptions indicate a full-length album / LP release."""
+    if _FORMAT_REJECT & vocab:
+        return False
+    if "mini-album" in vocab or "mini album" in vocab:
+        return False
+    return "album" in vocab or "lp" in vocab
 
-    if not artist.strip() or album_index == 0:
-        return DiscogsResolution(album=None, index=None, confidence="low")
 
-    log_extra = {
-        "stage": "discogs",
-        "request_id": request_id,
-        "artist": artist,
-        "album_index": album_index,
-    }
+def _score_candidate(title: str, vocab: set[str]) -> int:
+    score = 0
+    if "album" in vocab:
+        score += 2
+    if "lp" in vocab:
+        score += 1
+    if _title_tokens(title.lower()) & _SCORE_PENALTY_TITLE_TOKENS:
+        score -= 3
+    return score
+
+
+@dataclass
+class _Candidate:
+    album: Album
+    norm_title: str
+    score: int
+
+
+async def _enrich_master_row(
+    client: httpx.AsyncClient,
+    base_url: str,
+    rel: dict[str, Any],
+) -> _Candidate | None:
+    """Map one artist ``releases`` master row → candidate or None."""
+    if str(rel.get("type") or "").lower() != "master":
+        return None
+    role = str(rel.get("role") or "").lower()
+    if role and role != "main":
+        return None
+
+    title = str(rel.get("title") or "").strip()
+    if not title or _title_rejected_hard(title):
+        return None
+
+    year = _normalize_year_from_row(rel)
+    if year is None:
+        return None
+
+    norm = _normalize_title_key(title)
+    if _too_short_probable_track(norm):
+        return None
 
     try:
-        async with httpx.AsyncClient(timeout=settings.discogs_timeout_seconds) as client:
-            artist_id = await _search_artist(client, artist)
+        mid = int(rel.get("id"))
+    except (TypeError, ValueError):
+        return None
+
+    master_url = f"{base_url}{_MASTER_PATH.format(master_id=mid)}"
+    master_blob = await _get_json(client, master_url)
+    if not master_blob or not _master_release_type_album_ok(master_blob):
+        return None
+
+    rid = _main_release_id(master_blob)
+    if rid is None:
+        return None
+
+    release_url = f"{base_url}{_RELEASE_PATH.format(release_id=rid)}"
+    release_blob = await _get_json(client, release_url)
+    if not release_blob:
+        return None
+
+    vocab = _format_vocab_from_release(release_blob)
+    if not _format_studio_ok(vocab):
+        return None
+
+    sc = _score_candidate(title, vocab)
+    if sc < 2:
+        return None
+
+    album = Album(title=title, year=year, discogs_id=str(mid))
+    return _Candidate(album=album, norm_title=norm, score=sc)
+
+
+def _dedupe_same_norm_and_year(cands: list[_Candidate]) -> list[_Candidate]:
+    """Duplicate normalized title + same year → keep lowest master id."""
+    best: dict[tuple[str, int], _Candidate] = {}
+    for c in cands:
+        key = (c.norm_title, c.album.year or 0)
+        existing = best.get(key)
+        if existing is None or int(c.album.discogs_id) < int(existing.album.discogs_id):
+            best[key] = c
+    return list(best.values())
+
+
+def _dedupe_norm_earliest_year(cands: list[_Candidate]) -> list[_Candidate]:
+    """One row per normalized title — keep the earliest calendar year."""
+    by_norm: dict[str, _Candidate] = {}
+    for c in sorted(
+        cands,
+        key=lambda x: (x.album.year or 99999, int(x.album.discogs_id)),
+    ):
+        if c.norm_title not in by_norm:
+            by_norm[c.norm_title] = c
+    return list(by_norm.values())
+
+
+def _finalize_candidates(raw: list[_Candidate]) -> list[Album]:
+    step1 = _dedupe_same_norm_and_year(raw)
+    step2 = _dedupe_norm_earliest_year(step1)
+    step2.sort(key=lambda x: (x.album.year or 99999, x.album.title.lower()))
+    return [c.album for c in step2]
+
+
+async def _build_studio_albums(client: httpx.AsyncClient, releases: list[dict[str, Any]]) -> list[Album]:
+    settings = get_settings()
+    base = settings.discogs_base_url.rstrip("/")
+
+    master_rows = [r for r in releases if str(r.get("type") or "").lower() == "master"]
+    sem = asyncio.Semaphore(_ENRICH_CONCURRENCY)
+
+    async def _bounded(row: dict[str, Any]) -> _Candidate | None:
+        async with sem:
+            return await _enrich_master_row(client, base, row)
+
+    enriched = await asyncio.gather(*[_bounded(r) for r in master_rows])
+    candidates = [c for c in enriched if c is not None]
+    return _finalize_candidates(candidates)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+async def get_studio_albums(artist: str) -> list[Album]:
+    key = _cache_key(artist)
+    if not key:
+        return []
+
+    cached = _DISCOGRAPHY_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+
+    settings = get_settings()
+    timeout = settings.discogs_timeout_seconds
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            artist_id = await _resolve_artist_id(client, artist)
             if not artist_id:
-                logger.warning("discogs_artist_miss", extra={**log_extra, "status": "empty"})
-                return DiscogsResolution(album=None, index=None, confidence="low")
-
+                _DISCOGRAPHY_CACHE[key] = []
+                logger.info(
+                    "discogs_artist_miss",
+                    extra={"stage": "discogs", "status": "empty", "artist": artist},
+                )
+                return []
             releases = await _fetch_releases(client, artist_id)
-    except httpx.HTTPError as exc:
-        logger.warning(
-            "discogs_http_error",
-            extra={**log_extra, "status": "fail", "reason": f"{type(exc).__name__}: {exc}"},
-        )
-        return DiscogsResolution(album=None, index=None, confidence="low")
+            albums = await _build_studio_albums(client, releases)
     except Exception:
-        logger.exception("discogs_unexpected_error", extra={**log_extra, "status": "fail"})
-        return DiscogsResolution(album=None, index=None, confidence="low")
-
-    albums = _filter_studio_albums(releases)
-    if not albums:
-        logger.warning(
-            "discogs_no_studio_albums",
-            extra={**log_extra, "status": "empty", "count": len(releases)},
+        logger.exception(
+            "get_studio_albums_failed",
+            extra={"stage": "discogs", "status": "fail", "artist": artist},
         )
-        return DiscogsResolution(album=None, index=None, confidence="low")
+        return []
+
+    _DISCOGRAPHY_CACHE[key] = albums
+    first_ten = [{"year": a.year, "title": a.title, "id": a.discogs_id} for a in albums[:10]]
+    logger.info(
+        "discogs_studio_filter_debug",
+        extra={
+            "stage": "discogs",
+            "status": "success" if albums else "empty",
+            "artist": artist,
+            "total_releases_fetched": len(releases),
+            "total_after_filter": len(albums),
+            "ordered_album_preview_first_10": first_ten,
+        },
+    )
+    logger.info(
+        "discogs_studio_albums_built",
+        extra={
+            "stage": "discogs",
+            "status": "success" if albums else "empty",
+            "artist": artist,
+            "count": len(albums),
+        },
+    )
+    return list(albums)
+
+
+def _resolution_detail(ordered: list[Album], selected: Album | None, confidence: float) -> dict[str, Any]:
+    return {
+        "albums": [{"title": a.title, "year": a.year, "discogs_id": a.discogs_id} for a in ordered],
+        "selected_album": selected.title if selected else None,
+        "confidence": confidence,
+    }
+
+
+async def resolve_album_by_index(*, artist: str, album_index: int) -> AlbumResolution:
+    if not (artist or "").strip() or album_index == 0:
+        return AlbumResolution(
+            album=None,
+            index=None,
+            confidence=0.0,
+            detail=_resolution_detail([], None, 0.0),
+        )
+
+    albums = await get_studio_albums(artist)
+    if not albums:
+        return AlbumResolution(
+            album=None,
+            index=None,
+            confidence=0.0,
+            detail=_resolution_detail([], None, 0.0),
+        )
 
     if album_index == -1:
         picked = albums[-1]
-        idx = len(albums)
-    elif 1 <= album_index <= len(albums):
+        return AlbumResolution(
+            album=picked,
+            index=len(albums),
+            confidence=1.0,
+            detail=_resolution_detail(albums, picked, 1.0),
+        )
+
+    if 1 <= album_index <= len(albums):
         picked = albums[album_index - 1]
-        idx = album_index
-    else:
-        logger.warning(
-            "discogs_index_out_of_range",
-            extra={**log_extra, "status": "empty", "count": len(albums)},
+        return AlbumResolution(
+            album=picked,
+            index=album_index,
+            confidence=1.0,
+            detail=_resolution_detail(albums, picked, 1.0),
         )
-        return DiscogsResolution(album=None, index=None, confidence="low")
 
-    # "high" confidence iff the artist query returned an unambiguous hit AND the
-    # index is within the bounds of the studio-album list. Otherwise "medium".
-    confidence = "high" if 1 <= idx <= len(albums) else "medium"
-    logger.info(
-        "discogs_resolved",
-        extra={
-            **log_extra,
-            "status": "success",
-            "output": {"title": picked.title, "year": picked.year, "index": idx},
-        },
-    )
-    return DiscogsResolution(album=picked, index=idx, confidence=confidence)
-
-
-async def get_artist_discography(artist: str) -> list[DiscogsAlbum]:
-    """Filtered studio-main release rows for ``artist``, chronological order."""
-
-    settings = get_settings()
-    if not artist.strip():
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=settings.discogs_timeout_seconds) as client:
-            artist_id = await _search_artist(client, artist)
-            if not artist_id:
-                return []
-            releases = await _fetch_releases(client, artist_id)
-        return _filter_studio_albums(releases)
-    except Exception:
-        logger.exception("get_artist_discography_failed")
-        return []
-
-
-def _album_from_track_search_hit(hit: dict, track: str) -> DiscogsAlbum | None:
-    """Map one Discogs database/search row to a candidate album title."""
-
-    tit = str(hit.get("title") or "").strip()
-    ht = hit.get("type")
-    if not tit:
-        return None
-    hid = hit.get("id")
-    try:
-        hid_i = int(hid) if hid is not None else None
-    except (TypeError, ValueError):
-        hid_i = None
-
-    if ht == "master":
-        return DiscogsAlbum(
-            title=tit,
-            year=None,
-            artist_id=0,
-            master_id=hid_i,
-        )
-    if ht != "release":
-        return None
-
-    tr_l = track.lower()
-    for sep in (" – ", " - "):
-        if sep not in tit:
-            continue
-        _left, right = [p.strip() for p in tit.split(sep, maxsplit=1)]
-        rl = right.lower()
-        if len(right) > 2 and (tr_l not in rl or rl != tr_l):
-            return DiscogsAlbum(
-                title=right,
-                year=None,
-                artist_id=0,
-                master_id=None,
-            )
-
-    for sep in (" – ", " - "):
-        if sep in tit:
-            sub = tit.split(sep, maxsplit=1)[1].strip()
-            if len(sub) > 2:
-                return DiscogsAlbum(
-                    title=sub,
-                    year=None,
-                    artist_id=0,
-                    master_id=None,
-                )
-
-    return DiscogsAlbum(
-        title=tit,
-        year=None,
-        artist_id=0,
-        master_id=None,
+    return AlbumResolution(
+        album=None,
+        index=None,
+        confidence=0.5,
+        detail=_resolution_detail(albums, None, 0.5),
     )
 
 
-async def search_release_by_track(artist: str, track: str) -> list[DiscogsAlbum]:
-    """Discogs database/search hits for ``artist`` + ``track`` (deduped by title)."""
+# ---------------------------------------------------------------------------
+# Legacy compatibility surface
+# ---------------------------------------------------------------------------
 
-    settings = get_settings()
-    artist = artist.strip()
-    track = track.strip()
-    if not artist or not track:
-        return []
+DiscogsAlbum = Album
+DiscogsResolution = AlbumResolution
 
-    queries = (f'{artist} "{track}"', f"{artist} {track}")
-    collected: list[DiscogsAlbum] = []
-    seen_titles: set[str] = set()
-    try:
-        async with httpx.AsyncClient(timeout=settings.discogs_timeout_seconds) as client:
-            for q in queries:
-                for kind in ("master", "release"):
-                    try:
-                        resp = await client.get(
-                            f"{settings.discogs_base_url}/database/search",
-                            params={"q": q, "type": kind, "per_page": 25, "page": 1},
-                            headers=_headers(),
-                        )
-                        resp.raise_for_status()
-                        blob = resp.json() or {}
-                    except httpx.HTTPError:
-                        continue
-                    except Exception:
-                        logger.exception("search_release_by_track_http")
-                        continue
 
-                    for hit in blob.get("results") or []:
-                        album = _album_from_track_search_hit(hit, track)
-                        if album is None:
-                            continue
-                        key = album.title.strip().lower()
-                        if key in seen_titles:
-                            continue
-                        seen_titles.add(key)
-                        collected.append(album)
-    except Exception:
-        logger.exception("search_release_by_track_failed")
-        return []
-    return collected
+async def get_artist_discography(artist: str) -> list[Album]:
+    return await get_studio_albums(artist)
+
+
+async def search_release_by_track(artist: str, track: str) -> list[Album]:
+    return []
