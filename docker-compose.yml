@@ -23,7 +23,16 @@ services:
       dockerfile: Dockerfile
     environment:
       NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://backend:8000}
+      # Bind mounts often miss file events on Docker Desktop — polling makes `next dev` pick up saves
+      WATCHPACK_POLLING: "true"
+      CHOKIDAR_USEPOLLING: "true"
     ports:
       - "3000:3000"
+    volumes:
+      # Live code from host; refresh / Fast Refresh without rebuilding the image
+      - ./frontend:/app
+      # Keep deps and build cache inside the container (avoid empty host node_modules / arch mismatch)
+      - /app/node_modules
+      - /app/.next
     depends_on:
       - backend

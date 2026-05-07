@@ -4,21 +4,23 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:nodemon": "nodemon --watch app --watch components --watch lib --watch next.config.mjs --watch tailwind.config.ts --watch postcss.config.js --ignore .next --ignore node_modules --delay 200ms --exec \"next dev -H 0.0.0.0 -p 3000\"",
     "build": "next build",
     "start": "next start"
   },
   "dependencies": {
-    "next": "*",
-    "react": "*",
-    "react-dom": "*"
+    "next": "14.2.18",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "typescript": "*",
-    "@types/node": "*",
-    "@types/react": "*",
-    "@types/react-dom": "*",
-    "tailwindcss": "*",
-    "postcss": "*",
-    "autoprefixer": "*"
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.2",
+    "nodemon": "^3.1.9"
   }
 }
