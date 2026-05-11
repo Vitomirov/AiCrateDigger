@@ -11,15 +11,21 @@ import logging
 from typing import Any
 
 from app.config import get_settings
+from app.db.cache import (
+    build_search_cache_key,
+    get_cached_search_payload,
+    hydrate_cached_pipeline_dict,
+    set_cached_search_payload,
+)
+from app.db.store_loader import load_active_stores
 from app.llm.extract_listings import extract_listings
 from app.llm.parse_user_query import parse_user_query
 from app.models.result import ListingResult
 from app.pipeline_context import stage_timer
-from app.policies.eu_stores import get_active_stores
 from app.policies.search_dsl import build_query_core, build_tavily_core_query
 from app.services.discogs_service import resolve_album_by_index
-from app.services.tavily_service import run_tavily_for_store_domains
-from app.validators.listings import validate_listing
+from app.services.tavily_service import normalize_url, run_tavily_for_store_domains
+from app.validators.listings import normalize_whitelist_domain, validate_listing
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,21 @@ def _preview_listings_dicts(items: list[Any], *, n: int = _PREVIEW_N) -> list[di
                 },
             )
     return previews
+
+
+def _dedupe_listings_by_normalized_url(listings: list[Any]) -> list[Any]:
+    """Preserve first-seen order; URLs match Tavily normalization (tracking params stripped)."""
+    order: list[str] = []
+    by_key: dict[str, Any] = {}
+    for lst in listings:
+        u = getattr(lst, "url", None)
+        if not u:
+            continue
+        key = normalize_url(str(u))
+        if key not in by_key:
+            by_key[key] = lst
+            order.append(key)
+    return [by_key[k] for k in order]
 
 
 def _listing_to_api_row(listing: Any) -> ListingResult:
@@ -122,9 +143,9 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         2. discogs      — deterministic album resolution (ordinal or literal).
         3. stores       — load active EU vinyl stores from the whitelist.
         4. query_build  — one shared intent string + batched ``include_domains`` (not one Tavily call per store).
-        5. tavily       — constrained web search backend.
-        6. extract      — LLM extracts Listing JSON from the survivors.
-        7. validate     — hard rules: domain allowlist, title match, price.
+        5. tavily       — ≤6 batched HTTP calls, deduped URLs, tight per-domain caps.
+        6. extract      — LLM extracts Listing JSON from survivors.
+        7. validate     — allowlist + title match + price; dedupe URLs; cap at ``pipeline_max_results`` (default 4).
     """
     settings = get_settings()
     debug_enabled = settings.debug
@@ -202,10 +223,32 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         )
         return out
 
+    cache_key_value = build_search_cache_key(
+        user_query=query,
+        artist=parsed.artist,
+        album_title=album_title,
+        debug=debug_enabled,
+    )
+    cached_payload = await get_cached_search_payload(cache_key_value)
+    if cached_payload is not None:
+        hydrated = hydrate_cached_pipeline_dict(cached_payload)
+        cap = settings.pipeline_max_results
+        if len(hydrated["results"]) > cap:
+            hydrated["results"] = hydrated["results"][:cap]
+        _log_stage(
+            "after_cache_hit",
+            counts={"validated_count": len(hydrated["results"])},
+            preview={"results_head": _preview_listings_dicts(list(hydrated["results"]), n=_PREVIEW_N)},
+            artist=parsed.artist,
+            album_title=album_title,
+        )
+        return hydrated
+
     # 3. Load stores
     with stage_timer("stores") as rec:
-        stores = get_active_stores()
+        stores = await load_active_stores()
         rec.output = {"count": len(stores)}
+
 
     _log_stage(
         "after_stores",
@@ -214,6 +257,8 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         artist=parsed.artist,
         album_title=album_title,
     )
+
+    allowed_domains_frozen = frozenset(normalize_whitelist_domain(s.domain) for s in stores if s.domain)
 
     # 4. Build search intent + allowlisted domains (compression: one core query for Tavily)
     with stage_timer("query_build", input={"album": album_title}) as rec:
@@ -296,9 +341,9 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         queries=queries,
     )
 
-    # 7. Validate
+    # 7. Validate + dedupe + cap for API/Tavily budget (~6 upstream calls → 4 hits)
     with stage_timer("validate", input={"input_count": len(listings)}) as rec:
-        validated = [
+        validated_raw = [
             listing
             for listing in listings
             if validate_listing(
@@ -307,10 +352,16 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                         "validation_artist": parsed.artist,
                         "validation_album": album_title,
                     }
-                )
+                ),
+                allowed_domains=allowed_domains_frozen,
             )
         ]
-        rec.output = {"count": len(validated)}
+        validated = _dedupe_listings_by_normalized_url(validated_raw)
+        validated = validated[: settings.pipeline_max_results]
+        rec.output = {
+            "count": len(validated),
+            "validated_before_dedupe": len(validated_raw),
+        }
 
     _log_stage(
         "after_validate",
@@ -347,5 +398,14 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             "validated_count": len(validated),
             "validated_preview": _preview_listings_dicts(validated, n=8),
         }
+
+    await set_cached_search_payload(
+        cache_key_value,
+        {
+            "query": out["query"],
+            "results": [r.model_dump() for r in out["results"]],
+        },
+        ttl_seconds=settings.search_cache_ttl_seconds,
+    )
 
     return out

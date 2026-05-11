@@ -26,6 +26,8 @@ FORBIDDEN_DOMAINS = (
     "ebay.com",
     "amazon.",
     "acousticsounds.com",
+    "kupujemprodajem.com",
+    "kupindo.com",
 )
 
 
@@ -36,10 +38,6 @@ def is_valid_result(url: str) -> bool:
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 MAX_RESULTS_PER_QUERY = 10
-# Batched include_domains: fewer API calls; slightly higher cap per call for coverage.
-MAX_RESULTS_PER_BATCHED_CALL = 16
-TAVILY_DOMAIN_CHUNK_SIZE = 10
-MAX_RESULTS_PER_DOMAIN = 3
 REQUEST_TIMEOUT_SECONDS = 15.0
 # Tavily-reported relevance below this is usually noise (wrong artist/topic).
 MIN_TAVILY_SCORE = 0.12
@@ -78,10 +76,22 @@ def _dedupe_domains(domains: list[str]) -> list[str]:
     return out
 
 
-def _chunk_domains(domains: list[str], chunk_size: int) -> list[list[str]]:
-    if chunk_size <= 0:
-        return [domains]
-    return [domains[i : i + chunk_size] for i in range(0, len(domains), chunk_size)]
+def _chunk_domains_budgeted(domains: list[str], max_calls: int) -> list[list[str]]:
+    """Split into at most ``max_calls`` chunks with near-even sizes (minimises Tavily HTTP calls)."""
+    if not domains:
+        return []
+    n = len(domains)
+    calls = min(max(1, max_calls), n)
+    base, extra = divmod(n, calls)
+    chunks: list[list[str]] = []
+    idx = 0
+    for i in range(calls):
+        sz = base + (1 if i < extra else 0)
+        if sz <= 0:
+            break
+        chunks.append(domains[idx : idx + sz])
+        idx += sz
+    return chunks if chunks else [domains]
 
 
 def normalize_url(url: str) -> str:
@@ -110,7 +120,7 @@ async def _search_single_query(
         "query": query,
         "search_depth": "advanced",
         "max_results_per_query": max_r,
-        "max_results_per_domain": MAX_RESULTS_PER_DOMAIN,
+        "max_results_per_domain": settings.tavily_max_results_per_domain_aggregate,
     }
     if inc:
         payload["include_domains"] = inc
@@ -161,20 +171,25 @@ async def _search_single_query(
 
 
 async def run_tavily_for_store_domains(core_query: str, store_domains: list[str]) -> list[SearchResult]:
-    """Run one batched Tavily strategy per intent: same ``core_query``, shared ``include_domains``.
+    """Run batched Tavily with a hard cap on HTTP calls (see ``settings.tavily_max_http_calls``).
 
-    Collapses N near-duplicate ``… vinyl site:`` strings into ≤ ceil(N / chunk) HTTP calls
-    while preserving the same allowlisted domain union.
+    Domain list is split into ≤ N near-even batches so Tavily credits stay predictable
+    (~6 calls upstream, ~4 listings after extraction/validation downstream).
     """
     if not (core_query or "").strip() or not store_domains:
         return []
 
+    settings = get_settings()
     q = core_query.strip()
     domains = _dedupe_domains(list(store_domains))
     if not domains:
         return []
 
-    chunks = _chunk_domains(domains, TAVILY_DOMAIN_CHUNK_SIZE)
+    max_calls = settings.tavily_max_http_calls
+    max_batch_results = settings.tavily_max_results_per_batch
+    max_per_dom = settings.tavily_max_results_per_domain_aggregate
+
+    chunks = _chunk_domains_budgeted(domains, max_calls)
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         tasks = [
@@ -182,7 +197,7 @@ async def run_tavily_for_store_domains(core_query: str, store_domains: list[str]
                 client,
                 q,
                 include_domains=chunk,
-                max_results=MAX_RESULTS_PER_BATCHED_CALL,
+                max_results=max_batch_results,
             )
             for chunk in chunks
         ]
@@ -208,7 +223,7 @@ async def run_tavily_for_store_domains(core_query: str, store_domains: list[str]
     for res in sorted_candidates:
         domain = urlparse(res.url).netloc.lower()
         count = domain_counts.get(domain, 0)
-        if count >= MAX_RESULTS_PER_DOMAIN:
+        if count >= max_per_dom:
             dropped_by_domain_cap += 1
             continue
         final_results.append(res)
@@ -253,8 +268,11 @@ async def run_tavily_search(queries: list[str]) -> list[SearchResult]:
     if not queries:
         return []
 
+    settings = get_settings()
+    capped_queries = queries[: settings.tavily_max_http_calls]
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        tasks = [_search_single_query(client, q) for q in queries]
+        tasks = [_search_single_query(client, q) for q in capped_queries]
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
     unique_by_url: dict[str, SearchResult] = {}
@@ -275,10 +293,12 @@ async def run_tavily_search(queries: list[str]) -> list[SearchResult]:
     domain_counts: dict[str, int] = {}
     dropped_by_domain_cap = 0
 
+    max_per_dom = settings.tavily_max_results_per_domain_aggregate
+
     for res in sorted_candidates:
         domain = urlparse(res.url).netloc.lower()
         count = domain_counts.get(domain, 0)
-        if count >= MAX_RESULTS_PER_DOMAIN:
+        if count >= max_per_dom:
             dropped_by_domain_cap += 1
             continue
         final_results.append(res)
@@ -292,7 +312,7 @@ async def run_tavily_search(queries: list[str]) -> list[SearchResult]:
             "count": len(final_results),
             "output": {
                 "batched": False,
-                "tavily_http_calls": len(queries),
+                "tavily_http_calls": len(capped_queries),
                 "unique_urls": len(unique_by_url),
                 "kept": len(final_results),
                 "dropped_domain_cap": dropped_by_domain_cap,

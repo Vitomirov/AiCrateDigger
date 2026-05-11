@@ -1,4 +1,15 @@
-"""EU vinyl store whitelist (production seed)."""
+"""EU vinyl store whitelist (code seed).
+
+Hardcoded rows live in ``ALLOWED_STORES`` and seed PostgreSQL on first boot when
+``DATABASE_URL`` is set (see :func:`app.db.store_loader.seed_whitelist_stores_if_empty`).
+
+After seeding, ops can change the live allowlist with SQL/ORM on ``whitelist_stores``
+without redeploying — :func:`app.db.store_loader.load_active_stores` reads the DB.
+If the table is empty or Postgres is off, the pipeline falls back to this tuple.
+
+Domain checks in :mod:`app.validators.listings` use the same domains the pipeline
+loads for that request (DB-backed when configured).
+"""
 
 from __future__ import annotations
 
@@ -41,6 +52,8 @@ ALLOWED_STORES: tuple[StoreEntry, ...] = (
     StoreEntry("Dizonord", "dizonord.com", "FR", ("EU",), 7, True),
     StoreEntry("Born Bad Records", "bornbad.fr", "FR", ("EU",), 6, True),
     StoreEntry("Action Records", "actionrecords.co.uk", "UK", ("EU",), 7, True),
+    StoreEntry("Metropolis Music Company", "metropolismusic.rs", "RS", ("EU",), 7, True),
+    StoreEntry("Mascom Store", "mascom.rs", "RS", ("EU",), 7, True),
 )
 
 

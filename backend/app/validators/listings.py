@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _DEBUG_FUZZ_THRESHOLD = 80
 
 
-def _normalize_store_domain(domain: str) -> str:
+def normalize_whitelist_domain(domain: str) -> str:
     s = domain.strip().lower()
     if s.startswith("www."):
         s = s[4:]
@@ -39,20 +39,19 @@ def _normalize_listing_url_domain(url: str) -> str | None:
     return host or None
 
 
-_ALLOWED_URL_DOMAINS: frozenset[str] = frozenset(
-    _normalize_store_domain(s.domain) for s in ALLOWED_STORES if s.is_active
-)
+def default_allowed_domains() -> frozenset[str]:
+    return frozenset(normalize_whitelist_domain(s.domain) for s in ALLOWED_STORES if s.is_active)
 
 
-def _host_matches_store_whitelist(host: str) -> bool:
+def _host_matches_store_whitelist(host: str, allowed: frozenset[str]) -> bool:
     if not host:
         return False
     h = host.lower()
     if h.startswith("www."):
         h = h[4:]
-    if h in _ALLOWED_URL_DOMAINS:
+    if h in allowed:
         return True
-    return any(h.endswith("." + d) for d in _ALLOWED_URL_DOMAINS)
+    return any(h.endswith("." + d) for d in allowed)
 
 
 def _reject(reason: str, *, listing: Listing, extra: dict | None = None) -> bool:
@@ -69,12 +68,12 @@ def _reject(reason: str, *, listing: Listing, extra: dict | None = None) -> bool
     return False
 
 
-def _debug_minimal_pass(listing: Listing) -> tuple[bool, str | None]:
+def _debug_minimal_pass(listing: Listing, *, allowed_domains: frozenset[str]) -> tuple[bool, str | None]:
     url = listing.url
     if not url.startswith("http") or len(url) < 10:
         return False, "url_short_or_not_http"
     host = _normalize_listing_url_domain(url)
-    if host is None or not _host_matches_store_whitelist(host):
+    if host is None or not _host_matches_store_whitelist(host, allowed_domains):
         return False, "domain_not_allowed"
     if not (listing.title or "").strip():
         return False, "empty_title"
@@ -88,13 +87,18 @@ def _fuzzy_needle_ok(needle: str, title: str) -> tuple[bool, int]:
     return score >= _DEBUG_FUZZ_THRESHOLD, score
 
 
-def validate_listing(listing: Listing) -> bool:
+def validate_listing(
+    listing: Listing,
+    *,
+    allowed_domains: frozenset[str] | None = None,
+) -> bool:
     """Return True iff validation passes. Always logs on reject in strict mode."""
 
     settings = get_settings()
+    allowed = allowed_domains if allowed_domains is not None else default_allowed_domains()
 
     if settings.debug:
-        ok, reason = _debug_minimal_pass(listing)
+        ok, reason = _debug_minimal_pass(listing, allowed_domains=allowed)
         if not ok:
             return _reject(reason or "debug_minimal_fail", listing=listing)
 
@@ -132,7 +136,7 @@ def validate_listing(listing: Listing) -> bool:
 
     url = listing.url
     host = _normalize_listing_url_domain(url)
-    if host is None or not _host_matches_store_whitelist(host):
+    if host is None or not _host_matches_store_whitelist(host, allowed):
         return _reject("domain_not_allowed", listing=listing, extra={"host": host})
 
     album_needle = listing.validation_album

@@ -1,6 +1,21 @@
-version: "3.9"
-
 services:
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aicratedigger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aicratedigger}
+      POSTGRES_DB: ${POSTGRES_DB:-aicratedigger}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
 
   backend:
     build:
@@ -10,12 +25,15 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       DISCOGS_TOKEN: ${DISCOGS_TOKEN:-}
+      # Matches app.db.database: async SQLAlchemy + asyncpg (host `db` = Compose service name)
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://aicratedigger:aicratedigger@db:5432/aicratedigger}
     ports:
       - "8000:8000"
     volumes:
       - ./chroma_db:/app/chroma_db
-
+    depends_on:
+      db:
+        condition: service_healthy
 
   frontend:
     build:
@@ -36,3 +54,6 @@ services:
       - /app/.next
     depends_on:
       - backend
+
+volumes:
+  pgdata:
