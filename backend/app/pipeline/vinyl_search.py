@@ -13,62 +13,76 @@ from typing import Any
 from app.config import get_settings
 from app.db.cache import (
     build_search_cache_key,
+    build_tavily_tier_cache_key,
     get_cached_search_payload,
+    get_cached_tavily_tier_payload,
     hydrate_cached_pipeline_dict,
     set_cached_search_payload,
 )
 from app.db.store_loader import load_active_stores
-from app.llm.extract_listings import extract_listings
+from app.llm.extract_listings import ExtractListingsReport, extract_listings
 from app.llm.parse_user_query import parse_user_query
+from app.models.search_query import SearchResult
 from app.models.result import ListingResult
 from app.pipeline_context import stage_timer
-from app.policies.search_dsl import build_query_core, build_tavily_core_query
+from app.policies.eu_stores import StoreEntry
+from app.policies.geo_scope import (
+    NormalizedGeoIntent,
+    Tier,
+    TIER_NARROWNESS,
+    cap_stores,
+    filter_stores_for_tier,
+    geo_intent_from_parsed,
+    max_domains_for_tier,
+    normalized_geo_from_parsed,
+    sort_stores_for_tier,
+    sort_validated_listings_geo,
+    tier_fallback_order,
+)
+from app.policies.listing_rank import composite_listing_rank, resolve_store_for_url
+from app.policies.search_dsl import build_tavily_core_query
 from app.services.discogs_service import resolve_album_by_index
 from app.services.tavily_service import normalize_url, run_tavily_for_store_domains
 from app.validators.listings import normalize_whitelist_domain, validate_listing
 
 logger = logging.getLogger(__name__)
 
-_PREVIEW_LEN = 120
-_PREVIEW_N = 3
+_MIN_STORE_DOMAINS_DEFAULT = 2
+_MIN_STORE_DOMAINS_CITY = 1
 
 
-def _trunc(value: str | None, limit: int = _PREVIEW_LEN) -> str:
-    if value is None:
-        return ""
-    s = str(value)
-    return s if len(s) <= limit else f"{s[: limit - 3]}..."
+def _dedupe_store_entries_by_domain(capped: tuple[StoreEntry, ...]) -> tuple[StoreEntry, ...]:
+    seen: set[str] = set()
+    out: list[StoreEntry] = []
+    for s in capped:
+        k = normalize_whitelist_domain(s.domain)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return tuple(out)
 
 
-def _sample_urls(raw_results: list[Any], *, n: int = _PREVIEW_N) -> list[str]:
-    out: list[str] = []
-    for item in raw_results[:n]:
-        u = getattr(item, "url", None)
-        if u is None and isinstance(item, dict):
-            u = item.get("url")
-        out.append(_trunc(str(u) if u else "", 200))
-    return out
+def _tier_validated_stop_floor(tier: Tier, *, settings: Any) -> int:
+    if tier in ("city", "country"):
+        return int(settings.pipeline_geo_stop_country)
+    if tier == "region":
+        return int(settings.pipeline_geo_stop_region)
+    if tier == "continental":
+        return int(settings.pipeline_geo_stop_continental)
+    return 9999
 
 
-def _preview_listings_dicts(items: list[Any], *, n: int = _PREVIEW_N) -> list[dict[str, str]]:
-    previews: list[dict[str, str]] = []
-    for it in items[:n]:
-        if hasattr(it, "title") and hasattr(it, "url"):
-            previews.append(
-                {"title": _trunc(it.title), "url": _trunc(it.url, 200)},
-            )
-        elif isinstance(it, dict):
-            previews.append(
-                {
-                    "title": _trunc(it.get("title")),
-                    "url": _trunc(str(it.get("url") or ""), 200),
-                },
-            )
-    return previews
+def _effective_stop_floor(tier: Tier, *, settings: Any, confidence: float) -> int:
+    """High geo confidence → stop widening sooner; low → require more hits first."""
+    base = _tier_validated_stop_floor(tier, settings=settings)
+    if confidence >= 0.88:
+        return max(1, base)
+    bump = int((0.88 - confidence) * 6)
+    return min(20, max(1, base + max(0, bump)))
 
 
 def _dedupe_listings_by_normalized_url(listings: list[Any]) -> list[Any]:
-    """Preserve first-seen order; URLs match Tavily normalization (tracking params stripped)."""
     order: list[str] = []
     by_key: dict[str, Any] = {}
     for lst in listings:
@@ -82,11 +96,21 @@ def _dedupe_listings_by_normalized_url(listings: list[Any]) -> list[Any]:
     return [by_key[k] for k in order]
 
 
-def _listing_to_api_row(listing: Any) -> ListingResult:
-    """Map domain ``Listing`` to API ``ListingResult`` (stable for /search)."""
+def _listing_to_api_row(
+    listing: Any,
+    *,
+    norm: NormalizedGeoIntent,
+    store_by_domain: dict[str, StoreEntry],
+    listing_tier_map: dict[str, Tier],
+    default_tier: Tier,
+    album_title: str,
+    artist: str | None,
+    score_scale: float,
+) -> ListingResult:
     title = str(listing.title or "")
     if len(title) < 5:
         title = f"{title} · shop"
+
     price_str = None
     cur = listing.currency or "EUR"
     try:
@@ -94,10 +118,28 @@ def _listing_to_api_row(listing: Any) -> ListingResult:
             price_str = f"{float(listing.price):.2f} {cur}".rstrip("0").rstrip(".")
     except (TypeError, ValueError):
         price_str = f"{listing.price} {cur}" if listing.price else None
+
+    u = str(getattr(listing, "url", "") or "")
+    nk = normalize_url(u)
+    tier = listing_tier_map.get(nk, default_tier)
+    st = resolve_store_for_url(u, store_by_domain)
+
+    raw_rank = composite_listing_rank(
+        listing,
+        store=st,
+        discovery_tier=tier,
+        resolved_country=norm.resolved_country,
+        resolved_city=norm.resolved_city,
+        album_title=album_title,
+        artist=artist,
+    )
+    denom = score_scale if score_scale > 0 else 1.0
+    score_norm = min(max(raw_rank / denom, 0.0), 1.0)
+
     return ListingResult(
         url=listing.url,
         title=title,
-        score=1.0,
+        score=score_norm,
         price=price_str,
         location=None,
         availability="available" if listing.in_stock else "unknown",
@@ -109,44 +151,7 @@ def _listing_to_api_row(listing: Any) -> ListingResult:
     )
 
 
-def _log_stage(
-    stage: str,
-    *,
-    counts: dict[str, int] | None = None,
-    preview: Any = None,
-    artist: str | None = None,
-    album_title: str | None = None,
-    queries: list[str] | None = None,
-    status: str = "success",
-) -> None:
-    payload: dict[str, Any] = {
-        "stage": stage,
-        "status": status,
-        "counts": counts or {},
-    }
-    if preview is not None:
-        payload["preview"] = preview
-    if artist is not None or album_title is not None or queries is not None:
-        payload["keys"] = {
-            "artist": artist,
-            "album_title": album_title,
-            "queries_head": [_trunc(q, 200) for q in (queries or [])[:_PREVIEW_N]],
-        }
-    logger.info("vinyl_search_pipeline", extra=payload)
-
-
 async def run_vinyl_search(query: str) -> dict[str, Any]:
-    """Run the deterministic vinyl-search pipeline end-to-end.
-
-    Strict step order:
-        1. parse        — LLM parses the user query into ParsedQuery.
-        2. discogs      — deterministic album resolution (ordinal or literal).
-        3. stores       — load active EU vinyl stores from the whitelist.
-        4. query_build  — one shared intent string + batched ``include_domains`` (not one Tavily call per store).
-        5. tavily       — ≤6 batched HTTP calls, deduped URLs, tight per-domain caps.
-        6. extract      — LLM extracts Listing JSON from survivors.
-        7. validate     — allowlist + title match + price; dedupe URLs; cap at ``pipeline_max_results`` (default 4).
-    """
     settings = get_settings()
     debug_enabled = settings.debug
 
@@ -155,73 +160,27 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     store_domains: list[str] = []
     raw_results: list[Any] = []
     listings: list[Any] = []
-    validated: list[Any] = []
     album_title: str | None = None
     stores: tuple[Any, ...] = ()
 
-    # 1. Parse
     with stage_timer("parse", input={"query": query}) as rec:
         parsed = await parse_user_query(query)
         rec.output = parsed.model_dump()
 
-    _log_stage(
-        "after_parse",
-        counts={"fields": 4},
-        preview={"parsed": {k: _trunc(str(v) if v is not None else "") for k, v in parsed.model_dump().items()}},
-        artist=parsed.artist,
-        album_title=parsed.album,
-    )
-
-    # 2. Discogs resolution
-    with stage_timer(
-        "discogs",
-        input={
-            "artist": parsed.artist,
-            "album": parsed.album,
-            "album_index": parsed.album_index,
-        },
-    ) as rec:
+    with stage_timer("discogs") as rec:
         if parsed.album_index is not None:
             resolution = await resolve_album_by_index(
                 artist=parsed.artist,
                 album_index=parsed.album_index,
             )
             album_title = resolution.album.title if resolution.album else None
-            rec.output = {"album": album_title, "confidence": resolution.confidence}
         elif parsed.album:
             album_title = parsed.album
-            rec.output = {"album": album_title, "confidence": "literal"}
         else:
             album_title = None
-            rec.status = "empty"
-            rec.output = {"album": None}
-
-    _log_stage(
-        "after_discogs",
-        counts={"has_album_title": 1 if album_title else 0},
-        preview={"album_title": _trunc(album_title)},
-        artist=parsed.artist,
-        album_title=album_title,
-    )
 
     if album_title is None:
-        out: dict[str, Any] = {"query": query, "results": []}
-        if debug_enabled:
-            out["debug"] = {
-                "queries": [],
-                "raw_results_count": 0,
-                "extracted_count": 0,
-                "validated_count": 0,
-            }
-        _log_stage(
-            "after_early_exit",
-            status="empty",
-            counts={"raw_results_count": 0, "extracted_count": 0, "validated_count": 0},
-            artist=parsed.artist,
-            album_title=None,
-            queries=[],
-        )
-        return out
+        return {"query": query, "results": []}
 
     cache_key_value = build_search_cache_key(
         user_query=query,
@@ -229,182 +188,179 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         album_title=album_title,
         debug=debug_enabled,
     )
+
     cached_payload = await get_cached_search_payload(cache_key_value)
     if cached_payload is not None:
-        hydrated = hydrate_cached_pipeline_dict(cached_payload)
-        cap = settings.pipeline_max_results
-        if len(hydrated["results"]) > cap:
-            hydrated["results"] = hydrated["results"][:cap]
-        _log_stage(
-            "after_cache_hit",
-            counts={"validated_count": len(hydrated["results"])},
-            preview={"results_head": _preview_listings_dicts(list(hydrated["results"]), n=_PREVIEW_N)},
-            artist=parsed.artist,
-            album_title=album_title,
-        )
-        return hydrated
+        return hydrate_cached_pipeline_dict(cached_payload)
 
-    # 3. Load stores
     with stage_timer("stores") as rec:
         stores = await load_active_stores()
-        rec.output = {"count": len(stores)}
 
+    geo = geo_intent_from_parsed(parsed)
+    norm = normalized_geo_from_parsed(parsed)
 
-    _log_stage(
-        "after_stores",
-        counts={"stores": len(stores)},
-        preview={"stores": [{"domain": _trunc(s.domain), "name": _trunc(s.name)} for s in stores[:_PREVIEW_N]]},
-        artist=parsed.artist,
-        album_title=album_title,
-    )
-
-    allowed_domains_frozen = frozenset(normalize_whitelist_domain(s.domain) for s in stores if s.domain)
-
-    # 4. Build search intent + allowlisted domains (compression: one core query for Tavily)
-    with stage_timer("query_build", input={"album": album_title}) as rec:
-        # Tavily: quoted album, no location (avoids skew + junk pages; domains are EU allowlist).
-        core_query = build_tavily_core_query(parsed.artist, album_title)
-        store_domains = [s.domain for s in stores]
-        rec.output = {
-            "core_query_len": len(core_query),
-            "domains": len(store_domains),
-            "user_location_omitted_from_tavily": bool((parsed.location or "").strip()),
-        }
-
+    core_query = build_tavily_core_query(parsed.artist, album_title)
     queries = [core_query]
 
-    _log_stage(
-        "after_query_build",
-        counts={"domains": len(store_domains)},
-        preview={
-            "core_query": _trunc(core_query, 200),
-            "domains_head": [_trunc(d, 80) for d in store_domains[:_PREVIEW_N]],
-        },
-        artist=parsed.artist,
-        album_title=album_title,
-        queries=queries,
+    tier_queue = list(tier_fallback_order(geo, norm))
+    tier_ix = 0
+    executed_global_fallback = False
+
+    aggregated: dict[str, Any] = {}
+    listing_tier_map: dict[str, Tier] = {}
+    store_lookup: dict[str, StoreEntry] = {}
+    extract_report: ExtractListingsReport | None = None
+    last_tier: Tier = "continental"
+    tiers_attempted: list[Tier] = []
+
+    all_allowed = frozenset(
+        normalize_whitelist_domain(s.domain) for s in stores if getattr(s, "domain", None)
     )
 
-    # 5. Search (batched Tavily: ceil(|domains| / chunk) HTTP calls)
-    with stage_timer("tavily", input={"domains": len(store_domains)}) as rec:
-        raw_results = await run_tavily_for_store_domains(core_query, store_domains)
-        rec.output = {"count": len(raw_results)}
+    while True:
+        if tier_ix < len(tier_queue):
+            tier = tier_queue[tier_ix]
+            tier_ix += 1
+        elif (
+            not aggregated
+            and not executed_global_fallback
+            and "global" not in tier_queue
+        ):
+            tier = "global"
+            executed_global_fallback = True
+        else:
+            break
 
-    _log_stage(
-        "after_tavily",
-        counts={"raw_results_count": len(raw_results)},
-        preview={"sample_urls": _sample_urls(raw_results)},
-        artist=parsed.artist,
-        album_title=album_title,
-        queries=queries,
-    )
+        tiers_attempted.append(tier)
 
-    # 6. Extract
-    with stage_timer("extract", input={"raw_count": len(raw_results)}) as rec:
-        extract_report = await extract_listings(
-            [r.model_dump() for r in raw_results],
-            artist=parsed.artist,
-            album=album_title,
-            allowed_domains=set(store_domains),
-        )
-        listings = extract_report.listings
-        rec.output = {"count": len(listings), **extract_report.diagnostic}
-
-    if len(listings) == 0:
-        diag = extract_report.diagnostic
-        reason = diag.get("empty_reason") or "unknown"
-        parts = [
-            f"empty_reason={reason}",
-            f"prefilter_candidates={diag.get('prefilter_candidates')}",
-            f"llm_rows={diag.get('llm_rows_returned')}",
-            f"json_parse_ok={diag.get('json_parse_ok')}",
-            f"drop_url={diag.get('drop_url_not_in_candidates')}",
-            f"drop_title_gate={diag.get('drop_title_gate')}",
-            f"drop_pydantic={diag.get('drop_pydantic')}",
-        ]
-        logger.info(
-            "vinyl_search_extract_zero_results",
-            extra={
-                "stage": "vinyl_search",
-                "album_title": album_title,
-                "diagnostic": diag,
-                "summary": "; ".join(str(p) for p in parts),
-            },
+        pool = filter_stores_for_tier(stores, geo, tier, norm=norm)
+        sorted_pool = sort_stores_for_tier(pool, geo, tier, norm=norm)
+        max_d = max_domains_for_tier(
+            tier,
+            local_max=settings.pipeline_geo_local_max_domains,
+            regional_max=settings.pipeline_geo_regional_max_domains,
+            global_max=settings.pipeline_geo_global_max_domains,
         )
 
-    _log_stage(
-        "after_extract_listings",
-        counts={"extracted_count": len(listings)},
-        preview={"listings": _preview_listings_dicts(listings)},
-        artist=parsed.artist,
-        album_title=album_title,
-        queries=queries,
-    )
+        capped = cap_stores(sorted_pool, max_domains=max_d)
+        capped = _dedupe_store_entries_by_domain(capped)
 
-    # 7. Validate + dedupe + cap for API/Tavily budget (~6 upstream calls → 4 hits)
-    with stage_timer("validate", input={"input_count": len(listings)}) as rec:
-        validated_raw = [
-            listing
-            for listing in listings
-            if validate_listing(
-                listing.model_copy(
-                    update={
-                        "validation_artist": parsed.artist,
-                        "validation_album": album_title,
-                    }
-                ),
-                allowed_domains=allowed_domains_frozen,
+        min_dom = _MIN_STORE_DOMAINS_CITY if tier == "city" else _MIN_STORE_DOMAINS_DEFAULT
+        if len(capped) < min_dom:
+            logger.info(
+                "tier_skipped_low_signal",
+                extra={"tier": tier, "domains": len(capped)},
             )
-        ]
-        validated = _dedupe_listings_by_normalized_url(validated_raw)
-        validated = validated[: settings.pipeline_max_results]
-        rec.output = {
-            "count": len(validated),
-            "validated_before_dedupe": len(validated_raw),
-        }
+            continue
 
-    _log_stage(
-        "after_validate",
-        counts={"validated_count": len(validated)},
-        preview={"validated": _preview_listings_dicts(validated)},
+        tier_lookup = {normalize_whitelist_domain(s.domain): s for s in capped}
+
+        for dom, row in tier_lookup.items():
+            store_lookup[dom] = row
+
+        store_domains = [normalize_whitelist_domain(s.domain) for s in capped if s.domain]
+
+        tkey = build_tavily_tier_cache_key(
+            artist=parsed.artist,
+            album_title=album_title or "",
+            tier=tier,
+        )
+
+        cached_raw = await get_cached_tavily_tier_payload(tkey)
+        cache_hit = cached_raw is not None
+
+        with stage_timer("tavily") as rec:
+            if cache_hit:
+                raw_results = [SearchResult.model_validate(x) for x in (cached_raw or [])]
+            else:
+                raw_results, _ = await run_tavily_for_store_domains(
+                    core_query,
+                    store_domains,
+                    tier=tier,
+                )
+
+        with stage_timer("extract") as rec:
+            extract_report = await extract_listings(
+                [r.model_dump() for r in raw_results],
+                artist=parsed.artist,
+                album=album_title,
+                allowed_domains=set(store_domains),
+            )
+            listings = extract_report.listings
+
+        with stage_timer("validate") as rec:
+            batch = _dedupe_listings_by_normalized_url(listings)
+
+        accepted: list[Any] = []
+        for lst in batch:
+            enriched = lst.model_copy(
+                update={
+                    "validation_album": album_title,
+                    "validation_artist": parsed.artist,
+                }
+            )
+            if not validate_listing(enriched, allowed_domains=all_allowed):
+                continue
+            accepted.append(enriched)
+
+        for lst in accepted:
+            k = normalize_url(str(lst.url))
+            prev_tier = listing_tier_map.get(k)
+            if prev_tier is None or TIER_NARROWNESS[tier] < TIER_NARROWNESS[prev_tier]:
+                aggregated[k] = lst
+                listing_tier_map[k] = tier
+
+        last_tier = tier
+
+        need = _effective_stop_floor(tier, settings=settings, confidence=norm.confidence)
+        if len(aggregated) >= need:
+            break
+
+    list_out = list(aggregated.values())
+    sorted_listings = sort_validated_listings_geo(
+        list_out,
+        store_by_domain=store_lookup,
+        norm=norm,
+        listing_tier_map=listing_tier_map,
+        album_title=album_title or "",
         artist=parsed.artist,
-        album_title=album_title,
-        queries=queries,
     )
+
+    head = sorted_listings[: settings.pipeline_max_results]
+    scores = [
+        composite_listing_rank(
+            lst,
+            store=resolve_store_for_url(str(lst.url), store_lookup),
+            discovery_tier=listing_tier_map.get(normalize_url(str(lst.url)), last_tier),
+            resolved_country=norm.resolved_country,
+            resolved_city=norm.resolved_city,
+            album_title=album_title or "",
+            artist=parsed.artist,
+        )
+        for lst in head
+    ]
+    score_scale = max(scores) if scores else 1.0
 
     out = {
         "query": query,
-        "results": [_listing_to_api_row(listing) for listing in validated],
+        "results": [
+            _listing_to_api_row(
+                listing,
+                norm=norm,
+                store_by_domain=store_lookup,
+                listing_tier_map=listing_tier_map,
+                default_tier=last_tier,
+                album_title=album_title or "",
+                artist=parsed.artist,
+                score_scale=score_scale,
+            )
+            for listing in head
+        ],
     }
-    if debug_enabled:
-        out["debug"] = {
-            "search_core": core_query,
-            "search_core_with_location": build_query_core(parsed.artist, album_title, parsed.location),
-            "store_domains": list(store_domains),
-            "allowed_domains_head": sorted(set(store_domains))[:25],
-            "stores_count": len(stores),
-            "raw_results_count": len(raw_results),
-            "raw_results_preview": [
-                {
-                    "url": _trunc(str(getattr(r, "url", "") or ""), 240),
-                    "title": _trunc(str(getattr(r, "title", "") or "")),
-                    "score": float(getattr(r, "score", 0.0) or 0.0),
-                }
-                for r in raw_results[:8]
-            ],
-            "extracted_count": len(listings),
-            "extract_diagnostic": extract_report.diagnostic,
-            "listings_preview": _preview_listings_dicts(listings, n=8),
-            "validated_count": len(validated),
-            "validated_preview": _preview_listings_dicts(validated, n=8),
-        }
 
     await set_cached_search_payload(
         cache_key_value,
-        {
-            "query": out["query"],
-            "results": [r.model_dump() for r in out["results"]],
-        },
+        out,
         ttl_seconds=settings.search_cache_ttl_seconds,
     )
 

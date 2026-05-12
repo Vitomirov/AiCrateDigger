@@ -1,8 +1,9 @@
 """Hard-rule validators for extracted Listing objects.
 
-Strict checks when ``settings.debug`` is false. When ``debug`` is true, URL /
-domain / non-empty title plus **rapidfuzz** partial_ratio ≥ 80 on artist & album
-needles (when present).
+Production strict mode: whitelist domain, reject known non-product URLs/titles, then
+RapidFuzz **token_set_ratio** / **partial_ratio** on album (and artist when set).
+
+Debug mode: looser fuzz floor via ``listing_validation_debug_album_fuzz_min``.
 
 Rejections log a deterministic ``reason``.
 """
@@ -11,24 +12,129 @@ from __future__ import annotations
 
 import logging
 import math
-from urllib.parse import urlsplit
+import re
+from urllib.parse import urlparse, urlsplit
 
 from rapidfuzz import fuzz
 
 from app.config import get_settings
 from app.domain.listing_schema import Listing
 from app.policies.eu_stores import ALLOWED_STORES
+from app.policies.store_domain import canonical_store_domain
 
 logger = logging.getLogger(__name__)
 
-_DEBUG_FUZZ_THRESHOLD = 80
+# Title phrases typical of hubs, blogs, gift guides (not SKU rows).
+_TITLE_NON_PRODUCT_SNIPPETS: tuple[str, ...] = (
+    "staff pick",
+    "staff picks",
+    "editor's pick",
+    "editors pick",
+    "gift guide",
+    "buyer's guide",
+    "buyers guide",
+    "music news",
+    "interview with",
+    "essential metal",
+    "essential rock",
+    "top metal albums",
+    "top rock albums",
+    "best metal albums",
+    "best rock albums",
+    "our favourite albums",
+    "our favorite albums",
+    "our vinyl collection",
+    "complete vinyl collection",
+    "recommendation",
+    "recommendations",
+    "vinyl playlist",
+    "browse our",
+    "just in:",
+)
+
+# Path fragments that usually indicate editorial / artist hubs (not PDPs).
+_URL_HUB_SUBSTRINGS: tuple[str, ...] = (
+    "/blog",
+    "/blogs/news",
+    "/blogs/post",
+    "/blogs/article",
+    "/news/",
+    "/magazine/",
+    "/mag/",
+    "/editorial/",
+    "/features/",
+    "/feature/",
+    "/story/",
+    "/stories/",
+    "/podcast/",
+    "/playlists/",
+    "/playlist/",
+    "/tag/",
+    "/tags/",
+    "/articles/",
+    "/article/",
+    "/lists/",
+    "/guides/",
+    "/guide/",
+    "/recommendations/",
+    "/recommendation/",
+    "/charts/",
+    "/chart/",
+    "/bestseller",
+    "/best-of",
+    "/best_of",
+    "/search?",
+    "/search/",
+    "/category/",
+    "/categories/",
+    "/genre/",
+    "/genres/",
+    "/about",
+    "/contact",
+    "/help",
+    "/faq",
+)
+
+# Shallow artist/band/label index paths (no product slug).
+_ARTIST_HUB_PATH_RE = re.compile(
+    r"/(artist[s]?|band[s]?|label[s]?|genre[s]?)/[^/]+/?$",
+    re.IGNORECASE,
+)
+# When present, these suggest a buyable product URL — skip hub rejection.
+_URL_PRODUCT_HINTS: tuple[str, ...] = (
+    "/product/",
+    "/products/",
+    "/p/",
+    "/item/",
+    "/items/",
+    "/shop/",
+    "/buy/",
+    "add-to-cart",
+    ".html",
+)
+_URL_PRODUCT_SUFFIX_RE = re.compile(r"-p-?\d+(?:[/?#]|$)", re.IGNORECASE)
 
 
 def normalize_whitelist_domain(domain: str) -> str:
-    s = domain.strip().lower()
-    if s.startswith("www."):
-        s = s[4:]
-    return s
+    """Host-only lowercase key for allowlists and ``include_domains`` (no path/scheme)."""
+    return canonical_store_domain(domain)
+
+
+def url_suggests_product_detail_page(url: str) -> bool:
+    """Heuristic PDP URL — relaxes fuzzy gates and extract prefilter when True."""
+    try:
+        parsed = urlparse(url.strip())
+        path = parsed.path or "/"
+    except Exception:
+        return False
+    if _url_has_product_hint(path):
+        return True
+    pl = path.lower()
+    if re.search(r"/[a-z0-9_-]{3,}-\d{3,}(?:/)?$", pl):
+        return True
+    if re.search(r"/\d{5,}(?:[/?#]|$)", pl):
+        return True
+    return False
 
 
 def _normalize_listing_url_domain(url: str) -> str | None:
@@ -64,8 +170,59 @@ def _reject(reason: str, *, listing: Listing, extra: dict | None = None) -> bool
     }
     if extra:
         payload["detail"] = extra
-    logger.info("listing_validation", extra=payload)
+    logger.debug("listing_validation", extra=payload)
     return False
+
+
+def _url_has_product_hint(path: str) -> bool:
+    pl = path.lower()
+    if any(h in pl for h in _URL_PRODUCT_HINTS):
+        return True
+    if _URL_PRODUCT_SUFFIX_RE.search(pl):
+        return True
+    return False
+
+
+def _url_looks_non_product(url: str) -> bool:
+    """True when the URL clearly points at a hub / blog / category page.
+
+    A positive product hint short-circuits hub rejection (Shopify nests PDPs as
+    ``/collections/<x>/products/<y>`` and product hints win).
+    """
+    try:
+        parsed = urlparse(url.strip())
+        path = parsed.path or "/"
+    except Exception:
+        return True
+
+    pl = path.lower()
+    has_product_hint = _url_has_product_hint(pl)
+
+    if has_product_hint:
+        return False
+    if _ARTIST_HUB_PATH_RE.search(pl):
+        return True
+    if "/collections/" in pl and "/products/" not in pl:
+        return True
+    return any(fragment in pl for fragment in _URL_HUB_SUBSTRINGS)
+
+
+def _title_looks_non_product(title: str) -> bool:
+    t = (title or "").strip().lower()
+    if not t:
+        return True
+    return any(s in t for s in _TITLE_NON_PRODUCT_SNIPPETS)
+
+
+def _fuzz_best_album_artist(needle: str, haystack: str) -> tuple[int, int, int]:
+    """Returns (partial_ratio, token_set_ratio, best_of_two)."""
+    if not needle.strip():
+        return 100, 100, 100
+    n = needle.lower()
+    h = haystack.lower()
+    pr = int(fuzz.partial_ratio(n, h))
+    ts = int(fuzz.token_set_ratio(n, h))
+    return pr, ts, max(pr, ts)
 
 
 def _debug_minimal_pass(listing: Listing, *, allowed_domains: frozenset[str]) -> tuple[bool, str | None]:
@@ -80,13 +237,6 @@ def _debug_minimal_pass(listing: Listing, *, allowed_domains: frozenset[str]) ->
     return True, None
 
 
-def _fuzzy_needle_ok(needle: str, title: str) -> tuple[bool, int]:
-    if not needle.strip():
-        return True, 100
-    score = int(fuzz.partial_ratio(needle.lower(), title.lower()))
-    return score >= _DEBUG_FUZZ_THRESHOLD, score
-
-
 def validate_listing(
     listing: Listing,
     *,
@@ -96,66 +246,119 @@ def validate_listing(
 
     settings = get_settings()
     allowed = allowed_domains if allowed_domains is not None else default_allowed_domains()
+    album_min = int(settings.listing_validation_album_fuzz_min)
+    artist_min = int(settings.listing_validation_artist_fuzz_min)
+    relief = int(settings.listing_validation_pdp_fuzz_relief)
+    debug_album_min = int(settings.listing_validation_debug_album_fuzz_min)
+
+    url = listing.url
+    title = (listing.title or "").strip()
 
     if settings.debug:
         ok, reason = _debug_minimal_pass(listing, allowed_domains=allowed)
         if not ok:
             return _reject(reason or "debug_minimal_fail", listing=listing)
 
+        if _url_looks_non_product(url):
+            return _reject("non_product_url", listing=listing)
+        if _title_looks_non_product(title):
+            return _reject("non_product_title", listing=listing)
+
         album_needle = (listing.validation_album or "").strip()
         artist_needle = (listing.validation_artist or "").strip()
-        title = (listing.title or "").strip()
 
         if album_needle:
-            ok_a, score_a = _fuzzy_needle_ok(album_needle, title)
-            if not ok_a:
+            pr, ts, best = _fuzz_best_album_artist(album_needle, title)
+            if best < debug_album_min:
                 return _reject(
                     "debug_album_fuzzy_below_threshold",
                     listing=listing,
-                    extra={"needle": album_needle[:80], "partial_ratio": score_a, "min": _DEBUG_FUZZ_THRESHOLD},
+                    extra={
+                        "needle": album_needle[:80],
+                        "partial_ratio": pr,
+                        "token_set_ratio": ts,
+                        "best": best,
+                        "min": debug_album_min,
+                    },
                 )
         if artist_needle:
-            ok_ar, score_ar = _fuzzy_needle_ok(artist_needle, title)
-            if not ok_ar:
+            pr, ts, best = _fuzz_best_album_artist(artist_needle, title)
+            if best < artist_min:
                 return _reject(
                     "debug_artist_fuzzy_below_threshold",
                     listing=listing,
-                    extra={"needle": artist_needle[:80], "partial_ratio": score_ar, "min": _DEBUG_FUZZ_THRESHOLD},
+                    extra={
+                        "needle": artist_needle[:80],
+                        "partial_ratio": pr,
+                        "token_set_ratio": ts,
+                        "best": best,
+                        "min": artist_min,
+                    },
                 )
 
-        logger.info(
+        logger.debug(
             "listing_validation",
             extra={
                 "stage": "validate_listing",
                 "status": "accept_debug",
-                "reason": "debug_fuzzy_minimal",
+                "reason": "debug_fuzzy_gates",
                 "url": listing.url[:500],
             },
         )
         return True
 
-    url = listing.url
     host = _normalize_listing_url_domain(url)
     if host is None or not _host_matches_store_whitelist(host, allowed):
         return _reject("domain_not_allowed", listing=listing, extra={"host": host})
 
+    if not url.startswith("http") or len(url) < 10:
+        return _reject("url_short_or_not_http", listing=listing)
+
+    if _url_looks_non_product(url):
+        return _reject("non_product_url", listing=listing, extra={"url": url[:240]})
+
+    if _title_looks_non_product(title):
+        return _reject("non_product_title", listing=listing)
+
     album_needle = listing.validation_album
     if not album_needle or album_needle.strip() == "":
         return _reject("missing_validation_album", listing=listing)
-    title_lower = listing.title.lower()
-    if album_needle.lower() not in title_lower:
+
+    pdp = url_suggests_product_detail_page(url)
+    eff_album_min = max(60, album_min - (relief if pdp else 0))
+    eff_artist_min = max(55, artist_min - (relief if pdp else 0))
+
+    pr_a, ts_a, best_album = _fuzz_best_album_artist(album_needle.strip(), title)
+    if best_album < eff_album_min:
         return _reject(
-            "album_not_in_title",
+            "album_fuzzy_below_threshold",
             listing=listing,
-            extra={"needle": album_needle[:80]},
+            extra={
+                "needle": album_needle[:80],
+                "partial_ratio": pr_a,
+                "token_set_ratio": ts_a,
+                "best": best_album,
+                "min": eff_album_min,
+                "pdp_relaxed": pdp,
+            },
         )
+
     artist_needle = listing.validation_artist
-    if artist_needle is not None and artist_needle.lower() not in title_lower:
-        return _reject(
-            "artist_not_in_title",
-            listing=listing,
-            extra={"needle": artist_needle[:80]},
-        )
+    if artist_needle is not None and artist_needle.strip() != "":
+        pr_ar, ts_ar, best_art = _fuzz_best_album_artist(artist_needle.strip(), title)
+        if best_art < eff_artist_min:
+            return _reject(
+                "artist_fuzzy_below_threshold",
+                listing=listing,
+                extra={
+                    "needle": artist_needle[:80],
+                    "partial_ratio": pr_ar,
+                    "token_set_ratio": ts_ar,
+                    "best": best_art,
+                    "min": eff_artist_min,
+                    "pdp_relaxed": pdp,
+                },
+            )
 
     price = listing.price
     if price is None:
@@ -169,8 +372,5 @@ def validate_listing(
     cur = listing.currency or "EUR"
     if len(cur) != 3 or cur != cur.upper() or not cur.isascii() or not cur.isalpha():
         return _reject("invalid_currency", listing=listing, extra={"currency": cur})
-
-    if not url.startswith("http") or len(url) < 10:
-        return _reject("url_short_or_not_http", listing=listing)
 
     return True

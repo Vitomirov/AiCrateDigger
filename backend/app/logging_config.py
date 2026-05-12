@@ -1,15 +1,9 @@
-"""Centralized structured (JSON) logging for AiCrateDigger.
+"""Centralized logging for AiCrateDigger.
 
-Every log record includes a stable set of top-level fields:
-    timestamp, level, logger, message, stage, request_id, duration_ms, status
+- ``log_format=json``: newline-delimited JSON (good for Loki/Datadog).
+- ``log_format=human``: multi-line, indents ``payload`` for local/Docker terminal use.
 
-Agents/services should emit events through `logger.info(...)` (or the helpers in
-`pipeline_context`) with an `extra={"stage": ..., "status": ..., ...}` dict; the
-formatter below promotes those keys to first-class fields and folds the rest
-into `payload`.
-
-This formatter has ZERO external dependencies so it works even if the image
-was built without `python-json-logger`.
+Set via env ``LOG_FORMAT`` or :attr:`app.config.Settings.log_format`.
 """
 
 from __future__ import annotations
@@ -19,10 +13,9 @@ import logging
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Literal
 
-# Keys that the formatter will promote to top-level of the JSON record if
-# present in `record.__dict__`. Anything else ends up under "payload".
+# Keys that the formatter will promote to top-level if present in `record.__dict__`.
 _PROMOTED_KEYS: tuple[str, ...] = (
     "stage",
     "status",
@@ -36,8 +29,6 @@ _PROMOTED_KEYS: tuple[str, ...] = (
     "reason",
 )
 
-# Keys owned by the `logging` module itself — we must NOT re-emit these under
-# `payload`, or we'd get huge noisy records.
 _RESERVED_LOG_KEYS: frozenset[str] = frozenset(
     {
         "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
@@ -47,42 +38,10 @@ _RESERVED_LOG_KEYS: frozenset[str] = frozenset(
     }
 )
 
-
-class JsonFormatter(logging.Formatter):
-    """Log formatter that emits newline-delimited JSON. One object per record."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        data: dict[str, Any] = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created))
-            + f".{int(record.msecs):03d}Z",
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-
-        for key in _PROMOTED_KEYS:
-            if key in record.__dict__ and record.__dict__[key] is not None:
-                data[key] = record.__dict__[key]
-
-        # Fold any remaining user-supplied extras into `payload` for debugging.
-        payload: dict[str, Any] = {}
-        for key, value in record.__dict__.items():
-            if key in _RESERVED_LOG_KEYS or key in _PROMOTED_KEYS:
-                continue
-            if key.startswith("_"):
-                continue
-            payload[key] = _safe(value)
-        if payload:
-            data["payload"] = payload
-
-        if record.exc_info:
-            data["exc"] = self.formatException(record.exc_info)
-
-        return json.dumps(data, ensure_ascii=False, default=_safe)
+_MAX_PAYLOAD_CHARS = 12000
 
 
 def _safe(value: Any) -> Any:
-    """Best-effort JSON-safe coercion. Falls back to repr() for exotic types."""
     try:
         json.dumps(value)
         return value
@@ -93,14 +52,101 @@ def _safe(value: Any) -> Any:
             return "<unrepr-able>"
 
 
+def structured_log_dict(record: logging.LogRecord) -> dict[str, Any]:
+    """Build the same structured object used for JSON and human formatting."""
+    data: dict[str, Any] = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created))
+        + f".{int(record.msecs):03d}Z",
+        "level": record.levelname,
+        "logger": record.name,
+        "message": record.getMessage(),
+    }
+
+    for key in _PROMOTED_KEYS:
+        if key in record.__dict__ and record.__dict__[key] is not None:
+            data[key] = record.__dict__[key]
+
+    payload: dict[str, Any] = {}
+    for key, value in record.__dict__.items():
+        if key in _RESERVED_LOG_KEYS or key in _PROMOTED_KEYS:
+            continue
+        if key.startswith("_"):
+            continue
+        payload[key] = _safe(value)
+    if payload:
+        data["payload"] = payload
+
+    if record.exc_info:
+        data["exc"] = logging.Formatter().formatException(record.exc_info)
+
+    return data
+
+
+class JsonFormatter(logging.Formatter):
+    """Newline-delimited JSON, one object per record."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps(structured_log_dict(record), ensure_ascii=False, default=_safe)
+
+
+def _promo_line(data: dict[str, Any]) -> str | None:
+    parts: list[str] = []
+    for key in _PROMOTED_KEYS:
+        if key not in data or data[key] is None:
+            continue
+        val = data[key]
+        if isinstance(val, (dict, list)):
+            continue
+        parts.append(f"{key}={val}")
+    return "  " + "  ".join(parts) if parts else None
+
+
+class HumanReadableFormatter(logging.Formatter):
+    """Stack-friendly logs: first line summary, then promoted fields, pretty ``payload``."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        d = structured_log_dict(record)
+        ts = d.get("ts", "")
+        level = str(d.get("level", ""))
+        logg = str(d.get("logger", ""))
+        msg = str(d.get("message", ""))
+        line1 = f"{ts}  {level:7}  {logg}  {msg}"
+
+        lines: list[str] = [line1]
+        pl = _promo_line(d)
+        if pl:
+            lines.append(pl)
+
+        p = d.get("payload")
+        if p:
+            try:
+                blob = json.dumps(p, ensure_ascii=False, indent=2, default=_safe)
+            except Exception:
+                blob = repr(p)
+            if len(blob) > _MAX_PAYLOAD_CHARS:
+                blob = blob[:_MAX_PAYLOAD_CHARS] + "\n  ... [truncated]"
+            lines.append("  payload:")
+            for row in blob.splitlines():
+                lines.append(f"    {row}")
+
+        if "exc" in d and d["exc"]:
+            lines.append("  exc:")
+            for row in str(d["exc"]).strip().splitlines():
+                lines.append(f"    {row}")
+
+        return "\n".join(lines)
+
+
+LogFormat = Literal["json", "human"]
+
 _CONFIGURED = False
 
 
-def setup_logging(level: str | None = None) -> None:
-    """Idempotent: configure the root logger to emit structured JSON on stdout.
-
-    Safe to call multiple times (e.g. under uvicorn reload).
-    """
+def setup_logging(
+    level: str | None = None,
+    log_format: LogFormat | str | None = None,
+) -> None:
+    """Configure the root logger. Idempotent (first call wins during uvicorn reload)."""
     global _CONFIGURED
     if _CONFIGURED:
         return
@@ -108,21 +154,26 @@ def setup_logging(level: str | None = None) -> None:
     level_name = (level or os.getenv("LOG_LEVEL") or "INFO").upper()
     log_level = getattr(logging, level_name, logging.INFO)
 
+    fmt_raw = log_format or os.getenv("LOG_FORMAT") or "human"
+    fmt = str(fmt_raw).strip().lower()
+    if fmt not in ("json", "human"):
+        fmt = "human"
+
     handler = logging.StreamHandler(stream=sys.stdout)
-    handler.setFormatter(JsonFormatter())
+    if fmt == "json":
+        handler.setFormatter(JsonFormatter())
+    else:
+        handler.setFormatter(HumanReadableFormatter())
 
     root = logging.getLogger()
-    # Wipe any handlers uvicorn / FastAPI installed so we always emit JSON.
     for existing in list(root.handlers):
         root.removeHandler(existing)
     root.addHandler(handler)
     root.setLevel(log_level)
 
-    # Tame noisy third-party loggers; we still want WARN/ERROR from them.
     for noisy in ("httpx", "httpcore", "openai", "urllib3", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # uvicorn's own access log stays at INFO but flows through our JSON handler.
     for uv in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logging.getLogger(uv).handlers = []
         logging.getLogger(uv).propagate = True

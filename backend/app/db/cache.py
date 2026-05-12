@@ -30,6 +30,98 @@ def hydrate_cached_pipeline_dict(cached: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_tavily_tier_cache_key(*, artist: str | None, album_title: str, tier: str) -> str:
+    """Cache raw Tavily hits per geography tier (before LLM extract)."""
+    import hashlib
+
+    parts = (
+        "tavily_tier_v1",
+        (artist or "").strip().lower(),
+        (album_title or "").strip().lower(),
+        (tier or "").strip().lower(),
+    )
+    raw = "\n".join(parts).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+async def get_cached_tavily_tier_payload(cache_key: str) -> list[dict[str, Any]] | None:
+    """Intermediate Tavily JSON (list of result dicts) or ``None``."""
+    settings = get_settings()
+    if settings.debug:
+        return None
+    if not settings.database_url or not settings.search_cache_enabled:
+        return None
+    try:
+        sf = session_factory()
+    except RuntimeError:
+        return None
+
+    now = datetime.now(UTC)
+    async with sf() as session:
+        row = await session.get(SearchResponseCacheORM, cache_key)
+        if row is None:
+            return None
+        if row.expires_at <= now:
+            await session.delete(row)
+            await session.commit()
+            return None
+        try:
+            body = json.loads(row.payload_json)
+        except json.JSONDecodeError:
+            await session.delete(row)
+            await session.commit()
+            return None
+    raw_list = body.get("tavily_raw_results") if isinstance(body, dict) else body
+    if not isinstance(raw_list, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for x in raw_list:
+        if isinstance(x, dict):
+            out.append(x)
+    return out
+
+
+async def set_cached_tavily_tier_payload(
+    cache_key: str,
+    raw_results: list[dict[str, Any]],
+    *,
+    ttl_seconds: int,
+) -> None:
+    settings = get_settings()
+    if settings.debug:
+        return
+    if not settings.database_url or not settings.search_cache_enabled:
+        return
+    try:
+        sf = session_factory()
+    except RuntimeError:
+        return
+
+    now = datetime.now(UTC)
+    expires = now + timedelta(seconds=max(60, ttl_seconds))
+    payload = {"tavily_raw_results": raw_results}
+    body = json.dumps(payload, default=str)
+    async with sf() as session:
+        row = await session.get(SearchResponseCacheORM, cache_key)
+        if row is None:
+            session.add(
+                SearchResponseCacheORM(
+                    cache_key=cache_key,
+                    payload_json=body,
+                    expires_at=expires,
+                )
+            )
+        else:
+            row.payload_json = body
+            row.expires_at = expires
+        await session.commit()
+
+    logger.debug(
+        "tavily_tier_cache_set",
+        extra={"stage": "search_cache", "cache_key_head": cache_key[:12], "ttl_seconds": ttl_seconds},
+    )
+
+
 def build_search_cache_key(*, user_query: str, artist: str | None, album_title: str, debug: bool) -> str:
     """Stable SHA-256 hex for cache identity (debug mode gets a separate slot)."""
     import hashlib
@@ -101,7 +193,7 @@ async def set_cached_search_payload(cache_key: str, payload: dict[str, Any], *, 
             row.expires_at = expires
         await session.commit()
 
-    logger.info(
+    logger.debug(
         "search_cache_set",
         extra={"stage": "search_cache", "cache_key_head": cache_key[:12], "ttl_seconds": ttl_seconds},
     )

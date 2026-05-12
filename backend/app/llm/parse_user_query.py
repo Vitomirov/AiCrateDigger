@@ -1,7 +1,9 @@
 """LLM step 1 — parse a free-form user query into ParsedQuery JSON.
 
-Single OpenAI call, JSON-only output, temperature 0. Extraction only: no
-inference, no guessing, no filling gaps. Discogs runs downstream.
+Single OpenAI call, JSON-only output, temperature 0. Extracts the literal fields
+AND semantically resolves the user's geography (city/country name → ISO-3166-1
+alpha-2 + ``local|regional|global`` scope). No hardcoded city tables: the LLM
+is the country-resolver.
 """
 
 from __future__ import annotations
@@ -13,82 +15,120 @@ from openai import AsyncOpenAI
 from app.config import get_settings
 from app.domain.parse_schema import ParsedQuery
 
-SYSTEM_PROMPT = """You are an extraction-only parser. Your job is to copy \
-explicitly stated information from the user's text into JSON. You do NOT \
-reason about intent, probability, or what the user "probably means".
+SYSTEM_PROMPT = """You are an extraction-and-geocoding parser for a vinyl \
+ecommerce search. Copy explicitly stated music fields verbatim, and resolve the \
+user's geography to a country code using your world knowledge.
 
 Return STRICT JSON ONLY (one object, no markdown, no commentary).
 
 OUTPUT SCHEMA — exact keys only, no extras:
 {
-  "artist":       string | null,
-  "album":        string | null,
-  "album_index":  number | null,
-  "location":     string | null
+  "artist":        string | null,
+  "album":         string | null,
+  "album_index":   number | null,
+  "location":      string | null,
+  "country_code":  string | null,
+  "search_scope":  "local" | "regional" | "global",
+  "resolved_city": string | null,
+  "geo_confidence": number | null,
+  "geo_granularity": "city" | "country" | "region" | "none" | null
 }
 
-CORE RULE (NON-NEGOTIABLE):
-- Output a non-null value ONLY when that value is explicitly supported by \
-the user text (verbatim substring, or album_index via the ordinal mapping \
-below).
-- If the text does not explicitly support a field → null.
-- Never invent, infer, extrapolate, choose "most likely", or use world \
-knowledge to fill a field.
-- Uncertainty or ambiguity for a field → null for that field (never a guess).
+CORE RULES:
+- Music fields (artist, album, album_index, location) are EXTRACTION ONLY: never \
+invent, infer, or guess. Uncertain → null for that field.
+- Geography fields (country_code, search_scope) are SEMANTIC RESOLUTION of the \
+extracted `location`. They are the only place where world knowledge is allowed, \
+and only for country-level routing.
 
 1. ARTIST
-   - Set artist only if a musician or band name appears as a contiguous \
-substring in the user text (same spelling as written; do not correct typos \
-or casing).
-   - After ignoring format words (section 6), that substring must still be \
-present in what remains of the text.
-   - If no such substring → null.
+   - Set when a musician or band name appears as a contiguous substring in the \
+user text (preserve their spelling/casing).
+   - Ignore format words (section 6) when checking.
+   - Else null.
 
 2. ALBUM
-   - Set album ONLY when the user states an explicit album title (a named \
-release title) that appears in the text.
-   - NEVER set album from ordinal phrases ("second album", "2nd album", \
-"debut", "latest album", etc.). Those map to album_index only.
-   - Ordinal-only discography references → album = null.
-   - If it is unclear whether a phrase is a title vs a track, descriptor, \
-or format → null.
+   - Set ONLY when an explicit named album title appears in the text.
+   - Ordinal phrases ("second album", "debut", "latest album") → album = null \
+(they map to album_index only).
+   - Ambiguous title vs track/descriptor → null.
 
 3. ALBUM_INDEX
-   - Set ONLY when an ordinal / position phrase appears in the text:
-       "first" / "debut" / "1st" → 1
-       "second" / "2nd" → 2
-       "third" / "3rd" → 3
-       (same pattern for higher ordinals when written out or as Nth)
-       "latest" / "newest" / "most recent" (referring to an album) → -1
-   - If no such phrase → null.
-   - If both an explicit album title and an ordinal appear: set album to \
-the verbatim title and set album_index = null (never output both).
+   - Set ONLY when an ordinal/position phrase appears:
+       first / debut / 1st → 1
+       second / 2nd → 2
+       third / 3rd → 3   (etc.)
+       latest / newest / most recent (album) → -1
+   - If both an explicit title and an ordinal appear: set album to the title, \
+album_index = null.
 
-4. LOCATION
-   - Set location only when a city or country name appears literally in the \
-user text (verbatim substring).
-   - Do not translate, normalise, expand to a region, or infer location \
-from language, context, or genre.
-   - If both city and country appear explicitly, prefer the city substring as \
-location (more specific literal mention).
-   - If none → null.
+4. LOCATION (verbatim only)
+   - Set only when a city or country name appears literally in the user text.
+   - Do NOT translate, normalise, expand, or invent it.
+   - If both city and country appear, prefer the city substring (more specific).
 
-5. NO HALLUCINATION
-   - Any field not explicitly supported by the text → null for that field.
-   - No extra keys. JSON only.
+5. COUNTRY_CODE (semantic, country-level)
+   - When `location` is set to a single city or country, output its ISO-3166-1 \
+alpha-2 code in uppercase. Use the United Kingdom code "GB" (never "UK").
+   - Examples (use your knowledge, do NOT rely on this list being exhaustive):
+       "kragujevac"        → "RS"
+       "Novi Sad"          → "RS"
+       "Belgrade"          → "RS"
+       "Zagreb"            → "HR"
+       "Ljubljana"         → "SI"
+       "Sarajevo"          → "BA"
+       "Berlin"            → "DE"
+       "London"            → "GB"
+       "Paris"             → "FR"
+       "amsterdam"         → "NL"
+       "Oslo"              → "NO"
+       "Stockholm"         → "SE"
+       "Copenhagen"        → "DK"
+       "Helsinki"          → "FI"
+       "Warsaw"            → "PL"
+       "Prague"            → "CZ"
+       "Budapest"          → "HU"
+       "Vienna"            → "AT"
+       "Brussels"          → "BE"
+       "Barcelona" / "barselona" → "ES"
+   - When `location` is multi-country (continent / region / trade bloc), \
+country_code = null.
+       "Europe", "EU", "the Balkans", "Scandinavia" → country_code = null
+   - When `location` is null or genuinely ambiguous (e.g. a name that could \
+match many countries with no extra signal) → null.
 
-6. FORMAT WORDS — IGNORE (never assign to any field)
-   - Tokens like: vinyl, lp, record, ploča, vinile, schallplatte, and similar \
-physical-format words are not artist, album title, or location.
+6. SEARCH_SCOPE
+   - "local"    → `location` resolves to ONE country (city or country name).
+   - "regional" → `location` is a multi-country region/continent/trade bloc \
+(Europe, EU, EEA, Balkans, Scandinavia, Benelux, DACH, Iberia, Baltics, etc.).
+   - "global"   → `location` is null OR cannot be resolved at all.
+
+7. FORMAT WORDS — IGNORE everywhere (never location/artist/album)
+   - vinyl, lp, record, ploča, vinil, vinile, schallplatte, kaseta, cassette, \
+cd, and similar physical-format tokens.
+
+8. RESOLVED_CITY
+   - When `location` is a city name (including common misspellings), set \
+`resolved_city` to the standard English city name (e.g. user "barselona" → \
+"Barcelona"; "belgrad" → "Belgrade").
+   - When `location` is a country name only → `resolved_city` = null.
+   - Never invent a city when the user did not express one.
+
+9. GEO_CONFIDENCE (0.0–1.0)
+   - How sure you are about country_code + city/country classification.
+   - High (≥0.9) for well-known cities; lower for ambiguous names.
+   - null → omit (downstream will default).
+
+10. GEO_GRANULARITY
+   - "city"    → user intent is a specific city.
+   - "country" → user named a country or only a country-like location.
+   - "region"  → regional / multi-country intent (mirror search_scope regional).
+   - "none"    → no usable geo (location null).
 """
 
 
 async def parse_user_query(query: str) -> ParsedQuery:
-    """Run a single OpenAI call and return the strict ParsedQuery contract.
-
-    Fails fast: invalid JSON, schema mismatch, or transport errors propagate
-    to the caller.
-    """
+    """Run a single OpenAI call and return the strict ParsedQuery contract."""
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -107,7 +147,41 @@ async def parse_user_query(query: str) -> ParsedQuery:
     if not isinstance(data, dict):
         msg = "Parser returned non-object JSON."
         raise ValueError(msg)
-    llm_only = {k: data.get(k) for k in ("artist", "album", "album_index", "location")}
+
+    scope_raw = str(data.get("search_scope") or "").strip().lower()
+    if scope_raw not in ("local", "regional", "global"):
+        scope_raw = "global"
+
+    gran_raw = data.get("geo_granularity")
+    gran: str | None
+    if gran_raw is None or str(gran_raw).strip() == "":
+        gran = None
+    else:
+        gran = str(gran_raw).strip().lower()
+        if gran not in ("city", "country", "region", "none"):
+            gran = None
+
+    gconf = data.get("geo_confidence")
+    geo_confidence: float | None
+    if gconf is None or gconf == "":
+        geo_confidence = None
+    else:
+        try:
+            geo_confidence = float(gconf)
+        except (TypeError, ValueError):
+            geo_confidence = None
+
+    llm_only = {
+        "artist": data.get("artist"),
+        "album": data.get("album"),
+        "album_index": data.get("album_index"),
+        "location": data.get("location"),
+        "country_code": data.get("country_code"),
+        "search_scope": scope_raw,
+        "resolved_city": data.get("resolved_city"),
+        "geo_confidence": geo_confidence,
+        "geo_granularity": gran,
+    }
     return ParsedQuery.model_validate(
         {
             **llm_only,

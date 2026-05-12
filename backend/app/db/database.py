@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, Integer, String, Text, func, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -35,9 +35,15 @@ class WhitelistStoreORM(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     domain: Mapped[str] = mapped_column(String(160), unique=True, nullable=False, index=True)
     country: Mapped[str] = mapped_column(String(8), nullable=False)
+    country_code: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(32), nullable=True)
     ships_to_json: Mapped[str] = mapped_column(Text, nullable=False, default='["EU"]')
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    city: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    store_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class SearchResponseCacheORM(Base):
@@ -81,6 +87,15 @@ async def init_db(*, database_url: str, debug: bool = False) -> None:
     )
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for stmt in (
+            "ALTER TABLE whitelist_stores ADD COLUMN IF NOT EXISTS country_code VARCHAR(2)",
+            "ALTER TABLE whitelist_stores ADD COLUMN IF NOT EXISTS region VARCHAR(32)",
+            "ALTER TABLE whitelist_stores ADD COLUMN IF NOT EXISTS city VARCHAR(128)",
+            "ALTER TABLE whitelist_stores ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION",
+            "ALTER TABLE whitelist_stores ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION",
+            "ALTER TABLE whitelist_stores ADD COLUMN IF NOT EXISTS store_type VARCHAR(32)",
+        ):
+            await conn.execute(text(stmt))
 
     logger.info(
         "database_init",

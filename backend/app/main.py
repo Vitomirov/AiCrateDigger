@@ -10,10 +10,9 @@ from app.db.store_loader import seed_whitelist_stores_if_empty
 from app.logging_config import setup_logging
 from app.routers.search import router as search_router
 
-setup_logging()
-logger = logging.getLogger(__name__)
-
 settings = get_settings()
+setup_logging(level=settings.log_level, log_format=settings.log_format)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -46,6 +45,7 @@ logger.info(
         "status": "success",
         "debug": settings.debug,
         "log_level": settings.log_level,
+        "log_format": settings.log_format,
         "database_configured": bool(settings.database_url),
     },
 )

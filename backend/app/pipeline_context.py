@@ -143,7 +143,7 @@ def stage_timer(stage: Stage, *, input: Any = None, logger_: logging.Logger | No
     start = time.perf_counter()
 
     rec = StageRecord(stage=stage, status="success", duration_ms=0.0, input=input)
-    log.info(
+    log.debug(
         "stage_start",
         extra={"stage": stage, "status": "start", "request_id": ctx.request_id, "input": input},
     )
@@ -168,9 +168,9 @@ def stage_timer(stage: Stage, *, input: Any = None, logger_: logging.Logger | No
     else:
         rec.duration_ms = (time.perf_counter() - start) * 1000.0
         ctx.record(rec)
-        level = logging.WARNING if rec.status == "empty" else logging.INFO
+        end_level = logging.WARNING if rec.status == "empty" else logging.DEBUG
         log.log(
-            level,
+            end_level,
             "stage_end",
             extra={
                 "stage": stage,
