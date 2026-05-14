@@ -3,7 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent } from "react";
 
-import { postSearch, type ListingResultDto, type SearchResponseDto } from "../lib/api";
+import {
+  postParse,
+  postSearch,
+  type ListingResultDto,
+  type ParsedQueryDto,
+  type SearchResponseDto,
+} from "../lib/api";
+import { buildPipelineInspectPayload, DevJsonPanel } from "./DevJsonInspector";
 import HugeVinylRecordBg from "./HugeVinylRecord";
 import ListingResultCard from "./ListingResultCard";
 
@@ -13,6 +20,10 @@ export default function SearchExperience() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [payload, setPayload] = useState<SearchResponseDto | null>(null);
+  const [parsePayload, setParsePayload] = useState<ParsedQueryDto | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
+  /** After the first Dig, keep JSON panels mounted for debugging. */
+  const [hasRunInspect, setHasRunInspect] = useState(false);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const t0 = useRef(0);
 
@@ -42,12 +53,30 @@ export default function SearchExperience() {
       return;
     }
     setError(null);
+    setParseError(null);
+    setParsePayload(null);
+    setHasRunInspect(true);
     setLoading(true);
     rampProgress();
     try {
-      const data = await postSearch(q);
-      setPayload(data);
-      setProgress(100);
+      const [parsedOutcome, searchOutcome] = await Promise.allSettled([postParse(q), postSearch(q)]);
+
+      if (parsedOutcome.status === "fulfilled") {
+        setParsePayload(parsedOutcome.value);
+      } else {
+        const reason = parsedOutcome.reason;
+        setParseError(reason instanceof Error ? reason.message : "Parse request failed.");
+      }
+
+      if (searchOutcome.status === "fulfilled") {
+        setPayload(searchOutcome.value);
+        setProgress(100);
+      } else {
+        setProgress(0);
+        setPayload(null);
+        const reason = searchOutcome.reason;
+        setError(reason instanceof Error ? reason.message : "Search failed.");
+      }
     } catch (e) {
       setProgress(0);
       setPayload(null);
@@ -68,51 +97,16 @@ export default function SearchExperience() {
       ? "Nothing this pass — tweak the title or add a city hint."
       : null;
 
-  // Landing: lock document scroll. With results: native page scroll for the list.
-  useEffect(() => {
-    const html = document.documentElement;
-    const body = document.body;
-    if (hasHits) {
-      html.style.removeProperty("overflow");
-      body.style.removeProperty("overflow");
-    } else {
-      html.style.overflow = "hidden";
-      body.style.overflow = "hidden";
-    }
-    return () => {
-      html.style.removeProperty("overflow");
-      body.style.removeProperty("overflow");
-    };
-  }, [hasHits]);
-
   return (
-    <div
-      className={
-        hasHits
-          ? "relative flex w-full flex-col"
-          : "relative flex h-[100dvh] max-h-[100dvh] w-full flex-1 flex-col overflow-hidden"
-      }
-    >
+    <div className="relative flex min-h-[100dvh] w-full flex-col">
       {/* LP backdrop — fixed so it fills the viewport while the page scrolls with results */}
       <div className="pointer-events-none fixed inset-0 z-0 flex items-center justify-center opacity-[0.52] sm:opacity-[0.58] md:opacity-[0.6]">
         <HugeVinylRecordBg />
       </div>
 
-      <div
-        className={
-          hasHits
-            ? "relative z-[2] flex w-full flex-col"
-            : "relative z-[2] flex min-h-0 flex-1 flex-col overflow-hidden"
-        }
-      >
-        {/* Hero — centered when idle; pinned compact when listings need room */}
-        <div
-          className={
-            hasHits
-              ? "flex shrink-0 flex-col items-center overflow-hidden px-3 pt-3 pb-2 sm:px-5 sm:pt-4"
-              : "flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-3 py-3 sm:px-5 sm:py-4"
-          }
-        >
+      <div className="relative z-[2] flex w-full flex-col">
+        {/* Hero — compact so JSON inspector + cards get vertical room */}
+        <div className="flex shrink-0 flex-col items-center px-3 pt-3 pb-2 sm:px-5 sm:pt-4 sm:pb-3">
           <header className="max-w-lg shrink-0 text-center md:max-w-xl">
             <p className="font-slab text-[0.74rem] font-normal uppercase tracking-[0.48em] text-crate-amber sm:text-[1.5rem]">
               find favourite records
@@ -206,6 +200,38 @@ export default function SearchExperience() {
             <p className="rounded-md border border-crate-gold/35 bg-black/65 px-3 py-2 text-center text-[0.78rem] leading-snug text-crate-cream/80">
               {emptyHint}
             </p>
+          </div>
+        ) : null}
+
+        {/* Dev / debug: parse, pipeline (tavily & stages), listings as JSON */}
+        {hasRunInspect ? (
+          <div className="relative z-[2] w-full px-3 pb-3 sm:px-5">
+            <p className="mb-2 text-center font-slab text-[0.62rem] font-semibold uppercase tracking-[0.28em] text-crate-cream/50">
+              Pipeline inspector
+            </p>
+            <div className="mx-auto grid max-w-6xl grid-cols-1 gap-3 lg:grid-cols-3">
+              <DevJsonPanel
+                title="Parse"
+                subtitle="POST /parse — parser output"
+                loading={loading}
+                error={parseError}
+                data={parsePayload}
+              />
+              <DevJsonPanel
+                title="Query & pipeline"
+                subtitle="debug.stages: geo_norm / geo_tier / tavily / extract / validate / ranking / geo_widening_summary"
+                loading={loading}
+                error={error}
+                data={error ? null : buildPipelineInspectPayload(payload?.debug ?? null)}
+              />
+              <DevJsonPanel
+                title="Listings"
+                subtitle="POST /search — `results` array"
+                loading={loading}
+                error={error}
+                data={error ? null : (payload?.results ?? [])}
+              />
+            </div>
           </div>
         ) : null}
 

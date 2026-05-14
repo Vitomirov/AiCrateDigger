@@ -19,6 +19,21 @@ export type SearchResponseDto = {
   debug?: Record<string, unknown> | null;
 };
 
+/** Mirrors backend `domain.parse_schema.ParsedQuery` (subset for typing). */
+export type ParsedQueryDto = {
+  artist: string | null;
+  album: string | null;
+  album_index: number | null;
+  location: string | null;
+  country_code: string | null;
+  search_scope: string;
+  resolved_city: string | null;
+  geo_confidence: number | null;
+  geo_granularity: string | null;
+  language: string;
+  original_query: string;
+};
+
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
 export async function fetchHealth(): Promise<HealthResponse> {
@@ -72,4 +87,32 @@ export async function postSearch(query: string): Promise<SearchResponseDto> {
   }
 
   return data as SearchResponseDto;
+}
+
+export async function postParse(query: string): Promise<ParsedQueryDto> {
+  const response = await fetch("/api/parse", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+    cache: "no-store",
+  });
+
+  const text = await response.text();
+  let data: unknown;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error("Parse returned non-JSON response");
+  }
+
+  if (!response.ok) {
+    let detailMsg = `Parse failed (${response.status})`;
+    if (typeof data === "object" && data !== null && "detail" in data) {
+      const detail = (data as { detail: unknown }).detail;
+      detailMsg = typeof detail === "string" ? detail : JSON.stringify(detail);
+    }
+    throw new Error(detailMsg);
+  }
+
+  return data as ParsedQueryDto;
 }

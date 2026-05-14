@@ -52,6 +52,67 @@ _TITLE_NON_PRODUCT_SNIPPETS: tuple[str, ...] = (
     "just in:",
 )
 
+# Strict non-vinyl PDP rejection: physical objects that ARE listed on shops but
+# are not the record itself. Checked with case-insensitive substring match.
+_TITLE_NON_VINYL_PDP_TOKENS: tuple[str, ...] = (
+    "anniversary book",
+    "anniversary edition book",
+    "coffee table book",
+    "photo book",
+    "photobook",
+    "art book",
+    "biography",
+    "autobiography",
+    "memoir",
+    "hardcover",
+    "softcover",
+    "paperback",
+    "art print",
+    "art prints",
+    "poster print",
+    "poster set",
+    "lithograph",
+    "screen print",
+    "screenprint",
+    "tour poster",
+    "tour programme",
+    "tour program",
+    "calendar",
+    "puzzle",
+    "jigsaw",
+    "fridge magnet",
+    "tote bag",
+    "t-shirt",
+    "tshirt",
+    "hoodie",
+    "sweatshirt",
+    "longsleeve",
+    "long sleeve",
+    "cap",
+    " mug",
+    " mug,",
+    "mug ",
+    "enamel pin",
+    "keychain",
+    "keyring",
+    "patch",
+    "sticker pack",
+    "slipmat",
+    "stylus",
+    "cartridge",
+    "turntable",
+    "record player",
+    "cleaning kit",
+    "vinyl sleeve",
+    "vinyl sleeves",
+    "outer sleeve",
+    "inner sleeve",
+    "official 50th anniversary",
+    "50th anniversary book",
+    "the official book",
+    "official book of",
+)
+
 # Path fragments that usually indicate editorial / artist hubs (not PDPs).
 _URL_HUB_SUBSTRINGS: tuple[str, ...] = (
     "/blog",
@@ -93,6 +154,25 @@ _URL_HUB_SUBSTRINGS: tuple[str, ...] = (
     "/contact",
     "/help",
     "/faq",
+    # Non-vinyl merch / book / poster catalogue branches:
+    "/books/",
+    "/book/",
+    "/posters/",
+    "/poster/",
+    "/prints/",
+    "/print/",
+    "/merchandise/",
+    "/merch/",
+    "/clothing/",
+    "/apparel/",
+    "/accessories/",
+    "/turntables/",
+    "/equipment/",
+    "/hardware/",
+    "/dvd/",
+    "/dvds/",
+    "/blu-ray/",
+    "/bluray/",
 )
 
 # Shallow artist/band/label index paths (no product slug).
@@ -214,6 +294,18 @@ def _title_looks_non_product(title: str) -> bool:
     return any(s in t for s in _TITLE_NON_PRODUCT_SNIPPETS)
 
 
+def _title_looks_non_vinyl_object(title: str) -> bool:
+    """Reject titles that name a physical artifact other than the record itself.
+
+    Examples: "Pink Floyd: The Dark Side of the Moon (50th Anniversary Book)",
+    "Tour Poster", "Coffee Table Book", "Slipmat".
+    """
+    t = (title or "").strip().lower()
+    if not t:
+        return False
+    return any(tok in t for tok in _TITLE_NON_VINYL_PDP_TOKENS)
+
+
 def _fuzz_best_album_artist(needle: str, haystack: str) -> tuple[int, int, int]:
     """Returns (partial_ratio, token_set_ratio, best_of_two)."""
     if not needle.strip():
@@ -263,6 +355,8 @@ def validate_listing(
             return _reject("non_product_url", listing=listing)
         if _title_looks_non_product(title):
             return _reject("non_product_title", listing=listing)
+        if _title_looks_non_vinyl_object(title):
+            return _reject("non_vinyl_object_title", listing=listing, extra={"title": title[:160]})
 
         album_needle = (listing.validation_album or "").strip()
         artist_needle = (listing.validation_artist or "").strip()
@@ -319,6 +413,9 @@ def validate_listing(
 
     if _title_looks_non_product(title):
         return _reject("non_product_title", listing=listing)
+
+    if _title_looks_non_vinyl_object(title):
+        return _reject("non_vinyl_object_title", listing=listing, extra={"title": title[:160]})
 
     album_needle = listing.validation_album
     if not album_needle or album_needle.strip() == "":

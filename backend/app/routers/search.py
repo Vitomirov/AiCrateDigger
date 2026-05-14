@@ -56,7 +56,7 @@ async def search(payload: ParseRequest) -> SearchResponse:
 
             return SearchResponse(
                 results=result.get("results", []),
-                debug=result.get("debug") if settings.debug else None,
+                debug=ctx.as_debug_payload() if settings.debug else None,
             )
 
         except HTTPException:

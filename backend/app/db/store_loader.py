@@ -17,6 +17,8 @@ from app.db.database import WhitelistStoreORM, session_factory
 from app.policies.eu_stores import ALLOWED_STORES, StoreEntry, StoreType, get_active_stores
 from app.policies.store_domain import canonical_store_domain
 
+ALLOWED_STORE_TYPES: frozenset[str] = frozenset({"local_shop", "regional_ecommerce", "marketplace"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,6 +121,73 @@ async def seed_whitelist_stores_if_empty() -> int:
         extra={"stage": "stores", "inserted": len(ALLOWED_STORES)},
     )
     return len(ALLOWED_STORES)
+
+
+async def sync_whitelist_store_catalogue() -> dict[str, int]:
+    """Reconcile DB rows with :data:`ALLOWED_STORES` without overwriting curated edits.
+
+    Inserts rows missing in DB, and back-fills NULL ``city`` / ``store_type`` columns
+    from the code catalogue. Never demotes an existing ``local_shop`` to a generic
+    ``regional_ecommerce`` (operator may have promoted it deliberately in SQL).
+    """
+    settings = get_settings()
+    summary = {"inserted": 0, "city_filled": 0, "type_filled": 0}
+    if not settings.database_url:
+        return summary
+    try:
+        sf = session_factory()
+    except RuntimeError:
+        return summary
+
+    code_by_domain: dict[str, StoreEntry] = {
+        canonical_store_domain(s.domain): s for s in ALLOWED_STORES
+    }
+
+    async with sf() as session:
+        existing_rows = (
+            await session.scalars(select(WhitelistStoreORM))
+        ).all()
+        existing_by_domain = {canonical_store_domain(r.domain): r for r in existing_rows}
+
+        for dom, entry in code_by_domain.items():
+            row = existing_by_domain.get(dom)
+            if row is None:
+                leg = (entry.country_code or "XX")[:8]
+                session.add(
+                    WhitelistStoreORM(
+                        name=entry.name,
+                        domain=dom,
+                        country=leg,
+                        country_code=entry.country_code,
+                        region=entry.region,
+                        ships_to_json=json.dumps(list(entry.ships_to)),
+                        priority=entry.priority,
+                        is_active=entry.is_active,
+                        city=entry.city,
+                        latitude=entry.latitude,
+                        longitude=entry.longitude,
+                        store_type=entry.store_type,
+                    )
+                )
+                summary["inserted"] += 1
+                continue
+
+            if (row.city is None or not str(row.city).strip()) and entry.city:
+                row.city = entry.city
+                summary["city_filled"] += 1
+
+            existing_type = (getattr(row, "store_type", None) or "").strip().lower()
+            if existing_type not in ALLOWED_STORE_TYPES and entry.store_type:
+                row.store_type = entry.store_type
+                summary["type_filled"] += 1
+
+        await session.commit()
+
+    logger.info(
+        "whitelist_stores_sync",
+        extra={"stage": "stores", **summary},
+    )
+    return summary
 
 
 async def load_active_stores() -> tuple[StoreEntry, ...]:

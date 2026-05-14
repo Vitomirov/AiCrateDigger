@@ -27,7 +27,6 @@ from app.models.result import ListingResult
 from app.pipeline_context import stage_timer
 from app.policies.eu_stores import StoreEntry
 from app.policies.geo_scope import (
-    NormalizedGeoIntent,
     Tier,
     TIER_NARROWNESS,
     cap_stores,
@@ -39,7 +38,11 @@ from app.policies.geo_scope import (
     sort_validated_listings_geo,
     tier_fallback_order,
 )
-from app.policies.listing_rank import composite_listing_rank, resolve_store_for_url
+from app.policies.listing_rank import (
+    ListingRankBreakdown,
+    composite_listing_score,
+    resolve_store_for_url,
+)
 from app.policies.search_dsl import build_tavily_core_query
 from app.services.discogs_service import resolve_album_by_index
 from app.services.tavily_service import normalize_url, run_tavily_for_store_domains
@@ -99,13 +102,7 @@ def _dedupe_listings_by_normalized_url(listings: list[Any]) -> list[Any]:
 def _listing_to_api_row(
     listing: Any,
     *,
-    norm: NormalizedGeoIntent,
-    store_by_domain: dict[str, StoreEntry],
-    listing_tier_map: dict[str, Tier],
-    default_tier: Tier,
-    album_title: str,
-    artist: str | None,
-    score_scale: float,
+    breakdown: ListingRankBreakdown,
 ) -> ListingResult:
     title = str(listing.title or "")
     if len(title) < 5:
@@ -119,27 +116,16 @@ def _listing_to_api_row(
     except (TypeError, ValueError):
         price_str = f"{listing.price} {cur}" if listing.price else None
 
-    u = str(getattr(listing, "url", "") or "")
-    nk = normalize_url(u)
-    tier = listing_tier_map.get(nk, default_tier)
-    st = resolve_store_for_url(u, store_by_domain)
-
-    raw_rank = composite_listing_rank(
-        listing,
-        store=st,
-        discovery_tier=tier,
-        resolved_country=norm.resolved_country,
-        resolved_city=norm.resolved_city,
-        album_title=album_title,
-        artist=artist,
+    match_reason = (
+        f"tier={breakdown.discovery_tier}|store_type={breakdown.store_type}"
+        f"|geo={breakdown.geo_proximity:.1f}|sem={breakdown.semantic_match:.1f}"
+        f"|vinyl={breakdown.vinyl_confidence:.1f}"
     )
-    denom = score_scale if score_scale > 0 else 1.0
-    score_norm = min(max(raw_rank / denom, 0.0), 1.0)
 
     return ListingResult(
         url=listing.url,
         title=title,
-        score=score_norm,
+        score=breakdown.score_normalized,
         price=price_str,
         location=None,
         availability="available" if listing.in_stock else "unknown",
@@ -147,8 +133,16 @@ def _listing_to_api_row(
         domain=listing.store,
         artist_match=1.0,
         album_match=1.0,
-        match_reason="vinyl_pipeline",
+        match_reason=match_reason,
     )
+
+
+def _store_type_distribution(stores: tuple[StoreEntry, ...]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for s in stores:
+        k = s.store_type or "regional_ecommerce"
+        out[k] = out.get(k, 0) + 1
+    return out
 
 
 async def run_vinyl_search(query: str) -> dict[str, Any]:
@@ -199,6 +193,17 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     geo = geo_intent_from_parsed(parsed)
     norm = normalized_geo_from_parsed(parsed)
 
+    with stage_timer("geo_norm") as rec:
+        rec.output = {
+            "raw_location": norm.raw_location,
+            "resolved_country": norm.resolved_country,
+            "resolved_city": norm.resolved_city,
+            "granularity": norm.granularity,
+            "confidence": round(float(norm.confidence), 3),
+            "search_scope": geo.search_scope,
+            "region": geo.region,
+        }
+
     core_query = build_tavily_core_query(parsed.artist, album_title)
     queries = [core_query]
 
@@ -212,6 +217,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     extract_report: ExtractListingsReport | None = None
     last_tier: Tier = "continental"
     tiers_attempted: list[Tier] = []
+    tier_traces: list[dict[str, Any]] = []
 
     all_allowed = frozenset(
         normalize_whitelist_domain(s.domain) for s in stores if getattr(s, "domain", None)
@@ -221,6 +227,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         if tier_ix < len(tier_queue):
             tier = tier_queue[tier_ix]
             tier_ix += 1
+            widening_reason = "planned_tier"
         elif (
             not aggregated
             and not executed_global_fallback
@@ -228,6 +235,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         ):
             tier = "global"
             executed_global_fallback = True
+            widening_reason = "fallback_no_results"
         else:
             break
 
@@ -251,6 +259,20 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 "tier_skipped_low_signal",
                 extra={"tier": tier, "domains": len(capped)},
             )
+            with stage_timer("geo_tier", input={"tier": tier}) as rec:
+                rec.status = "empty"
+                rec.output = {
+                    "tier": tier,
+                    "selected_domains": [s.domain for s in capped],
+                    "pool_size": len(pool),
+                    "store_types": _store_type_distribution(capped),
+                    "min_domain_floor": min_dom,
+                    "widening_reason": widening_reason,
+                    "early_stop": False,
+                    "skipped": True,
+                    "skip_reason": "below_min_domain_floor",
+                    "geo_confidence": round(float(norm.confidence), 3),
+                }
             continue
 
         tier_lookup = {normalize_whitelist_domain(s.domain): s for s in capped}
@@ -287,11 +309,18 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 allowed_domains=set(store_domains),
             )
             listings = extract_report.listings
+            rec.output = {
+                "tier": tier,
+                "raw_results_in": len(raw_results),
+                "listings_out": len(listings),
+                "diagnostic": extract_report.diagnostic,
+            }
 
         with stage_timer("validate") as rec:
             batch = _dedupe_listings_by_normalized_url(listings)
 
         accepted: list[Any] = []
+        rejected_reasons: list[dict[str, str]] = []
         for lst in batch:
             enriched = lst.model_copy(
                 update={
@@ -300,20 +329,54 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 }
             )
             if not validate_listing(enriched, allowed_domains=all_allowed):
+                rejected_reasons.append(
+                    {
+                        "url": str(getattr(enriched, "url", ""))[:160],
+                        "title": str(getattr(enriched, "title", ""))[:120],
+                    }
+                )
                 continue
             accepted.append(enriched)
 
+        accepted_this_tier_urls: list[str] = []
         for lst in accepted:
             k = normalize_url(str(lst.url))
             prev_tier = listing_tier_map.get(k)
             if prev_tier is None or TIER_NARROWNESS[tier] < TIER_NARROWNESS[prev_tier]:
                 aggregated[k] = lst
                 listing_tier_map[k] = tier
+                accepted_this_tier_urls.append(k)
 
         last_tier = tier
 
         need = _effective_stop_floor(tier, settings=settings, confidence=norm.confidence)
-        if len(aggregated) >= need:
+        early_stop = len(aggregated) >= need
+
+        tier_trace = {
+            "tier": tier,
+            "widening_reason": widening_reason,
+            "pool_size": len(pool),
+            "selected_domains": [s.domain for s in capped],
+            "store_types": _store_type_distribution(capped),
+            "tavily_raw": len(raw_results),
+            "tavily_cache_hit": cache_hit,
+            "listings_extracted": len(listings),
+            "listings_accepted": len(accepted),
+            "listings_rejected": len(rejected_reasons),
+            "rejected_sample": rejected_reasons[:5],
+            "accepted_urls": accepted_this_tier_urls[:10],
+            "aggregated_running_total": len(aggregated),
+            "stop_floor": need,
+            "geo_confidence": round(float(norm.confidence), 3),
+            "early_stop": early_stop,
+            "skipped": False,
+        }
+        tier_traces.append(tier_trace)
+
+        with stage_timer("geo_tier", input={"tier": tier}) as rec:
+            rec.output = tier_trace
+
+        if early_stop:
             break
 
     list_out = list(aggregated.values())
@@ -327,34 +390,58 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     )
 
     head = sorted_listings[: settings.pipeline_max_results]
-    scores = [
-        composite_listing_rank(
-            lst,
-            store=resolve_store_for_url(str(lst.url), store_lookup),
-            discovery_tier=listing_tier_map.get(normalize_url(str(lst.url)), last_tier),
-            resolved_country=norm.resolved_country,
-            resolved_city=norm.resolved_city,
-            album_title=album_title or "",
-            artist=parsed.artist,
+
+    breakdowns: list[ListingRankBreakdown] = []
+    for lst in head:
+        u = str(getattr(lst, "url", "") or "")
+        st = resolve_store_for_url(u, store_lookup)
+        tier_for = listing_tier_map.get(normalize_url(u), last_tier)
+        breakdowns.append(
+            composite_listing_score(
+                lst,
+                store=st,
+                discovery_tier=tier_for,
+                resolved_country=norm.resolved_country,
+                resolved_city=norm.resolved_city,
+                album_title=album_title or "",
+                artist=parsed.artist,
+            )
         )
-        for lst in head
-    ]
-    score_scale = max(scores) if scores else 1.0
+
+    with stage_timer("ranking") as rec:
+        avg_total = (
+            round(sum(b.total for b in breakdowns) / len(breakdowns), 3)
+            if breakdowns
+            else 0.0
+        )
+        rec.output = {
+            "scored_count": len(breakdowns),
+            "avg_total_points": avg_total,
+            "breakdowns": [
+                {
+                    "url": str(getattr(lst, "url", ""))[:200],
+                    "title": str(getattr(lst, "title", ""))[:160],
+                    **b.as_dict(),
+                }
+                for lst, b in zip(head, breakdowns, strict=True)
+            ],
+        }
+
+    with stage_timer("geo_widening_summary") as rec:
+        rec.output = {
+            "tiers_planned": list(tier_queue),
+            "tiers_attempted": tiers_attempted,
+            "executed_global_fallback": executed_global_fallback,
+            "total_validated": len(aggregated),
+            "final_returned": len(head),
+            "per_tier": tier_traces,
+        }
 
     out = {
         "query": query,
         "results": [
-            _listing_to_api_row(
-                listing,
-                norm=norm,
-                store_by_domain=store_lookup,
-                listing_tier_map=listing_tier_map,
-                default_tier=last_tier,
-                album_title=album_title or "",
-                artist=parsed.artist,
-                score_scale=score_scale,
-            )
-            for listing in head
+            _listing_to_api_row(listing, breakdown=breakdown)
+            for listing, breakdown in zip(head, breakdowns, strict=True)
         ],
     }
 
