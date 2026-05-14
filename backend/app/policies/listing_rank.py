@@ -175,8 +175,22 @@ def _artist_fuzz(listing_title: str, artist: str | None) -> float:
     return float(max(fuzz.partial_ratio(a, t), fuzz.token_set_ratio(a, t)))
 
 
-def _vinyl_confidence(url: str, title: str) -> float:
-    """Soft 0..`_W_VINYL_MAX` score that listing is a vinyl PDP, not a sibling format."""
+#: Floor applied to whitelisted ``local_shop`` rows: an indie record store on
+#: our DB allowlist IS a vinyl-selling business by definition, so the URL
+#: heuristics should never zero its vinyl signal.
+_LOCAL_SHOP_VINYL_FLOOR: float = 0.6  # × _W_VINYL_MAX
+
+
+def _vinyl_confidence(url: str, title: str, *, is_local_shop: bool = False) -> float:
+    """Soft 0..`_W_VINYL_MAX` score that listing is a vinyl PDP, not a sibling format.
+
+    When ``is_local_shop`` is True (host resolved to a curated ``local_shop``
+    entry in ``whitelist_stores``), the negative-keyword penalty is skipped and
+    the score is floored at :data:`_LOCAL_SHOP_VINYL_FLOOR` × :data:`_W_VINYL_MAX`.
+    Rationale: the store IS a record shop because it's in our whitelist; an
+    unfortunate listing title (e.g. a long catalogue number) must not nuke the
+    vinyl signal that the URL hint and store identity both already provide.
+    """
     path = ""
     try:
         path = (urlsplit(url).path or "").lower()
@@ -185,7 +199,6 @@ def _vinyl_confidence(url: str, title: str) -> float:
     t = (title or "").lower()
     score = 0.0
 
-    # Positive: URL path & title contain vinyl/LP cues.
     if any(h in path for h in _VINYL_URL_HINTS):
         score += 6.0
     title_hits = sum(1 for h in _VINYL_TITLE_HINTS if h in t)
@@ -194,10 +207,16 @@ def _vinyl_confidence(url: str, title: str) -> float:
     if _VINYL_TITLE_RE.search(t):
         score += 2.0
 
-    # Negative: non-vinyl format tokens AND no positive vinyl hint.
-    has_pos = any(h in t for h in ("vinyl", "lp", '12"', "180g")) or any(h in path for h in _VINYL_URL_HINTS)
+    has_pos = any(h in t for h in ("vinyl", "lp", '12"', "180g")) or any(
+        h in path for h in _VINYL_URL_HINTS
+    )
     if not has_pos and any(h in t for h in _NON_VINYL_HINTS):
-        score -= 6.0
+        # Indie locals are vinyl-by-definition: skip the negative gate for them.
+        if not is_local_shop:
+            score -= 6.0
+
+    if is_local_shop:
+        score = max(score, _W_VINYL_MAX * _LOCAL_SHOP_VINYL_FLOOR)
     return max(0.0, min(_W_VINYL_MAX, score))
 
 
@@ -211,16 +230,22 @@ def composite_listing_score(
     album_title: str,
     artist: str | None,
     local_present_in_pool: bool = False,
+    album_match_confirmed: bool = True,
 ) -> ListingRankBreakdown:
     """Authoritative scorer. Returns the full breakdown for debug tracing.
 
     Local-First Strike behaviour:
 
     * When ``store.store_type == "local_shop"`` AND it city-matches the resolved
-      city, :data:`_INDIE_LOCAL_CITY_BONUS` is added to ``total`` (sort key only).
+      city AND ``album_match_confirmed`` is True, :data:`_INDIE_LOCAL_CITY_BONUS`
+      is added to ``total`` (sort key only). The confirmation gate prevents the
+      bonus from firing on a wrong-album local listing (e.g. an indie page
+      named "Spacekid" surfacing for a query about "Andrew Red Hand").
     * When ``local_present_in_pool`` is True and this row is NOT a local_shop,
       :data:`_GIANT_PENALTY_POINTS` is subtracted from both ``total`` and the
       normalized score so giants visibly fall below the indies.
+    * ``_vinyl_confidence`` runs in local-shop mode for whitelisted indies: it
+      skips the negative-keyword penalty and floors the signal.
     """
     # --- geo proximity (0..100) → weighted to ceiling ---
     geo_raw = 0.0
@@ -261,7 +286,12 @@ def composite_listing_score(
     semantic_w = sem_raw * _W_SEMANTIC_MAX
 
     # --- vinyl confidence (0..16) ---
-    vinyl_w = _vinyl_confidence(str(getattr(listing, "url", "") or ""), listing.title or "")
+    st_key_early = store.store_type if store is not None else "regional_ecommerce"
+    vinyl_w = _vinyl_confidence(
+        str(getattr(listing, "url", "") or ""),
+        listing.title or "",
+        is_local_shop=(st_key_early == "local_shop"),
+    )
 
     # --- store quality (priority + listing_quality) ---
     pri = float(store.priority if store is not None else 0)
@@ -297,9 +327,11 @@ def composite_listing_score(
 
     # Indie city bonus: applied to ``total`` only so the visible normalized
     # score stays informative across the indie cohort while the sort tier-bumps
-    # any city-matched local_shop above giants.
+    # any city-matched local_shop above giants. GATED on
+    # ``album_match_confirmed`` so an indie row with a confusing / off-target
+    # title cannot ride the +500 bonus to the top of the response.
     total = penalized_total
-    if is_local and geo_city_match:
+    if is_local and geo_city_match and album_match_confirmed:
         total = penalized_total + _INDIE_LOCAL_CITY_BONUS
 
     return ListingRankBreakdown(
@@ -330,6 +362,7 @@ def composite_listing_rank(
     album_title: str,
     artist: str | None,
     local_present_in_pool: bool = False,
+    album_match_confirmed: bool = True,
 ) -> float:
     """Back-compat scalar (used by `sort_validated_listings_geo`)."""
     return composite_listing_score(
@@ -341,6 +374,7 @@ def composite_listing_rank(
         album_title=album_title,
         artist=artist,
         local_present_in_pool=local_present_in_pool,
+        album_match_confirmed=album_match_confirmed,
     ).total
 
 

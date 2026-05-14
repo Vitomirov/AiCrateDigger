@@ -45,8 +45,13 @@ from app.policies.listing_rank import (
 )
 from app.policies.search_dsl import build_tavily_core_query
 from app.policies.store_domain import canonical_store_domain
+from app.llm.verify_album_match import verify_album_match
 from app.services.discogs_service import resolve_album_by_index
-from app.services.tavily_service import normalize_url, run_tavily_for_store_domains
+from app.services.tavily_service import (
+    normalize_url,
+    run_local_site_searches,
+    run_tavily_for_store_domains,
+)
 from app.validators.listings import normalize_whitelist_domain, validate_listing
 
 logger = logging.getLogger(__name__)
@@ -322,6 +327,11 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     aggregated: dict[str, Any] = {}
     listing_tier_map: dict[str, Tier] = {}
     store_lookup: dict[str, StoreEntry] = {}
+    # Per-URL LLM verdict on whether the listing's title actually names the
+    # target release. Populated only for city-tier ``local_shop`` rows so the
+    # +500 indie bonus doesn't fire on wrong-album local listings.
+    album_match_by_url: dict[str, bool] = {}
+    verifier_summary: list[dict[str, Any]] = []
     extract_report: ExtractListingsReport | None = None
     last_tier: Tier = "continental"
     tiers_attempted: list[Tier] = []
@@ -430,6 +440,59 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                     tier=tier,
                 )
 
+        # Local site-search fanout — only in the city tier. The batched Tavily
+        # call above gives every store one shared slate; the fanout below gives
+        # EACH indie local domain its own ``include_domains=[domain]`` request
+        # so deep PDPs surface on small shops that get drowned out in batches.
+        local_site_count = 0
+        local_site_kept = 0
+        if tier == "city":
+            local_domains_for_fanout = [
+                normalize_whitelist_domain(s.domain)
+                for s in capped
+                if s.domain and s.store_type == "local_shop"
+            ]
+            local_domains_for_fanout = [d for d in local_domains_for_fanout if d]
+            if local_domains_for_fanout:
+                logger.info(
+                    "tavily_local_fanout_start",
+                    extra={
+                        "stage": "tavily",
+                        "tier": tier,
+                        "core_query": core_query,
+                        "local_domains_count": len(local_domains_for_fanout),
+                        "local_domains": local_domains_for_fanout,
+                    },
+                )
+                with stage_timer("tavily_local_fanout") as rec_fan:
+                    fanout_results, n_calls = await run_local_site_searches(
+                        core_query,
+                        local_domains_for_fanout,
+                        tier=tier,
+                    )
+                    rec_fan.input = {
+                        "tier": tier,
+                        "local_domains": local_domains_for_fanout,
+                    }
+                    rec_fan.output = {
+                        "http_calls": n_calls,
+                        "kept": len(fanout_results),
+                    }
+                    rec_fan.status = "success" if fanout_results else "empty"
+                local_site_count = n_calls
+                local_site_kept = len(fanout_results)
+
+                # Merge fanout results into raw_results (URL-dedup, keep top score).
+                existing_by_url: dict[str, SearchResult] = {
+                    normalize_url(r.url): r for r in raw_results
+                }
+                for r in fanout_results:
+                    k = normalize_url(r.url)
+                    prev = existing_by_url.get(k)
+                    if prev is None or r.score > prev.score:
+                        existing_by_url[k] = r
+                raw_results = list(existing_by_url.values())
+
         with stage_timer("extract") as rec:
             extract_report = await extract_listings(
                 [r.model_dump() for r in raw_results],
@@ -478,6 +541,98 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 continue
             accepted.append(enriched)
 
+        # Title verification — only for city-tier ``local_shop`` rows. These
+        # are the same rows that get the +500 indie bonus, so a wrong-album
+        # title here would unfairly dominate. We LLM-confirm each title still
+        # names the requested release. Verdicts:
+        #   * "reject"   -> drop the row entirely from this tier.
+        #   * "confirmed"-> mark ``album_match_by_url[url] = True`` (bonus eligible).
+        #   * "unsure"   -> mark False (no bonus, no drop).
+        if tier == "city" and accepted:
+            to_verify: list[Any] = []
+            for lst in accepted:
+                url = str(getattr(lst, "url", "") or "")
+                host_store = resolve_store_for_url(url, tier_lookup)
+                if host_store is not None and host_store.store_type == "local_shop":
+                    to_verify.append(lst)
+
+            if to_verify:
+                with stage_timer("verify_album_match") as rec_v:
+                    rec_v.input = {
+                        "tier": tier,
+                        "candidates": len(to_verify),
+                        "album_title": album_title or "",
+                        "artist": parsed.artist,
+                    }
+                    verdicts = await verify_album_match(
+                        to_verify,
+                        artist=parsed.artist,
+                        album_title=album_title or "",
+                    )
+                    rec_v.output = {
+                        "verdicts_returned": len(verdicts),
+                        "rejected": sum(
+                            1 for v in verdicts.values() if v.verdict == "reject"
+                        ),
+                        "confirmed": sum(
+                            1 for v in verdicts.values() if v.verdict == "confirmed"
+                        ),
+                        "unsure": sum(
+                            1 for v in verdicts.values() if v.verdict == "unsure"
+                        ),
+                    }
+                    rec_v.status = "success" if verdicts else "empty"
+
+                # Drop rejects, mark confirmed/unsure for downstream scoring.
+                surviving: list[Any] = []
+                for lst in accepted:
+                    url = str(getattr(lst, "url", "") or "")
+                    host_store = resolve_store_for_url(url, tier_lookup)
+                    is_local = (
+                        host_store is not None
+                        and host_store.store_type == "local_shop"
+                    )
+                    if not is_local:
+                        surviving.append(lst)
+                        continue
+                    v = verdicts.get(url)
+                    if v is None:
+                        # Verifier silently skipped this row → treat as unsure
+                        # (keep, no bonus).
+                        album_match_by_url[url] = False
+                        album_match_by_url[normalize_url(url)] = False
+                        surviving.append(lst)
+                        continue
+                    if v.verdict == "reject":
+                        rejected_reasons.append(
+                            {
+                                "url": url[:160],
+                                "title": str(getattr(lst, "title", ""))[:120],
+                                "reason": f"verify_album_match:{v.reason[:80]}",
+                            }
+                        )
+                        verifier_summary.append(
+                            {
+                                "tier": tier,
+                                "url": url[:160],
+                                "verdict": "reject",
+                                "reason": v.reason[:120],
+                            }
+                        )
+                        continue
+                    album_match_by_url[url] = v.verdict == "confirmed"
+                    album_match_by_url[normalize_url(url)] = v.verdict == "confirmed"
+                    surviving.append(lst)
+                    verifier_summary.append(
+                        {
+                            "tier": tier,
+                            "url": url[:160],
+                            "verdict": v.verdict,
+                            "reason": v.reason[:120],
+                        }
+                    )
+                accepted = surviving
+
         accepted_this_tier_urls: list[str] = []
         for lst in accepted:
             k = normalize_url(str(lst.url))
@@ -500,6 +655,8 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             "store_types": _store_type_distribution(capped),
             "tavily_raw": len(raw_results),
             "tavily_cache_hit": cache_hit,
+            "tavily_local_fanout_calls": local_site_count,
+            "tavily_local_fanout_kept": local_site_kept,
             "listings_extracted": len(listings),
             "listings_accepted": len(accepted),
             "listings_rejected": len(rejected_reasons),
@@ -539,6 +696,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         album_title=album_title or "",
         artist=parsed.artist,
         local_present_in_pool=local_present_in_pool,
+        album_match_by_url=album_match_by_url,
     )
 
     # HHV duplicate fix: collapse same-domain rows down to the top-ranked one
@@ -561,8 +719,10 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     breakdowns: list[ListingRankBreakdown] = []
     for lst in head:
         u = str(getattr(lst, "url", "") or "")
+        nk = normalize_url(u)
         st = resolve_store_for_url(u, store_lookup)
-        tier_for = listing_tier_map.get(normalize_url(u), last_tier)
+        tier_for = listing_tier_map.get(nk, last_tier)
+        confirmed = album_match_by_url.get(u, album_match_by_url.get(nk, True))
         breakdowns.append(
             composite_listing_score(
                 lst,
@@ -573,6 +733,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 album_title=album_title or "",
                 artist=parsed.artist,
                 local_present_in_pool=local_present_in_pool,
+                album_match_confirmed=confirmed,
             )
         )
 
@@ -608,6 +769,12 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             "local_first_caps": {
                 "regional_ecommerce_max": _MAX_REGIONAL_WHEN_LOCAL_PRESENT,
                 "marketplace_max": _MAX_MARKETPLACE_WHEN_LOCAL_PRESENT,
+            },
+            "verifier_summary": verifier_summary[:25],
+            "verifier_totals": {
+                "confirmed": sum(1 for v in verifier_summary if v["verdict"] == "confirmed"),
+                "reject": sum(1 for v in verifier_summary if v["verdict"] == "reject"),
+                "unsure": sum(1 for v in verifier_summary if v["verdict"] == "unsure"),
             },
             "per_tier": tier_traces,
         }

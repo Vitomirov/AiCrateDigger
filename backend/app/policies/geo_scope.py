@@ -368,14 +368,22 @@ def sort_validated_listings_geo(
     album_title: str,
     artist: str | None,
     local_present_in_pool: bool = False,
+    album_match_by_url: dict[str, bool] | None = None,
 ) -> list[object]:
     """Global ordering by composite rank (geo-heavy).
 
     ``local_present_in_pool`` activates the "giant penalty" inside
     :func:`app.policies.listing_rank.composite_listing_rank` so non-local
     stores fall below any qualified indie local result.
+
+    ``album_match_by_url`` (when provided) gates the city-indie +500 bonus:
+    only rows whose URL maps to ``True`` are bonused. Unknown / missing keys
+    default to ``True`` (preserve backward-compat for callers that skip the
+    LLM verifier).
     """
     from app.policies.listing_rank import composite_listing_rank, resolve_store_for_url
+
+    match_lookup = album_match_by_url or {}
 
     def score(lst: object) -> float:
         u = str(getattr(lst, "url", "") or "")
@@ -384,6 +392,7 @@ def sort_validated_listings_geo(
         st = resolve_store_for_url(u, store_by_domain)
         if not hasattr(lst, "title"):
             return 0.0
+        confirmed = match_lookup.get(u, match_lookup.get(nk, True))
         return composite_listing_rank(
             lst,  # type: ignore[arg-type]
             store=st,
@@ -393,6 +402,7 @@ def sort_validated_listings_geo(
             album_title=album_title,
             artist=artist,
             local_present_in_pool=local_present_in_pool,
+            album_match_confirmed=confirmed,
         )
 
     return sorted(listings, key=lambda lst: (-score(lst), str(getattr(lst, "url", ""))))

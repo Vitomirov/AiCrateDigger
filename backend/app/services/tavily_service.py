@@ -308,6 +308,91 @@ async def run_tavily_for_store_domains(
     return final_results, http_calls
 
 
+async def run_local_site_searches(
+    core_query: str,
+    local_domains: list[str],
+    *,
+    tier: str | None = None,
+) -> tuple[list[SearchResult], int]:
+    """One-call-per-domain Tavily fanout for indie local shops.
+
+    Unlike :func:`run_tavily_for_store_domains` (which batches up to 20 domains
+    inside a single ``include_domains`` array), this fires N parallel calls
+    with ``include_domains=[<one_local_domain>]`` so each indie shop has the
+    full result slate to itself. Required to surface deep PDPs on small shops
+    that lose every fight against giants when batched.
+
+    Returns ``(deduplicated_results, http_call_count)``.
+    """
+    if not (core_query or "").strip() or not local_domains:
+        return [], 0
+
+    settings = get_settings()
+    q = core_query.strip()
+    domains = _dedupe_domains(list(local_domains))
+    if not domains:
+        return [], 0
+
+    max_results = settings.tavily_max_results_per_batch
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        async def _one(domain: str) -> list[SearchResult]:
+            logger.info(
+                "tavily_local_site_search",
+                extra={
+                    "stage": "tavily",
+                    "tier": tier,
+                    "domain": domain,
+                    "query": q,
+                },
+            )
+            try:
+                return await _search_single_query(
+                    client,
+                    q,
+                    include_domains=[domain],
+                    max_results=max_results,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "tavily_local_site_search_failed",
+                    extra={
+                        "stage": "tavily",
+                        "tier": tier,
+                        "domain": domain,
+                        "reason": str(exc),
+                    },
+                )
+                return []
+
+        gathered = await asyncio.gather(*[_one(d) for d in domains])
+
+    unique_by_url: dict[str, SearchResult] = {}
+    min_score = float(settings.tavily_min_result_score)
+    for res_list in gathered:
+        for res in res_list:
+            if res.score < min_score:
+                continue
+            if not is_valid_result(res.url):
+                continue
+            existing = unique_by_url.get(res.url)
+            if existing is None or res.score > existing.score:
+                unique_by_url[res.url] = res
+
+    final = sorted(unique_by_url.values(), key=lambda x: x.score, reverse=True)
+    logger.info(
+        "tavily_local_aggregate",
+        extra={
+            "stage": "tavily",
+            "tier": tier,
+            "domains": len(domains),
+            "kept": len(final),
+            "top_domains": _top_domains(final, limit=5),
+        },
+    )
+    return final, len(domains)
+
+
 def _top_domains(results: list[SearchResult], *, limit: int) -> list[str]:
     counts: dict[str, int] = {}
     for r in results:
