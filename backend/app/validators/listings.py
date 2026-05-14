@@ -333,8 +333,15 @@ def validate_listing(
     listing: Listing,
     *,
     allowed_domains: frozenset[str] | None = None,
+    relaxed_local_indie: bool = False,
 ) -> bool:
-    """Return True iff validation passes. Always logs on reject in strict mode."""
+    """Return True iff validation passes. Always logs on reject in strict mode.
+
+    ``relaxed_local_indie`` is set by the pipeline when the row originates from
+    a city-tier ``local_shop`` — fuzz floors are dropped to ``min(45, …)`` so a
+    messy indie page still passes while structural rules (whitelist, non-product
+    URL, non-vinyl object title) stay enforced.
+    """
 
     settings = get_settings()
     allowed = allowed_domains if allowed_domains is not None else default_allowed_domains()
@@ -342,6 +349,12 @@ def validate_listing(
     artist_min = int(settings.listing_validation_artist_fuzz_min)
     relief = int(settings.listing_validation_pdp_fuzz_relief)
     debug_album_min = int(settings.listing_validation_debug_album_fuzz_min)
+
+    if relaxed_local_indie:
+        album_min = max(45, album_min - 25)
+        artist_min = max(40, artist_min - 25)
+        debug_album_min = max(45, debug_album_min - 25)
+        relief = max(relief, 15)
 
     url = listing.url
     title = (listing.title or "").strip()

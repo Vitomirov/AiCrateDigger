@@ -19,7 +19,7 @@ from app.db.cache import (
     hydrate_cached_pipeline_dict,
     set_cached_search_payload,
 )
-from app.db.store_loader import load_active_stores
+from app.db.store_loader import ensure_local_coverage, load_active_stores
 from app.llm.extract_listings import ExtractListingsReport, extract_listings
 from app.llm.parse_user_query import parse_user_query
 from app.models.search_query import SearchResult
@@ -44,6 +44,7 @@ from app.policies.listing_rank import (
     resolve_store_for_url,
 )
 from app.policies.search_dsl import build_tavily_core_query
+from app.policies.store_domain import canonical_store_domain
 from app.services.discogs_service import resolve_album_by_index
 from app.services.tavily_service import normalize_url, run_tavily_for_store_domains
 from app.validators.listings import normalize_whitelist_domain, validate_listing
@@ -52,6 +53,10 @@ logger = logging.getLogger(__name__)
 
 _MIN_STORE_DOMAINS_DEFAULT = 2
 _MIN_STORE_DOMAINS_CITY = 1
+#: Result capping (Local-First Strike): when at least one ``local_shop`` validated,
+#: hold non-indie store types to this cap in the final response.
+_MAX_REGIONAL_WHEN_LOCAL_PRESENT = 1
+_MAX_MARKETPLACE_WHEN_LOCAL_PRESENT = 0
 
 
 def _dedupe_store_entries_by_domain(capped: tuple[StoreEntry, ...]) -> tuple[StoreEntry, ...]:
@@ -145,6 +150,90 @@ def _store_type_distribution(stores: tuple[StoreEntry, ...]) -> dict[str, int]:
     return out
 
 
+def _dedupe_listings_by_domain(
+    sorted_listings: list[Any],
+    *,
+    store_by_domain: dict[str, StoreEntry],
+) -> tuple[list[Any], dict[str, int]]:
+    """Collapse multiple listings from the same domain down to the top-ranked one.
+
+    Input MUST already be sorted by composite rank (best first); the first
+    occurrence of any domain wins and subsequent rows from that same host are
+    dropped. This is the "HHV duplicate fix": when ``hhv.de`` returns five PDPs
+    in one tier they collapse to a single row, freeing slots for distinct
+    stores (especially indie locals).
+
+    Returns ``(deduped_listings, dropped_by_domain)`` so we can surface the
+    decision in the debug payload.
+    """
+    seen: set[str] = set()
+    dropped: dict[str, int] = {}
+    out: list[Any] = []
+    for lst in sorted_listings:
+        url = str(getattr(lst, "url", "") or "")
+        store = resolve_store_for_url(url, store_by_domain)
+        if store is not None and store.domain:
+            key = normalize_whitelist_domain(store.domain)
+        else:
+            key = canonical_store_domain(url)
+        if not key:
+            continue
+        if key in seen:
+            dropped[key] = dropped.get(key, 0) + 1
+            continue
+        seen.add(key)
+        out.append(lst)
+    return out, dropped
+
+
+def _apply_local_first_caps(
+    sorted_listings: list[Any],
+    *,
+    store_by_domain: dict[str, StoreEntry],
+    local_present_in_pool: bool,
+    max_results: int,
+) -> list[Any]:
+    """Local-First result capping.
+
+    If at least one ``local_shop`` validated:
+      * keep every ``local_shop`` row (in their composite-score order),
+      * limit ``regional_ecommerce`` to ``_MAX_REGIONAL_WHEN_LOCAL_PRESENT``,
+      * limit ``marketplace`` to ``_MAX_MARKETPLACE_WHEN_LOCAL_PRESENT``.
+
+    When no locals are present the helper is a pass-through (input order kept).
+    Always returns at most ``max_results`` rows.
+    """
+    if max_results <= 0:
+        return []
+    if not local_present_in_pool:
+        return sorted_listings[:max_results]
+
+    out: list[Any] = []
+    seen_regional = 0
+    seen_market = 0
+    for lst in sorted_listings:
+        store = resolve_store_for_url(str(getattr(lst, "url", "") or ""), store_by_domain)
+        st = (store.store_type if store is not None else "regional_ecommerce") or "regional_ecommerce"
+        if st == "local_shop":
+            out.append(lst)
+        elif st == "regional_ecommerce":
+            if seen_regional < _MAX_REGIONAL_WHEN_LOCAL_PRESENT:
+                out.append(lst)
+                seen_regional += 1
+        elif st == "marketplace":
+            if seen_market < _MAX_MARKETPLACE_WHEN_LOCAL_PRESENT:
+                out.append(lst)
+                seen_market += 1
+        else:
+            # Unknown / default: treat as regional.
+            if seen_regional < _MAX_REGIONAL_WHEN_LOCAL_PRESENT:
+                out.append(lst)
+                seen_regional += 1
+        if len(out) >= max_results:
+            break
+    return out
+
+
 async def run_vinyl_search(query: str) -> dict[str, Any]:
     settings = get_settings()
     debug_enabled = settings.debug
@@ -187,9 +276,6 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     if cached_payload is not None:
         return hydrate_cached_pipeline_dict(cached_payload)
 
-    with stage_timer("stores") as rec:
-        stores = await load_active_stores()
-
     geo = geo_intent_from_parsed(parsed)
     norm = normalized_geo_from_parsed(parsed)
 
@@ -203,6 +289,28 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             "search_scope": geo.search_scope,
             "region": geo.region,
         }
+
+    # LOCAL-FIRST STRIKE — phase 2: if the resolved city has fewer than the
+    # configured number of indie ``local_shop`` rows, discover more on demand
+    # via Tavily + LLM before we load the active store catalogue.
+    if norm.resolved_city and norm.resolved_country:
+        with stage_timer("store_discovery", input={
+            "city": norm.resolved_city,
+            "country_code": norm.resolved_country,
+        }) as rec:
+            coverage = await ensure_local_coverage(
+                city=norm.resolved_city,
+                country_code=norm.resolved_country,
+            )
+            rec.output = coverage
+            disc = coverage.get("discovery") or {}
+            if not coverage.get("triggered"):
+                rec.status = "empty"
+            elif not (disc.get("inserted") or disc.get("updated")):
+                rec.status = "empty"
+
+    with stage_timer("stores") as rec:
+        stores = await load_active_stores()
 
     core_query = build_tavily_core_query(parsed.artist, album_title)
     queries = [core_query]
@@ -291,7 +399,28 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         cached_raw = await get_cached_tavily_tier_payload(tkey)
         cache_hit = cached_raw is not None
 
+        # Visibility hook for the local-first audit: dump the exact
+        # ``include_domains`` payload we are about to send to Tavily. This is
+        # the canonical place to verify that newly-discovered domains (e.g.
+        # ``misbits.ro``, ``phono.cz``) are actually included in the request.
+        logger.info(
+            "tavily_include_domains",
+            extra={
+                "stage": "tavily",
+                "tier": tier,
+                "core_query": core_query,
+                "include_domains_count": len(store_domains),
+                "include_domains": store_domains,
+                "cache_hit": cache_hit,
+            },
+        )
+
         with stage_timer("tavily") as rec:
+            rec.input = {
+                "tier": tier,
+                "include_domains": store_domains,
+                "cache_hit": cache_hit,
+            }
             if cache_hit:
                 raw_results = [SearchResult.model_validate(x) for x in (cached_raw or [])]
             else:
@@ -321,6 +450,8 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
 
         accepted: list[Any] = []
         rejected_reasons: list[dict[str, str]] = []
+        # Local-First Strike: a row from the city tier whose host resolves to a
+        # ``local_shop`` whitelist row passes the validator with relaxed fuzz floors.
         for lst in batch:
             enriched = lst.model_copy(
                 update={
@@ -328,7 +459,16 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                     "validation_artist": parsed.artist,
                 }
             )
-            if not validate_listing(enriched, allowed_domains=all_allowed):
+            relaxed = False
+            if tier == "city":
+                host_store = resolve_store_for_url(str(getattr(enriched, "url", "")), tier_lookup)
+                if host_store is not None and host_store.store_type == "local_shop":
+                    relaxed = True
+            if not validate_listing(
+                enriched,
+                allowed_domains=all_allowed,
+                relaxed_local_indie=relaxed,
+            ):
                 rejected_reasons.append(
                     {
                         "url": str(getattr(enriched, "url", ""))[:160],
@@ -380,6 +520,17 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             break
 
     list_out = list(aggregated.values())
+
+    # Local-First Strike — gather pool flag once: are there any indie locals among
+    # the validated rows? If yes, scorer + sorter activate the giant penalty.
+    def _row_store(lst: Any) -> StoreEntry | None:
+        return resolve_store_for_url(str(getattr(lst, "url", "") or ""), store_lookup)
+
+    local_present_in_pool = any(
+        (s := _row_store(r)) is not None and s.store_type == "local_shop"
+        for r in list_out
+    )
+
     sorted_listings = sort_validated_listings_geo(
         list_out,
         store_by_domain=store_lookup,
@@ -387,9 +538,25 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         listing_tier_map=listing_tier_map,
         album_title=album_title or "",
         artist=parsed.artist,
+        local_present_in_pool=local_present_in_pool,
     )
 
-    head = sorted_listings[: settings.pipeline_max_results]
+    # HHV duplicate fix: collapse same-domain rows down to the top-ranked one
+    # BEFORE the local-first cap runs, so that "5x hhv.de" can never crowd out
+    # five separate indie shops just because Tavily liked one giant catalogue.
+    deduped_listings, domain_drops = _dedupe_listings_by_domain(
+        sorted_listings,
+        store_by_domain=store_lookup,
+    )
+
+    # Result capping: when locals exist, hold non-indie store types to the cap
+    # BEFORE truncating to ``pipeline_max_results``.
+    head = _apply_local_first_caps(
+        deduped_listings,
+        store_by_domain=store_lookup,
+        local_present_in_pool=local_present_in_pool,
+        max_results=settings.pipeline_max_results,
+    )
 
     breakdowns: list[ListingRankBreakdown] = []
     for lst in head:
@@ -405,6 +572,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 resolved_city=norm.resolved_city,
                 album_title=album_title or "",
                 artist=parsed.artist,
+                local_present_in_pool=local_present_in_pool,
             )
         )
 
@@ -433,7 +601,14 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             "tiers_attempted": tiers_attempted,
             "executed_global_fallback": executed_global_fallback,
             "total_validated": len(aggregated),
+            "after_domain_dedupe": len(deduped_listings),
+            "domain_duplicates_dropped": domain_drops,
             "final_returned": len(head),
+            "local_present_in_pool": local_present_in_pool,
+            "local_first_caps": {
+                "regional_ecommerce_max": _MAX_REGIONAL_WHEN_LOCAL_PRESENT,
+                "marketplace_max": _MAX_MARKETPLACE_WHEN_LOCAL_PRESENT,
+            },
             "per_tier": tier_traces,
         }
 

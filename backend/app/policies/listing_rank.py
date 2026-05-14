@@ -33,12 +33,20 @@ from app.validators.listings import url_suggests_product_detail_page
 
 # Per-signal ceilings (in raw points). Sum = RANK_CEILING_TOTAL.
 _W_SEMANTIC_MAX = 30.0       # album fuzzy + artist fuzzy
-_W_GEO_MAX = 150.0           # geo_proximity_bonus (0..100) × 1.5
+_W_GEO_MAX = 220.0           # geo_proximity_bonus (0..100) × 2.2 — heavy locality bias
 _W_VINYL_MAX = 16.0          # URL + title format signals (vinyl/LP/12")
 _W_STORE_QUALITY_MAX = 22.0  # priority + listing_quality
 _W_PDP_MAX = 12.0            # PDP-shaped URL + in_stock
-_W_STORE_TYPE_MAX = 14.0     # local_shop bonus
+_W_STORE_TYPE_MAX = 60.0     # local_shop bonus — must clearly outrank regional
 _W_TIER_MAX = 48.0           # discovery tier (city tier highest)
+
+#: Local-First Strike: applied to ``total`` (sort key) only — keeps the normalized
+#: 0..1 ``score_normalized`` informative for the rest of the field while pinning
+#: indie locals to the top of any mixed pool.
+_INDIE_LOCAL_CITY_BONUS: float = 500.0
+#: Subtracted from non-``local_shop`` rows whenever the pool also contains a
+#: qualified ``local_shop`` listing. Affects both ``total`` and ``score_normalized``.
+_GIANT_PENALTY_POINTS: float = 80.0
 
 RANK_CEILING_TOTAL: float = (
     _W_SEMANTIC_MAX
@@ -60,8 +68,8 @@ _TIER_WEIGHT: dict[Tier, float] = {
 
 # Higher = stronger boost for the listing. local_shop > regional > marketplace.
 _STORE_TYPE_WEIGHT: dict[str, float] = {
-    "local_shop": _W_STORE_TYPE_MAX,
-    "regional_ecommerce": _W_STORE_TYPE_MAX * 0.43,
+    "local_shop": _W_STORE_TYPE_MAX,            # 60
+    "regional_ecommerce": _W_STORE_TYPE_MAX / 3.0,  # 20
     "marketplace": 0.0,
 }
 
@@ -202,8 +210,18 @@ def composite_listing_score(
     resolved_city: str | None,
     album_title: str,
     artist: str | None,
+    local_present_in_pool: bool = False,
 ) -> ListingRankBreakdown:
-    """Authoritative scorer. Returns the full breakdown for debug tracing."""
+    """Authoritative scorer. Returns the full breakdown for debug tracing.
+
+    Local-First Strike behaviour:
+
+    * When ``store.store_type == "local_shop"`` AND it city-matches the resolved
+      city, :data:`_INDIE_LOCAL_CITY_BONUS` is added to ``total`` (sort key only).
+    * When ``local_present_in_pool`` is True and this row is NOT a local_shop,
+      :data:`_GIANT_PENALTY_POINTS` is subtracted from both ``total`` and the
+      normalized score so giants visibly fall below the indies.
+    """
     # --- geo proximity (0..100) → weighted to ceiling ---
     geo_raw = 0.0
     geo_country_match = False
@@ -220,6 +238,7 @@ def composite_listing_score(
             target_city=resolved_city,
             target_commerce_region=tgt_reg,
             ships_expanded=ships,
+            store_type=store.store_type,
         )
         sc = (store.country_code or "").strip().upper()
         tc = (resolved_country or "").strip().upper()
@@ -265,8 +284,23 @@ def composite_listing_score(
     type_w = _STORE_TYPE_WEIGHT.get(st_key, 0.0)
     tier_w = _TIER_WEIGHT.get(discovery_tier, _W_TIER_MAX * 0.29)
 
-    total = semantic_w + geo_w + vinyl_w + store_quality_w + pdp_w + type_w + tier_w
-    score_norm = max(0.0, min(1.0, total / RANK_CEILING_TOTAL))
+    base_total = semantic_w + geo_w + vinyl_w + store_quality_w + pdp_w + type_w + tier_w
+
+    # Giant penalty: applied when an indie local is present in the same pool —
+    # affects BOTH the visible normalized score and the sort key.
+    is_local = st_key == "local_shop"
+    penalized_total = base_total
+    if local_present_in_pool and not is_local:
+        penalized_total = base_total - _GIANT_PENALTY_POINTS
+
+    score_norm = max(0.0, min(1.0, penalized_total / RANK_CEILING_TOTAL))
+
+    # Indie city bonus: applied to ``total`` only so the visible normalized
+    # score stays informative across the indie cohort while the sort tier-bumps
+    # any city-matched local_shop above giants.
+    total = penalized_total
+    if is_local and geo_city_match:
+        total = penalized_total + _INDIE_LOCAL_CITY_BONUS
 
     return ListingRankBreakdown(
         total=round(total, 3),
@@ -295,6 +329,7 @@ def composite_listing_rank(
     resolved_city: str | None,
     album_title: str,
     artist: str | None,
+    local_present_in_pool: bool = False,
 ) -> float:
     """Back-compat scalar (used by `sort_validated_listings_geo`)."""
     return composite_listing_score(
@@ -305,6 +340,7 @@ def composite_listing_rank(
         resolved_city=resolved_city,
         album_title=album_title,
         artist=artist,
+        local_present_in_pool=local_present_in_pool,
     ).total
 
 

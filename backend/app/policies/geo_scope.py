@@ -252,6 +252,11 @@ def filter_stores_for_tier(
             return ()
         return tuple(s for s in active if store_in_region(s, geo.region))
     if tier == "city":
+        # LOCAL-FIRST STRIKE: the city tier is strictly indie. A store enters this
+        # pool only when it is a ``local_shop`` AND its `city` fuzzy-matches the
+        # resolved query city. Regional ecommerce / marketplaces are deliberately
+        # withheld for the country/region fallback, even when they happen to be
+        # HQ'd in the target city (Juno London, HHV Berlin, …).
         if not norm.resolved_country or not norm.resolved_city:
             return ()
         cc = norm.resolved_country.upper()
@@ -259,10 +264,11 @@ def filter_stores_for_tier(
         for s in active:
             if (s.country_code or "").upper() != cc:
                 continue
-            if s.city and cities_match(norm.resolved_city, s.city):
-                out.append(s)
-            elif s.store_type == "local_shop" and ((not s.city) or cities_match(norm.resolved_city, s.city)):
-                out.append(s)
+            if s.store_type != "local_shop":
+                continue
+            if not s.city or not cities_match(norm.resolved_city, s.city):
+                continue
+            out.append(s)
         return tuple(out)
     # country — HQ match only (RS keeps expanded neighbourhood semantics).
     if not geo.country_code:
@@ -361,8 +367,14 @@ def sort_validated_listings_geo(
     listing_tier_map: dict[str, Tier],
     album_title: str,
     artist: str | None,
+    local_present_in_pool: bool = False,
 ) -> list[object]:
-    """Global ordering by composite rank (geo-heavy)."""
+    """Global ordering by composite rank (geo-heavy).
+
+    ``local_present_in_pool`` activates the "giant penalty" inside
+    :func:`app.policies.listing_rank.composite_listing_rank` so non-local
+    stores fall below any qualified indie local result.
+    """
     from app.policies.listing_rank import composite_listing_rank, resolve_store_for_url
 
     def score(lst: object) -> float:
@@ -380,6 +392,7 @@ def sort_validated_listings_geo(
             resolved_city=norm.resolved_city,
             album_title=album_title,
             artist=artist,
+            local_present_in_pool=local_present_in_pool,
         )
 
     return sorted(listings, key=lambda lst: (-score(lst), str(getattr(lst, "url", ""))))

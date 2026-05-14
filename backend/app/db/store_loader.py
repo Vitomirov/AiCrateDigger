@@ -212,3 +212,60 @@ async def load_active_stores() -> tuple[StoreEntry, ...]:
         return get_active_stores()
 
     return tuple(_orm_to_entry(r) for r in rows)
+
+
+# Default minimum number of ``local_shop`` rows a resolved city should have before
+# the pipeline starts. Below this we trigger on-demand discovery (Tavily + LLM).
+# Strict ``< 2`` policy: as soon as the city has only one indie (or none) on file,
+# we await discovery so the new domains hit Tavily on the SAME request.
+LOCAL_COVERAGE_THRESHOLD: int = 2
+
+
+async def ensure_local_coverage(
+    city: str | None,
+    country_code: str | None,
+    *,
+    threshold: int = LOCAL_COVERAGE_THRESHOLD,
+) -> dict[str, object]:
+    """Guarantee ``threshold`` ``local_shop`` rows exist for ``(city, country_code)``.
+
+    Returns a small summary dict for the pipeline debug payload. Safe no-op when
+    inputs are missing, the DB is unavailable, or discovery returns empty.
+    """
+    summary: dict[str, object] = {
+        "city": city,
+        "country_code": country_code,
+        "threshold": threshold,
+        "before": 0,
+        "after": 0,
+        "triggered": False,
+        "discovery": None,
+        "skipped_reason": None,
+    }
+    settings = get_settings()
+    if not city or not country_code:
+        summary["skipped_reason"] = "missing_city_or_country_code"
+        return summary
+    if not settings.database_url:
+        summary["skipped_reason"] = "no_database_url"
+        return summary
+
+    # Local import — keeps the discovery module optional at cold start and avoids
+    # pulling httpx/openai when ``ensure_local_coverage`` is never called.
+    from app.services.store_discovery import (
+        count_local_shops_in_city,
+        discover_new_stores,
+    )
+
+    before = await count_local_shops_in_city(city, country_code)
+    summary["before"] = before
+    if before >= threshold:
+        summary["after"] = before
+        summary["skipped_reason"] = "coverage_already_sufficient"
+        return summary
+
+    summary["triggered"] = True
+    report = await discover_new_stores(city=city, country_code=country_code)
+    summary["discovery"] = report.as_dict()
+    summary["after"] = await count_local_shops_in_city(city, country_code)
+    return summary
