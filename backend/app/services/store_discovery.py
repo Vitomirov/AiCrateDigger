@@ -21,7 +21,8 @@ from dataclasses import dataclass
 
 import httpx
 from openai import AsyncOpenAI
-from sqlalchemy import func, select
+from sqlalchemy import case, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import get_settings
 from app.db.database import WhitelistStoreORM, session_factory
@@ -288,19 +289,41 @@ async def _llm_extract_candidates(
 # ---------------------------------------------------------------------------
 
 
-async def _upsert_candidates(
+def _dedupe_candidates_by_domain(
+    candidates: list[DiscoveredStoreCandidate],
+) -> list[DiscoveredStoreCandidate]:
+    """Keep one row per canonical ``domain`` (highest ``confidence`` wins).
+
+    Prevents duplicate rows in ``values_list`` that would confuse PostgreSQL
+    bulk INSERT or trigger redundant conflict handling.
+    """
+    best_by_domain: dict[str, DiscoveredStoreCandidate] = {}
+    for cand in candidates:
+        prev = best_by_domain.get(cand.domain)
+        if prev is None or cand.confidence > prev.confidence:
+            best_by_domain[cand.domain] = cand
+    return list(best_by_domain.values())
+
+
+async def save_discovered_stores(
     candidates: list[DiscoveredStoreCandidate],
 ) -> tuple[list[str], list[str]]:
-    """Insert new rows or back-fill nullables on existing rows.
+    """Bulk PostgreSQL UPSERT for discovered stores.
 
-    Returns ``(inserted_domains, updated_domains)``.
-    NEVER overwrites existing ``priority``, ``name``, or ``ships_to_json``.
+    Uses ``INSERT ... ON CONFLICT (domain) DO UPDATE`` so duplicate domains from
+    Tavily/LLM never raise ``UniqueViolationError``. Conflicting rows refresh
+    empty/null ``city``, ``country_code``, ``region``, ``store_type`` (when not
+    yet set to a known type), and ``is_active``. Never updates ``priority``,
+    ``name``, ``ships_to_json``, ``latitude``, or ``longitude``.
+
+    Returns ``(inserted_domains, updated_domains)`` relative to rows that existed
+    before this call (domains present only in this batch).
     """
     if not candidates:
         return [], []
 
-    inserted: list[str] = []
-    updated: list[str] = []
+    unique = _dedupe_candidates_by_domain(candidates)
+    domains_in_batch = [c.domain for c in unique]
 
     try:
         sf = session_factory()
@@ -311,63 +334,78 @@ async def _upsert_candidates(
         )
         return [], []
 
-    async with sf() as session:
-        for cand in candidates:
-            dom = cand.domain
-            existing = await session.scalar(
-                select(WhitelistStoreORM).where(WhitelistStoreORM.domain == dom)
-            )
-            if existing is not None:
-                # BACK-FILL ONLY. priority / name / ships_to / listing_quality stay untouched.
-                changed = False
-                if (existing.city is None or not str(existing.city).strip()) and cand.city:
-                    existing.city = cand.city
-                    changed = True
-                if (
-                    (existing.country_code is None or not str(existing.country_code).strip())
-                    and cand.country_code
-                ):
-                    existing.country_code = cand.country_code
-                    changed = True
-                existing_type = (existing.store_type or "").strip().lower()
-                if existing_type not in {"local_shop", "regional_ecommerce", "marketplace"}:
-                    existing.store_type = "local_shop"
-                    changed = True
-                if existing.region is None or not str(existing.region).strip():
-                    reg = country_to_region(cand.country_code)
-                    if reg:
-                        existing.region = reg
-                        changed = True
-                if not existing.is_active:
-                    existing.is_active = True
-                    changed = True
-                if changed:
-                    updated.append(dom)
-                continue
+    values_list: list[dict[str, object]] = []
+    for cand in unique:
+        reg = country_to_region(cand.country_code)
+        leg = cand.country_code[:8] if cand.country_code else "XX"
+        values_list.append(
+            {
+                "name": cand.name,
+                "domain": cand.domain,
+                "country": leg,
+                "country_code": cand.country_code,
+                "region": reg,
+                "ships_to_json": json.dumps(["EU"]),
+                "priority": _DISCOVERED_PRIORITY,
+                "is_active": True,
+                "city": cand.city,
+                "latitude": None,
+                "longitude": None,
+                "store_type": "local_shop",
+            }
+        )
 
-            reg = country_to_region(cand.country_code)
-            leg = cand.country_code[:8] if cand.country_code else "XX"
-            session.add(
-                WhitelistStoreORM(
-                    name=cand.name,
-                    domain=dom,
-                    country=leg,
-                    country_code=cand.country_code,
-                    region=reg,
-                    ships_to_json=json.dumps(["EU"]),
-                    priority=_DISCOVERED_PRIORITY,
-                    is_active=True,
-                    city=cand.city,
-                    latitude=None,
-                    longitude=None,
-                    store_type="local_shop",
+    async with sf() as session:
+        existing_rows = (
+            await session.scalars(
+                select(WhitelistStoreORM.domain).where(
+                    WhitelistStoreORM.domain.in_(domains_in_batch)
                 )
             )
-            inserted.append(dom)
+        ).all()
+        existing_before = set(existing_rows)
 
+        stmt = pg_insert(WhitelistStoreORM).values(values_list)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["domain"],
+            set_={
+                "city": func.coalesce(
+                    func.nullif(func.trim(WhitelistStoreORM.city), ""),
+                    stmt.excluded.city,
+                ),
+                "country_code": func.coalesce(
+                    func.nullif(func.trim(WhitelistStoreORM.country_code), ""),
+                    stmt.excluded.country_code,
+                ),
+                "region": func.coalesce(
+                    func.nullif(func.trim(WhitelistStoreORM.region), ""),
+                    stmt.excluded.region,
+                ),
+                "store_type": case(
+                    (
+                        WhitelistStoreORM.store_type.in_(
+                            ("local_shop", "regional_ecommerce", "marketplace")
+                        ),
+                        WhitelistStoreORM.store_type,
+                    ),
+                    else_=stmt.excluded.store_type,
+                ),
+                "is_active": or_(WhitelistStoreORM.is_active, stmt.excluded.is_active),
+            },
+        )
+        await session.execute(stmt)
         await session.commit()
 
+    inserted = [d for d in domains_in_batch if d not in existing_before]
+    updated = [d for d in domains_in_batch if d in existing_before]
     return inserted, updated
+
+
+async def _upsert_candidates(
+    candidates: list[DiscoveredStoreCandidate],
+) -> tuple[list[str], list[str]]:
+    """Backward-compatible alias for :func:`save_discovered_stores`."""
+    return await save_discovered_stores(candidates)
 
 
 # ---------------------------------------------------------------------------

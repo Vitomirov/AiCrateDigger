@@ -145,7 +145,7 @@ export default function SearchExperience() {
                         void onDig();
                       }
                     }}
-                    placeholder={'Talking Heads — "Remain in Light"…'}
+                    placeholder={'Tool — "10,000 Days"…'}
                     className="box-border h-12 min-h-[3rem] w-full shrink-0 resize-none overflow-y-auto rounded-lg border-[3px] border-crate-rust bg-[#0b0907]/95 px-3 py-2 text-[13px] font-semibold leading-tight text-crate-cream shadow-inner outline-none placeholder:text-crate-cream/45 placeholder:italic focus:border-crate-amber disabled:opacity-55 sm:h-[3.25rem] sm:min-h-[3.25rem] sm:text-[14px] md:h-14 md:min-h-[3.5rem] md:text-[15px]"
                   />
                   <button

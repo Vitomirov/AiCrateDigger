@@ -95,7 +95,7 @@ class ParseRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {"query": "The Doors Strange Days vinyl in Belgrade"},
-                {"query": "Disciplina Kičme - Sviđa mi se da ti ne bude prijatno na vinilu u Beogradu"},
+                {"query": "Tool 10,000 Days vinyl in Belgrade"},
             ]
         }
     )
