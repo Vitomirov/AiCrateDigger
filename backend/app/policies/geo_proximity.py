@@ -64,6 +64,18 @@ BORDER_NEIGHBORS: dict[str, frozenset[str]] = {
 }
 
 
+# Common English↔local exonyms parsed users often mix with storefront DB spelling.
+_SYNONYMOUS_CAPITAL_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"prague", "praha"}),
+    frozenset({"bucharest", "bucurești", "bucuresti"}),
+    frozenset({"vienna", "wien"}),
+    frozenset({"copenhagen", "københavn", "kobenhavn"}),
+    frozenset({"munich", "münchen", "muenchen"}),
+    frozenset({"cologne", "köln", "koeln"}),
+    frozenset({"florence", "firenze"}),
+)
+
+
 def cities_match(user_city: str | None, store_city: str | None, *, min_ratio: int = 88) -> bool:
     """Lenient city match for typos / casing (e.g. Barselona vs Barcelona)."""
     if not user_city or not store_city:
@@ -74,6 +86,9 @@ def cities_match(user_city: str | None, store_city: str | None, *, min_ratio: in
         return False
     if a == b:
         return True
+    for grp in _SYNONYMOUS_CAPITAL_GROUPS:
+        if a in grp and b in grp:
+            return True
     return int(fuzz.ratio(a, b)) >= min_ratio
 
 

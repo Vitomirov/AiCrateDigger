@@ -19,6 +19,7 @@ import httpx
 from app.config import get_settings
 from app.models.search_query import SearchResult
 from app.pipeline_context import stage_timer
+from app.policies.search_dsl import build_tavily_local_fanout_narrow_query
 from app.policies.store_domain import canonical_store_domain
 from app.services.tavily_domain_batches import chunk_include_domains as _chunk_include_domains
 
@@ -141,11 +142,12 @@ async def _search_single_query(
     *,
     include_domains: list[str] | None = None,
     max_results: int | None = None,
+    fanout_local_shop: bool = False,
 ) -> list[SearchResult]:
     settings = get_settings()
     inc = include_domains if include_domains is not None else _include_domains_for_query(query)
     max_r = max_results if max_results is not None else MAX_RESULTS_PER_QUERY
-    min_score = float(settings.tavily_min_result_score)
+    min_score_base = float(settings.tavily_min_result_score)
     depth = getattr(settings, "tavily_search_depth", None) or "basic"
     payload: dict[str, str | int | list[str]] = {
         "api_key": settings.tavily_api_key,
@@ -156,6 +158,10 @@ async def _search_single_query(
     }
     if inc:
         payload["include_domains"] = inc
+
+    per_query_threshold = min_score_base
+    if fanout_local_shop and inc is not None and len(inc) == 1:
+        per_query_threshold = max(0.052, min_score_base * 0.42)
 
     with stage_timer("tavily", input={"query": query}) as rec:
         try:
@@ -170,9 +176,7 @@ async def _search_single_query(
                 extra={"stage": "tavily", "status": "fail", "reason": rec.error, "query": query},
             )
             return []
-        except Exception as exc:
-            rec.status = "fail"
-            rec.error = str(exc)
+        except Exception:
             logger.exception("tavily_unexpected_error", extra={"stage": "tavily", "status": "fail"})
             return []
 
@@ -190,7 +194,9 @@ async def _search_single_query(
             prod = _product_signal_multiplier(path_m)
             base_score = float(item.get("score", 0.0) or 0.0)
             eff = base_score * prod
-            if prod == 0.0 or eff < min_score:
+            if fanout_local_shop and prod > 0.0:
+                eff = float(base_score) * max(float(prod), 0.91)
+            if prod == 0.0 or eff < per_query_threshold:
                 continue
             results.append(
                 SearchResult(
@@ -313,14 +319,15 @@ async def run_local_site_searches(
     local_domains: list[str],
     *,
     tier: str | None = None,
+    album_title: str | None = None,
 ) -> tuple[list[SearchResult], int]:
     """One-call-per-domain Tavily fanout for indie local shops.
 
-    Unlike :func:`run_tavily_for_store_domains` (which batches up to 20 domains
-    inside a single ``include_domains`` array), this fires N parallel calls
-    with ``include_domains=[<one_local_domain>]`` so each indie shop has the
-    full result slate to itself. Required to surface deep PDPs on small shops
-    that lose every fight against giants when batched.
+    Optionally runs a **narrow album-phrase** query in addition to the full ``core``
+    string—some EU storefront search indexes barely surface rows for long artist+album packs.
+
+    Per-request score floors relax when ``fanout_local_shop`` is enabled so SEO-sparse PDP
+    URLs are not clipped before merge.
 
     Returns ``(deduplicated_results, http_call_count)``.
     """
@@ -333,7 +340,14 @@ async def run_local_site_searches(
     if not domains:
         return [], 0
 
+    narrow = build_tavily_local_fanout_narrow_query(album_title or "").strip()
+    sub_queries = [q]
+    if narrow and narrow.lower() != q.lower():
+        sub_queries.append(narrow)
+    queries_per_domain = len(sub_queries)
+
     max_results = settings.tavily_max_results_per_batch
+    aggregate_floor = max(0.052, float(settings.tavily_min_result_score) * 0.42)
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         async def _one(domain: str) -> list[SearchResult]:
@@ -343,35 +357,44 @@ async def run_local_site_searches(
                     "stage": "tavily",
                     "tier": tier,
                     "domain": domain,
-                    "query": q,
+                    "queries": sub_queries,
                 },
             )
-            try:
-                return await _search_single_query(
-                    client,
-                    q,
-                    include_domains=[domain],
-                    max_results=max_results,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "tavily_local_site_search_failed",
-                    extra={
-                        "stage": "tavily",
-                        "tier": tier,
-                        "domain": domain,
-                        "reason": str(exc),
-                    },
-                )
-                return []
+            merged: dict[str, SearchResult] = {}
+            for subq in sub_queries:
+                try:
+                    batch = await _search_single_query(
+                        client,
+                        subq,
+                        include_domains=[domain],
+                        max_results=max_results,
+                        fanout_local_shop=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "tavily_local_site_search_failed",
+                        extra={
+                            "stage": "tavily",
+                            "tier": tier,
+                            "domain": domain,
+                            "sub_query": subq,
+                            "reason": str(exc),
+                        },
+                    )
+                    continue
+                for sr in batch:
+                    nk = normalize_url(sr.url)
+                    prev = merged.get(nk)
+                    if prev is None or sr.score > prev.score:
+                        merged[nk] = sr
+            return list(merged.values())
 
         gathered = await asyncio.gather(*[_one(d) for d in domains])
 
     unique_by_url: dict[str, SearchResult] = {}
-    min_score = float(settings.tavily_min_result_score)
     for res_list in gathered:
         for res in res_list:
-            if res.score < min_score:
+            if res.score < aggregate_floor:
                 continue
             if not is_valid_result(res.url):
                 continue
@@ -386,11 +409,12 @@ async def run_local_site_searches(
             "stage": "tavily",
             "tier": tier,
             "domains": len(domains),
+            "queries_per_domain": queries_per_domain,
             "kept": len(final),
             "top_domains": _top_domains(final, limit=5),
         },
     )
-    return final, len(domains)
+    return final, len(domains) * queries_per_domain
 
 
 def _top_domains(results: list[SearchResult], *, limit: int) -> list[str]:

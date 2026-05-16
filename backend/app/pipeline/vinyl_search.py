@@ -8,7 +8,10 @@ lives in the called sub-module. No fallbacks, no error swallowing.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Any
+
+from rapidfuzz import fuzz
 
 from app.config import get_settings
 from app.db.cache import (
@@ -43,6 +46,12 @@ from app.policies.listing_rank import (
     composite_listing_score,
     resolve_store_for_url,
 )
+from app.policies.physical_local import (
+    curated_city_local_shop_domains,
+    pool_has_qualifying_physical_local_row,
+    qualifies_as_target_city_local_shop,
+    should_prioritize_physical_local_shops,
+)
 from app.policies.search_dsl import build_tavily_core_query
 from app.policies.store_domain import canonical_store_domain
 from app.llm.verify_album_match import verify_album_match
@@ -62,6 +71,9 @@ _MIN_STORE_DOMAINS_CITY = 1
 #: hold non-indie store types to this cap in the final response.
 _MAX_REGIONAL_WHEN_LOCAL_PRESENT = 1
 _MAX_MARKETPLACE_WHEN_LOCAL_PRESENT = 0
+#: Stricter locality-first cap: when prioritized target-city locals validated,
+#: regional giants are withheld entirely unless no such locals exist upstream.
+_MAX_REGIONAL_WHEN_PRIORITIZED_PRIMARY_LOCAL_PRESENT = 0
 
 
 def _dedupe_store_entries_by_domain(capped: tuple[StoreEntry, ...]) -> tuple[StoreEntry, ...]:
@@ -93,6 +105,44 @@ def _effective_stop_floor(tier: Tier, *, settings: Any, confidence: float) -> in
         return max(1, base)
     bump = int((0.88 - confidence) * 6)
     return min(20, max(1, base + max(0, bump)))
+
+
+def _title_album_fuzzy_score(lst: Any, album_title: str) -> float:
+    if not (album_title or "").strip():
+        return 0.0
+    ttl = str(getattr(lst, "title", "") or "").strip().lower()
+    alb = album_title.strip().lower()
+    if not ttl or not alb:
+        return 0.0
+    return float(max(fuzz.partial_ratio(alb, ttl), fuzz.token_set_ratio(alb, ttl)))
+
+
+def _verdict_confirmed_rank(lst: Any, album_match_by_url: dict[str, bool] | None) -> int:
+    """Prefer explicit True verifier keys; missing keys neutral; explicit False suppressed."""
+    if not album_match_by_url:
+        return 1
+    u = str(getattr(lst, "url", "") or "")
+    nk = normalize_url(u)
+    if u in album_match_by_url:
+        return 2 if album_match_by_url[u] else 0
+    if nk in album_match_by_url:
+        return 2 if album_match_by_url[nk] else 0
+    return 1
+
+
+def _pick_best_same_domain_rows(rows: list[Any], *, album_title: str | None, album_match_by_url: dict[str, bool] | None) -> Any:
+    if len(rows) == 1:
+        return rows[0]
+
+    def key(lst: Any) -> tuple[int, float, str]:
+        u = str(getattr(lst, "url", "") or "")
+        return (
+            _verdict_confirmed_rank(lst, album_match_by_url),
+            _title_album_fuzzy_score(lst, album_title or ""),
+            u,
+        )
+
+    return max(rows, key=key)
 
 
 def _dedupe_listings_by_normalized_url(listings: list[Any]) -> list[Any]:
@@ -159,21 +209,23 @@ def _dedupe_listings_by_domain(
     sorted_listings: list[Any],
     *,
     store_by_domain: dict[str, StoreEntry],
+    album_title: str | None = None,
+    artist: str | None = None,
+    album_match_by_url: dict[str, bool] | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
-    """Collapse multiple listings from the same domain down to the top-ranked one.
+    """Pick the best listing per store domain after scoring, not simply "first in list".
 
-    Input MUST already be sorted by composite rank (best first); the first
-    occurrence of any domain wins and subsequent rows from that same host are
-    dropped. This is the "HHV duplicate fix": when ``hhv.de`` returns five PDPs
-    in one tier they collapse to a single row, freeing slots for distinct
-    stores (especially indie locals).
+    Groups hosts using the same keying policy as before, but when several URLs
+    share a domain (e.g. multiple Groovie PDPs) we keep the row that best matches
+    the target album title and any explicit ``verify_album_match`` confirmation
+    flags. ``artist`` is accepted for forward-compatible tie metadata (unused for
+    now — title overlap + verifier rank carry the signal).
 
-    Returns ``(deduped_listings, dropped_by_domain)`` so we can surface the
-    decision in the debug payload.
+    ``sorted_listings`` should still be ranked best-first for ordering of *groups*
+    and as a prior when composite scores are tied.
     """
-    seen: set[str] = set()
-    dropped: dict[str, int] = {}
-    out: list[Any] = []
+    _ = artist  # reserved for future token checks
+    groups: "OrderedDict[str, list[Any]]" = OrderedDict()
     for lst in sorted_listings:
         url = str(getattr(lst, "url", "") or "")
         store = resolve_store_for_url(url, store_by_domain)
@@ -183,11 +235,23 @@ def _dedupe_listings_by_domain(
             key = canonical_store_domain(url)
         if not key:
             continue
-        if key in seen:
-            dropped[key] = dropped.get(key, 0) + 1
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(lst)
+
+    out: list[Any] = []
+    dropped: dict[str, int] = {}
+    for key, rows in groups.items():
+        if len(rows) == 1:
+            out.append(rows[0])
             continue
-        seen.add(key)
-        out.append(lst)
+        kept = _pick_best_same_domain_rows(
+            rows,
+            album_title=album_title,
+            album_match_by_url=album_match_by_url,
+        )
+        out.append(kept)
+        dropped[key] = len(rows) - 1
     return out, dropped
 
 
@@ -195,23 +259,31 @@ def _apply_local_first_caps(
     sorted_listings: list[Any],
     *,
     store_by_domain: dict[str, StoreEntry],
-    local_present_in_pool: bool,
+    generic_local_shop_present_in_pool: bool,
+    prioritize_physical_locals: bool,
+    primary_target_local_shop_present: bool,
     max_results: int,
 ) -> list[Any]:
     """Local-First result capping.
 
-    If at least one ``local_shop`` validated:
-      * keep every ``local_shop`` row (in their composite-score order),
-      * limit ``regional_ecommerce`` to ``_MAX_REGIONAL_WHEN_LOCAL_PRESENT``,
-      * limit ``marketplace`` to ``_MAX_MARKETPLACE_WHEN_LOCAL_PRESENT``.
+    If at least one validated ``local_shop`` row exists in the aggregated pool:
+      * ``local_shop`` rows are streamed first until ``max_results``,
+      * ``regional_ecommerce`` capped to 1 normally, or **0** when prioritized
+        target-city indie locals validated (mega-retailer fallback only once
+        indie coverage is exhausted),
+      * ``marketplace`` capped to ``_MAX_MARKETPLACE_WHEN_LOCAL_PRESENT``.
 
-    When no locals are present the helper is a pass-through (input order kept).
-    Always returns at most ``max_results`` rows.
+    Without ``generic_local_shop_present_in_pool`` the helper preserves input
+    order (subject only to ``max_results``).
     """
     if max_results <= 0:
         return []
-    if not local_present_in_pool:
+    if not generic_local_shop_present_in_pool:
         return sorted_listings[:max_results]
+
+    regional_cap = _MAX_REGIONAL_WHEN_LOCAL_PRESENT
+    if prioritize_physical_locals and primary_target_local_shop_present:
+        regional_cap = _MAX_REGIONAL_WHEN_PRIORITIZED_PRIMARY_LOCAL_PRESENT
 
     out: list[Any] = []
     seen_regional = 0
@@ -222,7 +294,7 @@ def _apply_local_first_caps(
         if st == "local_shop":
             out.append(lst)
         elif st == "regional_ecommerce":
-            if seen_regional < _MAX_REGIONAL_WHEN_LOCAL_PRESENT:
+            if seen_regional < regional_cap:
                 out.append(lst)
                 seen_regional += 1
         elif st == "marketplace":
@@ -231,7 +303,7 @@ def _apply_local_first_caps(
                 seen_market += 1
         else:
             # Unknown / default: treat as regional.
-            if seen_regional < _MAX_REGIONAL_WHEN_LOCAL_PRESENT:
+            if seen_regional < regional_cap:
                 out.append(lst)
                 seen_regional += 1
         if len(out) >= max_results:
@@ -316,6 +388,13 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
 
     with stage_timer("stores") as rec:
         stores = await load_active_stores()
+
+    prioritize_physical_locals = should_prioritize_physical_local_shops(geo, norm)
+    curated_city_local_domains = (
+        curated_city_local_shop_domains(stores, norm)
+        if prioritize_physical_locals
+        else frozenset()
+    )
 
     core_query = build_tavily_core_query(parsed.artist, album_title)
     queries = [core_query]
@@ -469,6 +548,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                         core_query,
                         local_domains_for_fanout,
                         tier=tier,
+                        album_title=album_title or "",
                     )
                     rec_fan.input = {
                         "tier": tier,
@@ -499,6 +579,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 artist=parsed.artist,
                 album=album_title,
                 allowed_domains=set(store_domains),
+                snippet_relax_hosts=curated_city_local_domains,
             )
             listings = extract_report.listings
             rec.output = {
@@ -523,10 +604,16 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 }
             )
             relaxed = False
-            if tier == "city":
-                host_store = resolve_store_for_url(str(getattr(enriched, "url", "")), tier_lookup)
-                if host_store is not None and host_store.store_type == "local_shop":
-                    relaxed = True
+            enriched_url = str(getattr(enriched, "url", "") or "")
+            host_tier = resolve_store_for_url(enriched_url, tier_lookup)
+            if tier == "city" and host_tier is not None and host_tier.store_type == "local_shop":
+                relaxed = True
+            elif prioritize_physical_locals and qualifies_as_target_city_local_shop(
+                listing_url=enriched_url,
+                store_lookup=store_lookup,
+                norm=norm,
+            ):
+                relaxed = True
             if not validate_listing(
                 enriched,
                 allowed_domains=all_allowed,
@@ -604,6 +691,27 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                         surviving.append(lst)
                         continue
                     if v.verdict == "reject":
+                        keep_physical_local_despite_strict_reject = (
+                            prioritize_physical_locals
+                            and qualifies_as_target_city_local_shop(
+                                listing_url=url,
+                                store_lookup=store_lookup,
+                                norm=norm,
+                            )
+                        )
+                        if keep_physical_local_despite_strict_reject:
+                            album_match_by_url[url] = False
+                            album_match_by_url[normalize_url(url)] = False
+                            verifier_summary.append(
+                                {
+                                    "tier": tier,
+                                    "url": url[:160],
+                                    "verdict": "reject_soft_kept",
+                                    "reason": v.reason[:120],
+                                }
+                            )
+                            surviving.append(lst)
+                            continue
                         rejected_reasons.append(
                             {
                                 "url": url[:160],
@@ -678,14 +786,23 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
 
     list_out = list(aggregated.values())
 
-    # Local-First Strike — gather pool flag once: are there any indie locals among
-    # the validated rows? If yes, scorer + sorter activate the giant penalty.
+    # Local-First Strike — generic indie vs target-city indie signals.
     def _row_store(lst: Any) -> StoreEntry | None:
         return resolve_store_for_url(str(getattr(lst, "url", "") or ""), store_lookup)
 
-    local_present_in_pool = any(
+    generic_any_local_shop_present = any(
         (s := _row_store(r)) is not None and s.store_type == "local_shop"
         for r in list_out
+    )
+    primary_target_local_shop_present = pool_has_qualifying_physical_local_row(
+        list_out,
+        store_lookup=store_lookup,
+        norm=norm,
+    )
+    pool_for_giant_penalty = (
+        primary_target_local_shop_present
+        if prioritize_physical_locals
+        else generic_any_local_shop_present
     )
 
     sorted_listings = sort_validated_listings_geo(
@@ -695,16 +812,22 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         listing_tier_map=listing_tier_map,
         album_title=album_title or "",
         artist=parsed.artist,
-        local_present_in_pool=local_present_in_pool,
+        local_present_in_pool=pool_for_giant_penalty,
         album_match_by_url=album_match_by_url,
+        prioritize_physical_city_locals=prioritize_physical_locals,
     )
 
     # HHV duplicate fix: collapse same-domain rows down to the top-ranked one
     # BEFORE the local-first cap runs, so that "5x hhv.de" can never crowd out
     # five separate indie shops just because Tavily liked one giant catalogue.
+    # Prefer the listing that best evidences the requested album (plus verifier flags),
+    # instead of blindly keeping the first composite-ranked row on that host.
     deduped_listings, domain_drops = _dedupe_listings_by_domain(
         sorted_listings,
         store_by_domain=store_lookup,
+        album_title=album_title,
+        artist=parsed.artist,
+        album_match_by_url=(album_match_by_url if len(album_match_by_url) > 0 else None),
     )
 
     # Result capping: when locals exist, hold non-indie store types to the cap
@@ -712,7 +835,9 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     head = _apply_local_first_caps(
         deduped_listings,
         store_by_domain=store_lookup,
-        local_present_in_pool=local_present_in_pool,
+        generic_local_shop_present_in_pool=generic_any_local_shop_present,
+        prioritize_physical_locals=prioritize_physical_locals,
+        primary_target_local_shop_present=primary_target_local_shop_present,
         max_results=settings.pipeline_max_results,
     )
 
@@ -732,7 +857,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 resolved_city=norm.resolved_city,
                 album_title=album_title or "",
                 artist=parsed.artist,
-                local_present_in_pool=local_present_in_pool,
+                local_present_in_pool=pool_for_giant_penalty,
                 album_match_confirmed=confirmed,
             )
         )
@@ -765,9 +890,16 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             "after_domain_dedupe": len(deduped_listings),
             "domain_duplicates_dropped": domain_drops,
             "final_returned": len(head),
-            "local_present_in_pool": local_present_in_pool,
+            "local_present_in_pool": generic_any_local_shop_present,
+            "primary_target_city_local_shop_present": primary_target_local_shop_present,
+            "prioritize_physical_local_shops": prioritize_physical_locals,
+            "giant_penalty_pool_active": pool_for_giant_penalty,
             "local_first_caps": {
-                "regional_ecommerce_max": _MAX_REGIONAL_WHEN_LOCAL_PRESENT,
+                "regional_ecommerce_max": (
+                    _MAX_REGIONAL_WHEN_PRIORITIZED_PRIMARY_LOCAL_PRESENT
+                    if prioritize_physical_locals and primary_target_local_shop_present
+                    else _MAX_REGIONAL_WHEN_LOCAL_PRESENT
+                ),
                 "marketplace_max": _MAX_MARKETPLACE_WHEN_LOCAL_PRESENT,
             },
             "verifier_summary": verifier_summary[:25],

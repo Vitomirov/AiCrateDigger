@@ -35,6 +35,10 @@ class Listing(BaseModel):
     )
     validation_artist: str | None = Field(default=None, description="Injected pre-validate.")
     validation_album: str | None = Field(default=None, description="Injected pre-validate.")
+    source_snippet: str | None = Field(
+        default=None,
+        description="Raw SERP title+snippet excerpt used for grounding (verifier/evidence).",
+    )
 
     @field_validator("price", mode="before")
     @classmethod

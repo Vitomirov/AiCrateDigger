@@ -36,6 +36,19 @@ def build_tavily_core_query(artist: str | None, album: str) -> str:
     return " ".join(parts)
 
 
+def build_tavily_local_fanout_narrow_query(album: str) -> str:
+    """Album-anchored query for single-domain indie Tavily fanout.
+
+    Full ``artist + \"album\" + vinyl`` strings sometimes under-index on sparse
+    storefront search indexes; a tight album phrase recovers real PDPs without
+    injecting city tokens.
+    """
+    al = str(album or "").strip()
+    if not al:
+        return "vinyl LP"
+    return f'"{al}" vinyl LP' if " " in al else f"{al} vinyl LP"
+
+
 def build_query_core(
     artist: str | None,
     album: str,

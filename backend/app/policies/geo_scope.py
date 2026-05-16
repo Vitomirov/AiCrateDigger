@@ -369,6 +369,7 @@ def sort_validated_listings_geo(
     artist: str | None,
     local_present_in_pool: bool = False,
     album_match_by_url: dict[str, bool] | None = None,
+    prioritize_physical_city_locals: bool = False,
 ) -> list[object]:
     """Global ordering by composite rank (geo-heavy).
 
@@ -380,20 +381,24 @@ def sort_validated_listings_geo(
     only rows whose URL maps to ``True`` are bonused. Unknown / missing keys
     default to ``True`` (preserve backward-compat for callers that skip the
     LLM verifier).
+
+    ``prioritize_physical_city_locals`` — target city/country ``local_shop`` rows are
+    ordered strictly ahead of giants when locality-first UX applies.
     """
+    from app.policies.physical_local import qualifies_as_target_city_local_shop
     from app.policies.listing_rank import composite_listing_rank, resolve_store_for_url
 
     match_lookup = album_match_by_url or {}
 
-    def score(lst: object) -> float:
+    def sort_key(lst: object) -> tuple[int, float, str]:
         u = str(getattr(lst, "url", "") or "")
         nk = normalize_url(u)
         tier = listing_tier_map.get(nk, "continental")
         st = resolve_store_for_url(u, store_by_domain)
         if not hasattr(lst, "title"):
-            return 0.0
+            return (1, 0.0, u)
         confirmed = match_lookup.get(u, match_lookup.get(nk, True))
-        return composite_listing_rank(
+        composite = composite_listing_rank(
             lst,  # type: ignore[arg-type]
             store=st,
             discovery_tier=tier,
@@ -404,5 +409,18 @@ def sort_validated_listings_geo(
             local_present_in_pool=local_present_in_pool,
             album_match_confirmed=confirmed,
         )
+        phys_bucket = (
+            0
+            if (
+                prioritize_physical_city_locals
+                and qualifies_as_target_city_local_shop(
+                    listing_url=u,
+                    store_lookup=store_by_domain,
+                    norm=norm,
+                )
+            )
+            else 1
+        )
+        return (phys_bucket, -composite, u)
 
-    return sorted(listings, key=lambda lst: (-score(lst), str(getattr(lst, "url", ""))))
+    return sorted(listings, key=sort_key)

@@ -4,15 +4,13 @@ The Local-First Strike applies a +500-point bonus to indie ``local_shop``
 results whose store sits in the resolved city. That bonus must NEVER fire for
 a row whose title names a different release — otherwise a Bucharest indie
 selling "Spacekid" would crowd out an actual "Andrew Red Hand" listing on
-HHV. This module runs a single batched LLM call to label each candidate as
-``confirmed`` | ``reject`` | ``unsure`` so the pipeline can drop the rejects
-and gate the bonus.
+HHV. This module runs deterministic snippet checks PLUS a batched LLM gate.
 
 Contract:
 - Deterministic (``temperature=0``, JSON-only).
-- Single HTTP call regardless of input size.
-- Failure-tolerant: returns an empty dict on any error so the caller falls
-  back to "unsure" semantics (do not break, do not bonus).
+- Single HTTP call per invocation (skipped when every row fails deterministic evidence).
+- Failure-tolerant: returns an empty dict on missing keys / decoding errors so callers
+  keep rows as "unsure" except where deterministic rejects apply.
 """
 
 from __future__ import annotations
@@ -25,6 +23,8 @@ from openai import AsyncOpenAI
 
 from app.config import get_settings
 from app.domain.listing_schema import Listing
+from app.llm.extract_listings.evidence_alignment import evidence_blob_matches_target_release
+from app.services.tavily_service import normalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -39,23 +39,28 @@ class AlbumMatchVerdict:
 _VERIFY_SYSTEM_PROMPT = """
 You are AiCrateDigger's RELEASE VERIFIER.
 
-INPUT: target artist + target album, plus a small list of candidate listings
-(URL + title). Decide whether each listing names the SAME release.
+INPUT bundles `target_artist`, `target_album`, plus `listings` where each row has:
+``url``, ``snippet_title``, ``snippet_excerpt``.
+
+CRITICAL SOURCE-OF-TRUTH:
+- Decide using ONLY tokens present inside ``snippet_title`` + ``snippet_excerpt``.
+- If those fields describe a DIFFERENT album/artist/comp than the TARGET, you MUST return
+  `"reject"` even if the PDP URL could hypothetically correspond to anything else offline.
+- Never treat the shopper's hoped-for release name as factual unless BOTH target artist and
+  target album wording (or unmistakable synonyms printed in THAT snippet excerpt) explicitly
+  appear describing the SAME product listing.
 
 DECISION RULES:
-- "confirmed" — the title contains the target album name (or a clear
-  abbreviation / translation / partial form) and, when an artist is given,
-  there is a matching artist token. Edition/format suffixes are fine
-  (LP, 12", reissue year, gatefold, deluxe). Different pressings of the same
-  release count as confirmed.
-- "reject" — the title clearly names a DIFFERENT release: another album by
-  the same artist, a different artist entirely, a compilation that does
-  not include the target release, or non-record merchandise (book, poster,
-  T-shirt, equipment).
-- "unsure" — the title is too generic (e.g. just the artist name, just a
-  catalogue number, or truncated) to make a confident decision either way.
-  Use this sparingly; prefer "confirmed" or "reject" when the title gives
-  any usable cue.
+
+- `"confirmed"` — the snippet plainly names the SAME release as the TARGET: required album cues
+  (title / unmistakable synonym) PLUS artist cues WHEN a target artist is provided. Casual
+  format noise (LP, gatefold, 180g, year) ignored.
+- `"reject"` — the snippet names another release/composer/collection/non-music SKU, contradicts the
+  target album, OR when a target artist exists the snippet never references that artist but instead
+  references someone else.
+- `"unsure"` — the snippet is too sparse (only store nav, price, or generic "vinyl" text) to align
+  with any specific release. Use rarely; default to reject when the snippet clearly describes a
+  different record.
 
 OUTPUT — strict JSON only (no prose, no markdown):
 {
@@ -64,9 +69,18 @@ OUTPUT — strict JSON only (no prose, no markdown):
   ]
 }
 
-`reason` must be ≤ 80 chars. There MUST be exactly one verdict per input
-listing, identified by the exact ``url`` value.
+`reason` must be ≤ 80 chars. There MUST be exactly one verdict per survivor listing.
 """.strip()
+
+
+def _listing_evidence_blob_lc(lst: Listing) -> str:
+    parts: list[str] = []
+    sn = getattr(lst, "source_snippet", None)
+    if isinstance(sn, str) and sn.strip():
+        parts.append(sn.strip())
+    if lst.title:
+        parts.append(str(lst.title))
+    return " ".join(parts).strip().lower()
 
 
 async def verify_album_match(
@@ -75,13 +89,46 @@ async def verify_album_match(
     artist: str | None,
     album_title: str,
 ) -> dict[str, AlbumMatchVerdict]:
-    """Return ``{url -> AlbumMatchVerdict}``. Empty dict on missing inputs / failure."""
+    """Return ``{url -> AlbumMatchVerdict}``. Deterministic rejects win over any LLM output."""
     if not listings or not (album_title or "").strip():
         return {}
 
+    out: dict[str, AlbumMatchVerdict] = {}
+    survivors: list[Listing] = []
+
+    for lst in listings:
+        url = str(getattr(lst, "url", "") or "").strip()
+        if not url:
+            continue
+        blob_lc = _listing_evidence_blob_lc(lst)
+        if not evidence_blob_matches_target_release(
+            blob_lc,
+            artist=artist,
+            album=album_title,
+        ):
+            out[url] = AlbumMatchVerdict(
+                url=url,
+                verdict="reject",
+                reason="deterministic_snippet_misses_target",
+            )
+            nk = normalize_url(url)
+            if nk and nk != url:
+                out[nk] = out[url]
+            continue
+        survivors.append(lst)
+
+    if not survivors:
+        return out
+
     settings = get_settings()
     if not settings.openai_api_key:
-        return {}
+        for lst in survivors:
+            u = str(lst.url)
+            out[u] = AlbumMatchVerdict(url=u, verdict="unsure", reason="no_openai_key")
+            nk = normalize_url(u)
+            if nk and nk != u:
+                out[nk] = out[u]
+        return out
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     payload = {
@@ -90,9 +137,15 @@ async def verify_album_match(
         "listings": [
             {
                 "url": str(getattr(lst, "url", "") or ""),
-                "title": (getattr(lst, "title", "") or "")[:240],
+                "snippet_title": (getattr(lst, "title", "") or "")[:280],
+                "snippet_excerpt": (
+                    str(
+                        getattr(lst, "source_snippet", None)
+                        or (getattr(lst, "title", None) or "")
+                    )[:600]
+                ),
             }
-            for lst in listings
+            for lst in survivors
         ],
     }
 
@@ -111,7 +164,13 @@ async def verify_album_match(
             "verify_album_match_llm_failed",
             extra={"stage": "verify_album_match", "reason": str(exc)},
         )
-        return {}
+        for lst in survivors:
+            u = str(lst.url)
+            out[u] = AlbumMatchVerdict(url=u, verdict="unsure", reason="llm_error")
+            nk = normalize_url(u)
+            if nk and nk != u:
+                out[nk] = out[u]
+        return out
 
     raw = response.choices[0].message.content or "{}"
     try:
@@ -125,9 +184,14 @@ async def verify_album_match(
                 "raw_head": raw[:200],
             },
         )
-        return {}
+        for lst in survivors:
+            u = str(lst.url)
+            out[u] = AlbumMatchVerdict(url=u, verdict="unsure", reason="json_decode")
+            nk = normalize_url(u)
+            if nk and nk != u:
+                out[nk] = out[u]
+        return out
 
-    out: dict[str, AlbumMatchVerdict] = {}
     for row in data.get("verdicts", []) or []:
         if not isinstance(row, dict):
             continue
@@ -135,9 +199,13 @@ async def verify_album_match(
         verdict = str(row.get("verdict") or "").strip().lower()
         if not url or verdict not in {"confirmed", "reject", "unsure"}:
             continue
-        out[url] = AlbumMatchVerdict(
+        av = AlbumMatchVerdict(
             url=url,
             verdict=verdict,
             reason=str(row.get("reason") or "")[:120],
         )
+        out[url] = av
+        nk = normalize_url(url)
+        if nk and nk != url:
+            out[nk] = av
     return out

@@ -358,6 +358,11 @@ def validate_listing(
 
     url = listing.url
     title = (listing.title or "").strip()
+    fuzz_haystack = title
+    if relaxed_local_indie:
+        snippet = getattr(listing, "source_snippet", None)
+        if isinstance(snippet, str) and snippet.strip():
+            fuzz_haystack = f"{title} {snippet.strip()}".strip()
 
     if settings.debug:
         ok, reason = _debug_minimal_pass(listing, allowed_domains=allowed)
@@ -375,7 +380,7 @@ def validate_listing(
         artist_needle = (listing.validation_artist or "").strip()
 
         if album_needle:
-            pr, ts, best = _fuzz_best_album_artist(album_needle, title)
+            pr, ts, best = _fuzz_best_album_artist(album_needle, fuzz_haystack)
             if best < debug_album_min:
                 return _reject(
                     "debug_album_fuzzy_below_threshold",
@@ -389,7 +394,7 @@ def validate_listing(
                     },
                 )
         if artist_needle:
-            pr, ts, best = _fuzz_best_album_artist(artist_needle, title)
+            pr, ts, best = _fuzz_best_album_artist(artist_needle, fuzz_haystack)
             if best < artist_min:
                 return _reject(
                     "debug_artist_fuzzy_below_threshold",
@@ -435,10 +440,12 @@ def validate_listing(
         return _reject("missing_validation_album", listing=listing)
 
     pdp = url_suggests_product_detail_page(url)
-    eff_album_min = max(60, album_min - (relief if pdp else 0))
-    eff_artist_min = max(55, artist_min - (relief if pdp else 0))
+    floor_album = 50 if relaxed_local_indie else 60
+    floor_artist = 45 if relaxed_local_indie else 55
+    eff_album_min = max(floor_album, album_min - (relief if pdp else 0))
+    eff_artist_min = max(floor_artist, artist_min - (relief if pdp else 0))
 
-    pr_a, ts_a, best_album = _fuzz_best_album_artist(album_needle.strip(), title)
+    pr_a, ts_a, best_album = _fuzz_best_album_artist(album_needle.strip(), fuzz_haystack)
     if best_album < eff_album_min:
         return _reject(
             "album_fuzzy_below_threshold",
@@ -455,7 +462,7 @@ def validate_listing(
 
     artist_needle = listing.validation_artist
     if artist_needle is not None and artist_needle.strip() != "":
-        pr_ar, ts_ar, best_art = _fuzz_best_album_artist(artist_needle.strip(), title)
+        pr_ar, ts_ar, best_art = _fuzz_best_album_artist(artist_needle.strip(), fuzz_haystack)
         if best_art < eff_artist_min:
             return _reject(
                 "artist_fuzzy_below_threshold",
