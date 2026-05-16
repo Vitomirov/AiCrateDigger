@@ -1,4 +1,10 @@
-"""Regression tests for geo widening and proximity bonuses."""
+"""Regression tests for geo widening and proximity bonuses.
+
+``geo_proximity_bonus`` applies a store-type locality factor (``local_shop``,
+``regional_ecommerce``, ``marketplace``). Tests pass ``store_type`` explicitly
+when asserting full undamped scores; omitting it asserts damped behavior for
+the default regional class.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +23,22 @@ class TestGeoProximity(unittest.TestCase):
     def test_city_typo_matches(self) -> None:
         self.assertTrue(cities_match("Barcelona", "barselona"))
 
-    def test_same_city_country_100(self) -> None:
+    def test_same_city_country_100_for_local_shop(self) -> None:
+        """Full 0..100 geo bonus only when locality factor is 1.0 (``local_shop``)."""
+        b = geo_proximity_bonus(
+            store_country="ES",
+            store_city="Barcelona",
+            store_commerce_region="southern_europe",
+            target_country="ES",
+            target_city="Barcelona",
+            target_commerce_region="southern_europe",
+            ships_expanded=expand_ships_to(("EU",)),
+            store_type="local_shop",
+        )
+        self.assertEqual(b, 100.0)
+
+    def test_same_city_country_regional_ecommerce_is_dampened(self) -> None:
+        """Missing / generic store class defaults to regional ecommerce (×0.55)."""
         b = geo_proximity_bonus(
             store_country="ES",
             store_city="Barcelona",
@@ -27,9 +48,10 @@ class TestGeoProximity(unittest.TestCase):
             target_commerce_region="southern_europe",
             ships_expanded=expand_ships_to(("EU",)),
         )
-        self.assertEqual(b, 100.0)
+        self.assertAlmostEqual(b, 100.0 * 0.55)
 
-    def test_same_country_different_city_60(self) -> None:
+    def test_same_country_different_city_50_for_local_shop(self) -> None:
+        """Same-country non-city match uses a 50-point base (× locality factor)."""
         b = geo_proximity_bonus(
             store_country="ES",
             store_city="Madrid",
@@ -38,10 +60,12 @@ class TestGeoProximity(unittest.TestCase):
             target_city="Barcelona",
             target_commerce_region="southern_europe",
             ships_expanded=expand_ships_to(("EU",)),
+            store_type="local_shop",
         )
-        self.assertEqual(b, 60.0)
+        self.assertEqual(b, 50.0)
 
-    def test_eu_shipper_abroad_is_weak_signal(self) -> None:
+    def test_eu_shipper_abroad_is_weak_signal_for_local_shop(self) -> None:
+        """EU-only ship match uses a 4-point base (× locality factor)."""
         b = geo_proximity_bonus(
             store_country="DE",
             store_city="Berlin",
@@ -50,8 +74,9 @@ class TestGeoProximity(unittest.TestCase):
             target_city="Barcelona",
             target_commerce_region="southern_europe",
             ships_expanded=expand_ships_to(("EU",)),
+            store_type="local_shop",
         )
-        self.assertEqual(b, 5.0)
+        self.assertEqual(b, 4.0)
 
 
 class TestTierFallback(unittest.TestCase):

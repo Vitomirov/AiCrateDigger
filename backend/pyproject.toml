@@ -3,7 +3,7 @@ name = "aicratedigger-backend"
 version = "0.1.0"
 description = "AiCrateDigg FastAPI backend"
 authors = ["AiCrateDigg Team"]
-readme = "README.md"
+package-mode = false
 packages = [{ include = "app" }]
 
 [tool.poetry.dependencies]
