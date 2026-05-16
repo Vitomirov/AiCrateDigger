@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rapidfuzz import fuzz
 
+from app.agents.extractor.evidence_alignment import artist_fuzzy_best_vs_blob, artist_substring_in_blob
 from app.validators.listings import url_suggests_product_detail_page
 
 # Standard mega-retailer / rich-snippet blobs — album title often verbatim.
@@ -34,11 +35,12 @@ def intent_matches_snippet(
     td_pdp_art, td_pdp_album, td_blob_art = rd
 
     if album_l in blob:
-        if not artist_l or artist_l in blob:
+        if not artist_l:
+            return True
+        if artist_substring_in_blob(artist_l, blob):
             return True
         if url_suggests_product_detail_page(url):
-            ar = max(fuzz.token_set_ratio(artist_l, blob), fuzz.partial_ratio(artist_l, blob))
-            if ar >= td_pdp_art:
+            if artist_fuzzy_best_vs_blob(artist_l, blob) >= td_pdp_art:
                 return True
         return False
     if not url_suggests_product_detail_page(url):
@@ -48,8 +50,7 @@ def intent_matches_snippet(
         return False
     if not artist_l:
         return True
-    ar = max(fuzz.token_set_ratio(artist_l, blob), fuzz.partial_ratio(artist_l, blob))
-    return ar >= td_blob_art
+    return artist_fuzzy_best_vs_blob(artist_l, blob) >= td_blob_art
 
 
 def snippet_passes_release_intent(

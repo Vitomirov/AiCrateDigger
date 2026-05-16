@@ -23,8 +23,8 @@ from app.db.cache import (
     set_cached_search_payload,
 )
 from app.db.store_loader import ensure_local_coverage, load_active_stores
-from app.llm.extract_listings import ExtractListingsReport, extract_listings
-from app.llm.parse_user_query import parse_user_query
+from app.agents.extractor import ExtractListingsReport, extract_listings
+from app.agents.parser.parse_user_query import parse_user_query
 from app.models.search_query import SearchResult
 from app.models.result import ListingResult
 from app.pipeline_context import stage_timer
@@ -54,7 +54,7 @@ from app.policies.physical_local import (
 )
 from app.policies.search_dsl import build_tavily_core_query
 from app.policies.store_domain import canonical_store_domain
-from app.llm.verify_album_match import verify_album_match
+from app.agents.extractor.verify_album_match import verify_album_match
 from app.services.discogs_service import resolve_album_by_index
 from app.services.tavily_service import (
     normalize_url,
@@ -548,6 +548,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                         core_query,
                         local_domains_for_fanout,
                         tier=tier,
+                        artist=parsed.artist,
                         album_title=album_title or "",
                     )
                     rec_fan.input = {

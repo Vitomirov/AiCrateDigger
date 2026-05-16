@@ -8,8 +8,8 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.agents.extractor.listing_constants import EXTRACTOR_SYSTEM_PROMPT
 from app.config import get_settings
-from app.llm.extract_listings.constants import EXTRACTOR_SYSTEM_PROMPT
 
 logger = logging.getLogger("app.llm.extract_listings")
 
@@ -29,7 +29,10 @@ async def llm_extract(
         "instructions": (
             "For each listings[] element, set `title` using ONLY substring material from "
             "that object's `title` + `content` fields. NEVER paste an artist/album that does "
-            "not appear verbatim (or clearly as product naming) inside that same snippet blob."
+            "not appear verbatim (or clearly as product naming) inside that same snippet blob. "
+            "If the band appears without a leading article (e.g. \"Doors\" when the user said "
+            "\"The Doors\") but the album title in the snippet is clearly this product, use the "
+            "snippet's artist wording — do not invent \"The\"."
         ),
         "listings": candidates,
     }

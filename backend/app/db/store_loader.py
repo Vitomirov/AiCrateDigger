@@ -190,6 +190,69 @@ async def sync_whitelist_store_catalogue() -> dict[str, int]:
     return summary
 
 
+async def repair_whitelist_store_domains() -> dict[str, int]:
+    """Rewrite persisted ``whitelist_stores.domain`` to :func:`canonical_store_domain`.
+
+    Discovery / manual rows sometimes store a non-resolving host (hyphen drift, ``www``
+    inconsistency is already normalized at read time; this persists the canonical
+    registrable host so Tavily ``include_domains`` and the unique index stay consistent).
+
+    When the canonical host already exists on another row, the typo row is **deactivated**
+    instead of violating the unique constraint.
+    """
+    summary = {"updated": 0, "deactivated_duplicates": 0}
+    settings = get_settings()
+    if not settings.database_url:
+        return summary
+    try:
+        sf = session_factory()
+    except RuntimeError:
+        return summary
+
+    async with sf() as session:
+        rows = list((await session.scalars(select(WhitelistStoreORM))).all())
+        for r in rows:
+            target = canonical_store_domain(r.domain)
+            if not target:
+                continue
+            cur = (r.domain or "").strip().lower()
+            if cur == target:
+                continue
+
+            conflict_id = await session.scalar(
+                select(WhitelistStoreORM.id).where(
+                    func.lower(func.trim(WhitelistStoreORM.domain)) == target,
+                    WhitelistStoreORM.id != r.id,
+                )
+            )
+            if conflict_id is not None:
+                r.is_active = False
+                summary["deactivated_duplicates"] += 1
+                logger.info(
+                    "whitelist_store_domain_duplicate_deactivated",
+                    extra={
+                        "stage": "stores",
+                        "row_id": r.id,
+                        "had_domain": cur,
+                        "canonical_domain": target,
+                        "keeps_row_id": conflict_id,
+                    },
+                )
+                continue
+
+            r.domain = target
+            summary["updated"] += 1
+
+        await session.commit()
+
+    if summary["updated"] or summary["deactivated_duplicates"]:
+        logger.info(
+            "whitelist_store_domains_repaired",
+            extra={"stage": "stores", **summary},
+        )
+    return summary
+
+
 async def load_active_stores() -> tuple[StoreEntry, ...]:
     """DB-backed allowlist when migrations/seed populated the table; else code tuple."""
     settings = get_settings()

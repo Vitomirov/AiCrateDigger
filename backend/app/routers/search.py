@@ -2,7 +2,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from app.llm.parse_user_query import parse_user_query
+from app.agents.parser.parse_user_query import parse_user_query
 from app.config import get_settings
 from app.domain.parse_schema import ParsedQuery
 from app.models.search_query import ParseRequest, SearchResponse

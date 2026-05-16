@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.llm.extract_listings.constants import SNIPPET_CHAR_CAP
-from app.llm.extract_listings.domains import host_matches_whitelist, normalize_domain
-from app.llm.extract_listings.intent_match import snippet_passes_release_intent
+from app.agents.extractor.intent_match import snippet_passes_release_intent
+from app.agents.extractor.listing_constants import SNIPPET_CHAR_CAP
+from app.agents.extractor.listing_domains import host_matches_whitelist, normalize_domain
 
 
 def collect_snippet_candidates(

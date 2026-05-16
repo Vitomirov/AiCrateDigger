@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from app.agents.parser.compilation import looks_like_compilation
-from app.agents.parser.intent import classify_intent
+from app.agents.parser.steps.step_04_intent import classify_intent
 from app.agents.parser.track_resolver import resolve_track_to_album
 from app.models.search_query import ParsedQuery
 

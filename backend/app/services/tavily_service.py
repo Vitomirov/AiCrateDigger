@@ -19,7 +19,11 @@ import httpx
 from app.config import get_settings
 from app.models.search_query import SearchResult
 from app.pipeline_context import stage_timer
-from app.policies.search_dsl import build_tavily_local_fanout_narrow_query
+from app.policies.search_dsl import (
+    build_tavily_local_fanout_narrow_query,
+    build_tavily_local_fanout_plain_album_query,
+    build_tavily_local_fanout_plain_artist_album_query,
+)
 from app.policies.store_domain import canonical_store_domain
 from app.services.tavily_domain_batches import chunk_include_domains as _chunk_include_domains
 
@@ -44,6 +48,23 @@ MAX_RESULTS_PER_QUERY = 8
 REQUEST_TIMEOUT_SECONDS = 15.0
 # Tavily-reported relevance below this is usually noise (wrong artist/topic).
 # Default is overridden by ``Settings.tavily_min_result_score`` at runtime.
+
+
+def _fanout_single_domain_threshold(min_score_base: float) -> float:
+    """Score floor for single-domain local shop fanout (sparse PDP snippets)."""
+    return max(0.022, min_score_base * 0.18)
+
+
+def _whitelist_include_domains_threshold(min_score_base: float) -> float:
+    """Score floor when ``include_domains`` restricts hits to curated stores only.
+
+    Batched city/country/regional tier calls use the same constraint: Tavily scores
+    are miscalibrated low for indie domains, so the global ``tavily_min_result_score``
+    would yield raw_count>0 but kept_count=0.
+    """
+    return max(0.032, min_score_base * 0.30)
+
+
 _NON_RETAIL_PATH_SNIPPETS: tuple[str, ...] = (
     "/blog",
     "/blogs/",
@@ -78,6 +99,8 @@ _RETAIL_PATH_BOOST_SNIPPETS: tuple[str, ...] = (
     ".html",
     "add-to-cart",
     "/cart",
+    "/produse/",
+    "/produs/",
 )
 
 
@@ -136,6 +159,19 @@ def normalize_url(url: str) -> str:
         return url
 
 
+def _host_matches_include_domain(netloc: str, allowed_domain: str) -> bool:
+    """True if URL host is ``allowed_domain`` or a subdomain of it (``www`` stripped)."""
+    h = (netloc or "").lower().strip()
+    if h.startswith("www."):
+        h = h[4:]
+    a = (allowed_domain or "").lower().strip()
+    if a.startswith("www."):
+        a = a[4:]
+    if not h or not a:
+        return False
+    return h == a or h.endswith("." + a)
+
+
 async def _search_single_query(
     client: httpx.AsyncClient,
     query: str,
@@ -159,9 +195,12 @@ async def _search_single_query(
     if inc:
         payload["include_domains"] = inc
 
+    include_only = inc is not None and len(inc) > 0
     per_query_threshold = min_score_base
-    if fanout_local_shop and inc is not None and len(inc) == 1:
-        per_query_threshold = max(0.052, min_score_base * 0.42)
+    if fanout_local_shop and include_only and len(inc) == 1:
+        per_query_threshold = _fanout_single_domain_threshold(min_score_base)
+    elif include_only:
+        per_query_threshold = _whitelist_include_domains_threshold(min_score_base)
 
     with stage_timer("tavily", input={"query": query}) as rec:
         try:
@@ -194,8 +233,9 @@ async def _search_single_query(
             prod = _product_signal_multiplier(path_m)
             base_score = float(item.get("score", 0.0) or 0.0)
             eff = base_score * prod
-            if fanout_local_shop and prod > 0.0:
-                eff = float(base_score) * max(float(prod), 0.91)
+            if include_only and prod > 0.0:
+                p_floor = 0.91 if fanout_local_shop and len(inc) == 1 else 0.82
+                eff = float(base_score) * max(float(prod), p_floor)
             if prod == 0.0 or eff < per_query_threshold:
                 continue
             results.append(
@@ -209,9 +249,58 @@ async def _search_single_query(
                 )
             )
 
+        salvage_kept = 0
+        if (
+            fanout_local_shop
+            and include_only
+            and len(inc) == 1
+            and not results
+            and raw_items
+        ):
+            want_dom = inc[0]
+            salvage_scored: list[tuple[float, str, dict[str, object]]] = []
+            for item in raw_items:
+                url = str(item.get("url", "")).strip()
+                if not url or not is_valid_result(url):
+                    continue
+                nu = normalize_url(url)
+                try:
+                    netloc = urlparse(nu).netloc or ""
+                    path_m = urlparse(nu).path or "/"
+                except Exception:
+                    continue
+                if not _host_matches_include_domain(netloc, want_dom):
+                    continue
+                prod = _product_signal_multiplier(path_m)
+                if prod <= 0.0:
+                    continue
+                base_score = float(item.get("score", 0.0) or 0.0)
+                salvage_scored.append((base_score * prod, nu, item))
+            salvage_scored.sort(key=lambda x: -x[0])
+            for _, nu, item in salvage_scored[:max_r]:
+                base_score = float(item.get("score", 0.0) or 0.0)
+                try:
+                    path_m = urlparse(nu).path or "/"
+                except Exception:
+                    path_m = "/"
+                prod = _product_signal_multiplier(path_m)
+                eff = max(float(base_score), 0.052) * 0.92 * max(float(prod), 0.72)
+                results.append(
+                    SearchResult(
+                        title=str(item.get("title", "")).strip(),
+                        url=nu,
+                        content=str(item.get("content", "")).strip(),
+                        score=min(eff, 0.49),
+                        price=None,
+                        extracted_location=None,
+                    )
+                )
+                salvage_kept += 1
+
         rec.output = {
             "raw_count": len(raw_items),
             "kept_count": len(results),
+            "salvage_kept": salvage_kept,
             "top_domains": _top_domains(results, limit=5),
         }
         rec.status = "success" if results else "empty"
@@ -269,9 +358,10 @@ async def run_tavily_for_store_domains(
 
     unique_by_url: dict[str, SearchResult] = {}
     min_score = float(settings.tavily_min_result_score)
+    merge_floor = _whitelist_include_domains_threshold(min_score)
     for task_result in batch_lists:
         for res in task_result:
-            if res.score < min_score:
+            if res.score < merge_floor:
                 continue
             if not is_valid_result(res.url):
                 continue
@@ -319,6 +409,7 @@ async def run_local_site_searches(
     local_domains: list[str],
     *,
     tier: str | None = None,
+    artist: str | None = None,
     album_title: str | None = None,
 ) -> tuple[list[SearchResult], int]:
     """One-call-per-domain Tavily fanout for indie local shops.
@@ -340,14 +431,28 @@ async def run_local_site_searches(
     if not domains:
         return [], 0
 
-    narrow = build_tavily_local_fanout_narrow_query(album_title or "").strip()
-    sub_queries = [q]
-    if narrow and narrow.lower() != q.lower():
-        sub_queries.append(narrow)
+    narrow = build_tavily_local_fanout_narrow_query(
+        artist=artist,
+        album=album_title or "",
+    ).strip()
+    sub_queries: list[str] = [q]
+    seen_q = {q.lower()}
+    for extra in (
+        narrow,
+        build_tavily_local_fanout_plain_album_query(album_title or ""),
+        build_tavily_local_fanout_plain_artist_album_query(
+            artist=artist,
+            album=album_title or "",
+        ),
+    ):
+        x = (extra or "").strip()
+        if x and x.lower() not in seen_q:
+            seen_q.add(x.lower())
+            sub_queries.append(x)
     queries_per_domain = len(sub_queries)
 
     max_results = settings.tavily_max_results_per_batch
-    aggregate_floor = max(0.052, float(settings.tavily_min_result_score) * 0.42)
+    aggregate_floor = _fanout_single_domain_threshold(float(settings.tavily_min_result_score))
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         async def _one(domain: str) -> list[SearchResult]:
@@ -383,6 +488,12 @@ async def run_local_site_searches(
                     )
                     continue
                 for sr in batch:
+                    try:
+                        path_m = urlparse(normalize_url(sr.url)).path or "/"
+                    except Exception:
+                        path_m = "/"
+                    if _product_signal_multiplier(path_m) <= 0.0:
+                        continue
                     nk = normalize_url(sr.url)
                     prev = merged.get(nk)
                     if prev is None or sr.score > prev.score:

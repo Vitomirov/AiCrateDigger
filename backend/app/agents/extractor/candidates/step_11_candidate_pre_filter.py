@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from app.agents.extractor.constants import MIN_ARTIST_FUZZY, MIN_TITLE_LEN
-from app.agents.extractor.fuzzy_snippets import album_fuzzy_score, artist_fuzzy_score
 from app.agents.extractor.merch_gate import listing_looks_like_merch
-from app.agents.extractor.rejection_logging import log_extractor_reject
+from app.agents.extractor.utils.fuzzy_snippets import album_fuzzy_score, artist_fuzzy_score
+from app.agents.extractor.utils.rejection_logging import log_extractor_reject
 from app.models.search_query import SearchResult
 
 

@@ -1,7 +1,7 @@
-"""Tests for ``app.llm.extract_listings`` — no real OpenAI calls.
+"""Tests for Tavily snippet listing extraction — no real OpenAI calls.
 
 Deterministic helpers use real RapidFuzz / regex. The LLM step is mocked at
-``pipeline.llm_extract``.
+``step_05_listings_orchestrator.llm_extract``.
 """
 
 from __future__ import annotations
@@ -9,16 +9,18 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.llm.extract_listings import ExtractListingsReport, extract_listings
-from app.llm.extract_listings.domains import (
+from app.agents.extractor import ExtractListingsReport, extract_listings
+from app.agents.extractor.evidence_alignment import evidence_blob_matches_target_release
+from app.agents.extractor.intent_match import intent_matches_snippet
+from app.agents.extractor.listing_domains import (
     host_matches_whitelist,
     normalize_allowed_domains,
     normalize_domain,
 )
-from app.llm.extract_listings.merge_llm import merge_llm_rows_into_listings
-from app.llm.extract_listings.prefilter import collect_snippet_candidates
-from app.llm.extract_listings.price_currency import coerce_price_currency, sniff_price_currency
-from app.llm.extract_listings.deterministic import deterministic_listings_from_candidates
+from app.agents.extractor.steps.step_01_snippet_prefilter import collect_snippet_candidates
+from app.agents.extractor.steps.step_02_listing_deterministic import deterministic_listings_from_candidates
+from app.agents.extractor.steps.step_04_merge_llm_listings import merge_llm_rows_into_listings
+from app.agents.extractor.utils.price_currency import coerce_price_currency, sniff_price_currency
 
 
 class TestDomains(unittest.TestCase):
@@ -230,7 +232,10 @@ class TestExtractListingsPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(r.listings), 2)
         self.assertIsNone(r.diagnostic["empty_reason"])
 
-    @patch("app.llm.extract_listings.pipeline.llm_extract", new_callable=AsyncMock)
+    @patch(
+        "app.agents.extractor.steps.step_05_listings_orchestrator.llm_extract",
+        new_callable=AsyncMock,
+    )
     async def test_llm_branch_merges_rows(self, mock_llm: AsyncMock) -> None:
         """More than ``SMALL_BATCH_NO_LLM`` candidates forces the async LLM path."""
         host = "four.example.net"
@@ -273,7 +278,10 @@ class TestExtractListingsPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(r.listings), 4)
         self.assertIsNone(r.diagnostic["empty_reason"])
 
-    @patch("app.llm.extract_listings.pipeline.llm_extract", new_callable=AsyncMock)
+    @patch(
+        "app.agents.extractor.steps.step_05_listings_orchestrator.llm_extract",
+        new_callable=AsyncMock,
+    )
     async def test_llm_empty_array_sets_diagnostic(self, mock_llm: AsyncMock) -> None:
         host = "big.example.org"
         album = "Vol 9"
@@ -297,6 +305,32 @@ class TestExtractListingsPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.listings, [])
         self.assertEqual(r.diagnostic["llm_rows_returned"], 0)
         self.assertIn(r.diagnostic["empty_reason"], ("llm_empty_response", "llm_returned_empty_listings_array"))
+
+
+class TestArtistArticleVariants(unittest.TestCase):
+    """Leading-article bands (e.g. The Doors) often appear as \"Doors\" in snippets."""
+
+    def test_intent_passes_when_album_present_and_artist_omits_the(self) -> None:
+        blob = "strange days vinyl lp doors official reissue shop"
+        self.assertTrue(
+            intent_matches_snippet(
+                url="https://example.com/product/strange-days",
+                blob=blob,
+                artist_l="the doors",
+                album_l="strange days",
+                relaxed_indie_candidate=False,
+            )
+        )
+
+    def test_evidence_passes_for_the_doors_when_blob_says_doors(self) -> None:
+        b = "doors strange days vinyl 180g reissue in stock".lower()
+        self.assertTrue(
+            evidence_blob_matches_target_release(
+                b,
+                artist="The Doors",
+                album="Strange Days",
+            )
+        )
 
 
 if __name__ == "__main__":

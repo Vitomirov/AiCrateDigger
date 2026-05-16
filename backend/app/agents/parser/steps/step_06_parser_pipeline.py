@@ -9,12 +9,12 @@ from pydantic import ValidationError
 
 from app.agents.parser.coercion import normalize_format_literal, safe_int, safe_str
 from app.agents.parser.compilation import looks_like_compilation, user_wants_compilation
-from app.agents.parser.discogs_finalize import finalize_album_with_discogs
 from app.agents.parser.errors import ParserError
-from app.agents.parser.geo_inference import ensure_country_when_city_given
-from app.agents.parser.intent import build_unknown_fallback, classify_intent
-from app.agents.parser.ordinal_fallback import resolve_ordinal_via_llm_fallback
-from app.agents.parser.primary_llm import extract_json_with_primary_llm
+from app.agents.parser.steps.step_01_primary_llm import extract_json_with_primary_llm
+from app.agents.parser.steps.step_02_geo_inference import ensure_country_when_city_given
+from app.agents.parser.steps.step_03_ordinal_fallback import resolve_ordinal_via_llm_fallback
+from app.agents.parser.steps.step_04_intent import build_unknown_fallback, classify_intent
+from app.agents.parser.steps.step_05_discogs_finalize import finalize_album_with_discogs
 from app.models.search_query import ParsedQuery
 from app.pipeline_context import stage_timer
 from app.services.discogs_service import resolve_album_by_index

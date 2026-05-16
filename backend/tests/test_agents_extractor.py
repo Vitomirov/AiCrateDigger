@@ -10,16 +10,16 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.agents.extractor.constants import MIN_TITLE_LEN
-from app.agents.extractor.field_normalizers import (
+from app.agents.extractor.utils.field_normalizers import (
     clean_optional_string,
     normalize_availability,
     normalize_seller,
 )
-from app.agents.extractor.fuzzy_snippets import album_fuzzy_score, artist_fuzzy_score
+from app.agents.extractor.utils.fuzzy_snippets import album_fuzzy_score, artist_fuzzy_score
 from app.agents.extractor.hosts import normalize_domain
 from app.agents.extractor.merch_gate import listing_looks_like_merch
-from app.agents.extractor.pipeline import extract_and_score_results
-from app.agents.extractor.pre_filter import run_pre_filter
+from app.agents.extractor.candidates.step_11_candidate_pre_filter import run_pre_filter
+from app.agents.extractor.candidates.step_13_candidate_pipeline import extract_and_score_results
 from app.models.search_query import SearchResult
 from app.pipeline_context import start_pipeline
 
@@ -170,7 +170,7 @@ class TestExtractAndScoreResultsAsync(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(out, [])
 
-    @patch("app.agents.extractor.pipeline.run_llm_extract", new_callable=AsyncMock)
+    @patch("app.agents.extractor.candidates.step_13_candidate_pipeline.run_llm_extract", new_callable=AsyncMock)
     async def test_end_to_end_assembles_listing_results(self, mock_llm: AsyncMock) -> None:
         mock_llm.return_value = [
             {
@@ -212,7 +212,7 @@ class TestExtractAndScoreResultsAsync(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(row.artist_match, 0.5)
         self.assertGreater(row.album_match, 0.0)
 
-    @patch("app.agents.extractor.pipeline.run_llm_extract", new_callable=AsyncMock)
+    @patch("app.agents.extractor.candidates.step_13_candidate_pipeline.run_llm_extract", new_callable=AsyncMock)
     async def test_llm_drops_url_yields_empty(self, mock_llm: AsyncMock) -> None:
         mock_llm.return_value = []
         candidates = [

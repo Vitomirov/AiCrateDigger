@@ -6,10 +6,10 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.agents.extractor.evidence_alignment import evidence_blob_matches_target_release
+from app.agents.extractor.listing_domains import normalize_domain
+from app.agents.extractor.utils.price_currency import sniff_price_currency
 from app.domain.listing_schema import Listing
-from app.llm.extract_listings.domains import normalize_domain
-from app.llm.extract_listings.evidence_alignment import evidence_blob_matches_target_release
-from app.llm.extract_listings.price_currency import sniff_price_currency
 
 _SNIPPET_STORE_MAX = 520
 
@@ -24,7 +24,7 @@ def deterministic_listings_from_candidates(
     """Small-batch path: strict SERP evidence (same thresholds as merge/LLM path).
 
     ``snippet_relax_hosts`` is ignored here on purpose — it only informs intent
-    relax upstream in :func:`~app.llm.extract_listings.prefilter.collect_snippet_candidates`.
+    relax upstream in :func:`~app.agents.extractor.steps.step_01_snippet_prefilter.collect_snippet_candidates`.
     Indie-specific fuzz belongs in ``validate_listing(..., relaxed_local_indie=True)``.
     """
     _ = snippet_relax_hosts

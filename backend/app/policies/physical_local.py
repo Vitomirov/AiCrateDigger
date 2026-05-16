@@ -30,7 +30,7 @@ def curated_city_local_shop_domains(
 ) -> frozenset[str]:
     """Normalized whitelist domains for city-matching ``local_shop`` catalogue rows.
 
-    Passed into :func:`app.llm.extract_listings.pipeline.extract_listings` so fuzzy
+    Passed into :func:`app.agents.extractor.steps.step_05_listings_orchestrator.extract_listings` so fuzzy
     prefilter / merge gates do not silently drop thin indie snippets while stricter
     mega-retailer HTML still passes unchanged.
     """

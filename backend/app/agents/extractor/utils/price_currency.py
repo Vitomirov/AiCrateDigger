@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.llm.extract_listings.constants import PRICE_SNIFF_RE
+from app.agents.extractor.listing_constants import PRICE_SNIFF_RE
 
 
 def coerce_price_currency(item: dict[str, Any]) -> tuple[float, str]:

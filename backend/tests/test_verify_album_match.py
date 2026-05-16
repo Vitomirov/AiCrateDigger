@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from app.domain.listing_schema import Listing
-from app.llm.verify_album_match import verify_album_match
+from app.agents.extractor.verify_album_match import verify_album_match
 
 
 class TestVerifyAlbumDeterministic(unittest.IsolatedAsyncioTestCase):

@@ -1,9 +1,9 @@
-"""LLM step 1 — parse a free-form user query into ParsedQuery JSON.
+"""Parse a free-form user query into ParsedQuery JSON (single OpenAI call).
 
-Single OpenAI call, JSON-only output, temperature 0. Extracts the literal fields
-AND semantically resolves the user's geography (city/country name → ISO-3166-1
-alpha-2 + ``local|regional|global`` scope). No hardcoded city tables: the LLM
-is the country-resolver.
+JSON-only output, temperature 0. Extracts the literal fields AND semantically
+resolves the user's geography (city/country name → ISO-3166-1 alpha-2 +
+``local|regional|global`` scope). No hardcoded city tables: the LLM is the
+country-resolver.
 """
 
 from __future__ import annotations

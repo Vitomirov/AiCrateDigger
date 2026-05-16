@@ -5,6 +5,39 @@ from __future__ import annotations
 from rapidfuzz import fuzz
 
 
+def _artist_variants_lc(artist_lc: str) -> tuple[str, ...]:
+    """Lowercased artist forms: full string plus ``the …`` stripped when safe.
+
+    Many SERP snippets say ``Doors`` / ``doors`` without the leading article even
+    when the canonical artist is ``The Doors`` — substring checks must not miss that.
+    """
+    a = (artist_lc or "").strip().lower()
+    if not a:
+        return ()
+    out: list[str] = [a]
+    if a.startswith("the ") and len(a) > 4:
+        tail = a[4:].strip()
+        if tail:
+            out.append(tail)
+    return tuple(dict.fromkeys(out))
+
+
+def artist_substring_in_blob(artist_lc: str, blob_lc: str) -> bool:
+    """True if any variant (including ``the``-stripped) appears in the blob."""
+    return any(v in blob_lc for v in _artist_variants_lc(artist_lc))
+
+
+def artist_fuzzy_best_vs_blob(artist_lc: str, blob_lc: str) -> float:
+    """Best RapidFuzz score across artist variants vs the blob."""
+    variants = _artist_variants_lc(artist_lc)
+    if not variants:
+        return 0.0
+    return max(
+        float(max(fuzz.partial_ratio(v, blob_lc), fuzz.token_set_ratio(v, blob_lc)))
+        for v in variants
+    )
+
+
 def canonical_query_echo_title(artist: str | None, album: str) -> str:
     """Lowercase trimmed \"Artist Album\" fingerprint (avoid LLM copying the search)."""
     return f"{(artist or '').strip()} {album}".strip().lower()
@@ -73,7 +106,7 @@ def evidence_blob_matches_target_release(
         if not (artist or "").strip():
             return True
         ar = artist.strip().lower()
-        if ar in b:
+        if artist_substring_in_blob(ar, b):
             return True
-        return float(max(fuzz.partial_ratio(ar, b), fuzz.token_set_ratio(ar, b))) >= artist_partial_min
+        return artist_fuzzy_best_vs_blob(ar, b) >= artist_partial_min
     return False

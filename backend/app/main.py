@@ -6,7 +6,11 @@ from fastapi import FastAPI
 from app.config import get_settings
 from app.db.cache import purge_expired_search_cache_rows
 from app.db.database import dispose_engine, init_db
-from app.db.store_loader import seed_whitelist_stores_if_empty, sync_whitelist_store_catalogue
+from app.db.store_loader import (
+    repair_whitelist_store_domains,
+    seed_whitelist_stores_if_empty,
+    sync_whitelist_store_catalogue,
+)
 from app.logging_config import setup_logging
 from app.routers.search import router as search_router
 
@@ -21,6 +25,7 @@ async def lifespan(app: FastAPI):
         await init_db(database_url=settings.database_url, debug=settings.debug)
         inserted = await seed_whitelist_stores_if_empty()
         sync_summary = await sync_whitelist_store_catalogue()
+        repair_summary = await repair_whitelist_store_domains()
         removed = await purge_expired_search_cache_rows()
         logger.info(
             "lifespan_db",
@@ -28,6 +33,7 @@ async def lifespan(app: FastAPI):
                 "stage": "startup",
                 "stores_seeded_rows": inserted,
                 "stores_sync": sync_summary,
+                "stores_domain_repair": repair_summary,
                 "cache_expired_purged": removed,
             },
         )

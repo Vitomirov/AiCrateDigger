@@ -25,6 +25,10 @@ RULES — ANTI-HALLUCINATION / NO QUERY INJECTION
   exact tokens (artist + album) appear in THAT row's ``title`` or ``content`` as the MAIN product described.
   If the snippet is clearly about another record (different artist/album/compilations), reproduce THAT
   product naming from the snippet only — never substitute the customer's query.
+- Band names in real snippets often drop a leading article (e.g. ``Doors`` / ``doors`` when the shopper
+  asked for ``The Doors``). If that row's text still names the same **album** as a product (title matches
+  the release), keep the artist wording exactly as printed in the snippet — do not force ``The`` into ``title``
+  when the source line omits it.
 - If the snippet mentions a PDP URL but describes unrelated inventory, still reflect the unrelated text;
   never fabricate catalogue fields for the hunted release.
 
