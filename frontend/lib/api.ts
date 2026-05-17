@@ -14,11 +14,6 @@ export type ListingResultDto = {
   domain: string | null;
 };
 
-export type SearchResponseDto = {
-  results: ListingResultDto[];
-  debug?: Record<string, unknown> | null;
-};
-
 /** Mirrors backend `domain.parse_schema.ParsedQuery` (subset for typing). */
 export type ParsedQueryDto = {
   artist: string | null;
@@ -32,6 +27,21 @@ export type ParsedQueryDto = {
   geo_granularity: string | null;
   language: string;
   original_query: string;
+};
+
+/** Machine-readable empty-state code emitted by `/search`. Mirrors backend
+ *  `models.search_query.SearchEmptyReason`. Keep in sync. */
+export type SearchEmptyReason = "album_unresolved";
+
+export type SearchResponseDto = {
+  results: ListingResultDto[];
+  /** Parser output that drove the pipeline. Always populated on a 200 — one
+   *  round-trip covers both the result list and the parse-debug pane. */
+  parsed?: ParsedQueryDto | null;
+  /** Structured explanation for an empty `results` array (e.g. the album
+   *  could not be resolved). `null`/omitted on a normal Tavily-backed search. */
+  reason?: SearchEmptyReason | null;
+  debug?: Record<string, unknown> | null;
 };
 
 const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";

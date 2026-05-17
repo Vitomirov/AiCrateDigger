@@ -491,3 +491,28 @@ def validate_listing(
         return _reject("invalid_currency", listing=listing, extra={"currency": cur})
 
     return True
+
+
+def global_fallback_matches_parsed_entity(
+    *,
+    listing_title: str,
+    source_snippet: str | None,
+    validation_artist: str | None,
+    validation_album: str,
+) -> bool:
+    """Strict identity gate before expensive ranking on pipeline-only global widenings."""
+    from app.agents.extractor.evidence_alignment import evidence_blob_matches_target_release
+
+    alb = validation_album.strip()
+    if not alb:
+        return False
+    blob_lc = f"{listing_title or ''}\n{source_snippet or ''}".strip().lower()
+    if not blob_lc:
+        return False
+    return evidence_blob_matches_target_release(
+        blob_lc,
+        artist=validation_artist,
+        album=alb,
+        album_partial_min=72.0,
+        artist_partial_min=62.0,
+    )

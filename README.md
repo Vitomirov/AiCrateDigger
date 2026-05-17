@@ -54,12 +54,12 @@ Treat production deployment as requiring your own hardening (secrets, rate limit
 
 The **live HTTP pipeline** (`POST /search`) roughly follows:
 
-1. **Parse** (`app.llm.parse_user_query`) — one structured JSON object per query: artist, album, album index, location, ISO country code, search scope.
+1. **Parse** (`app.agents.parser.parse_user_query`) — one structured JSON object per query: artist, album, album index, location, ISO country code, search scope.
 2. **Search** (`app.services.tavily_service`) — Tavily calls constrained by geo-tiered **whitelist stores** loaded from DB or policy fallbacks.
-3. **Extract** (`app.llm.extract_listings`) — maps search snippets to listing rows (price, currency, stock hints, titles).
+3. **Extract** (`app.agents.extractor.extract_listings`) — maps search snippets to listing rows (price, currency, stock hints, titles).
 4. **Validate & rank** (`app.validators.listings`, RapidFuzz, URL normalization) — filters and scores before response.
 
-The repository also contains **`app.agents.parser`** and **`app.agents.extractor`**—richer, alternative agent-style modules. The **documented primary path** for the API is the `llm/` + `pipeline/vinyl_search.py` stack above.
+The repository also keeps **`app.agents.parser.parse_user_input`** (Discogs-aware orchestration) and **`app.agents.extractor.extract_and_score_results`** (legacy ``SearchResult``→``ListingResult`` tests). Shared low-level LLM helpers live under **`app.llm/`** (e.g. field coercion).
 
 > **Note:** Project documentation in `.cursorrules` mentions **Crawl4AI** for full-page markdown extraction. That is **not** present in `pyproject.toml` today; retrieval is **Tavily-centric** with snippet-based LLM extraction.
 
@@ -75,8 +75,8 @@ AiCrateDigger/
 │   │   ├── config.py            # Pydantic settings (env-driven)
 │   │   ├── routers/search.py    # /parse, /search, /search-listings
 │   │   ├── pipeline/vinyl_search.py
-│   │   ├── llm/                 # parse_user_query, extract_listings, coercion helpers
-│   │   ├── agents/              # parser.py, extractor.py (alternate/heavier paths)
+│   │   ├── llm/                 # small helpers (e.g. coerce_listing_fields)
+│   │   ├── agents/              # parser/, extractor/ (numbered step modules)
 │   │   ├── services/          # tavily_service, discogs_service, domain batching
 │   │   ├── policies/           # geo_scope, eu_stores, store domains, query DSL
 │   │   ├── db/                 # async SQLAlchemy, cache, store loader

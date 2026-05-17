@@ -39,6 +39,13 @@ async def parse_search_query(payload: ParseRequest) -> ParsedQuery:
 # -------------------------
 @router.post("/search", response_model=SearchResponse)
 async def search(payload: ParseRequest) -> SearchResponse:
+    """Single round-trip search endpoint.
+
+    Returns the validated listings AND the parser output that drove the
+    pipeline, so callers (today: the Next.js UI, including the dev JSON
+    inspector) never need a second `/parse` request. The standalone `/parse`
+    endpoint remains available for parse-only debug tooling.
+    """
     with start_pipeline(debug=get_settings().debug) as ctx:
         try:
             result = await run_vinyl_search(payload.query)
@@ -51,11 +58,14 @@ async def search(payload: ParseRequest) -> SearchResponse:
                     "status": "success",
                     "request_id": ctx.request_id,
                     "count": len(result.get("results", [])),
+                    "reason": result.get("reason"),
                 },
             )
 
             return SearchResponse(
                 results=result.get("results", []),
+                parsed=result.get("parsed"),
+                reason=result.get("reason"),
                 debug=ctx.as_debug_payload() if settings.debug else None,
             )
 

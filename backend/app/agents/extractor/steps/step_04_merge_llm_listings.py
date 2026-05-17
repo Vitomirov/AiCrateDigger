@@ -55,22 +55,26 @@ def merge_llm_rows_into_listings(
         cand = by_url_candidate.get(url) or {}
 
         host = normalize_domain(url)
-        if not snippet_passes_release_intent(
+        intent_ok = snippet_passes_release_intent(
             url=url,
             blob=evidence_blob_lc,
             artist_l=artist_l,
             album_l=album_l,
             host=host,
             snippet_relax_hosts=snippet_relax_hosts,
-        ):
-            diagnostic["drop_title_gate"] += 1
-            continue
-
-        if not evidence_blob_matches_target_release(
+        )
+        evidence_ok = evidence_blob_matches_target_release(
             evidence_blob_lc,
             artist=artist,
             album=album,
-        ):
+        )
+        # Prefilter admits any URL on the tier allowlist without intent; merge used to require
+        # intent only, so editorial hits (e.g. thevinylfactory.com) became drop_title_gate despite
+        # valid evidence. Require evidence for correctness; intent is an extra signal, not the sole gate.
+        if not intent_ok and not evidence_ok:
+            diagnostic["drop_title_gate"] += 1
+            continue
+        if not evidence_ok:
             diagnostic["drop_evidence_target_miss_pdd"] += 1
             continue
 

@@ -1,71 +1,77 @@
-# AiCrateDigg — Cursor Rules (v2.0)
+# AiCrateDigger — Cursor Rules
 
-## Project Identity
-AI-powered global music format search. Finding real listings for Vinyl, CD, and Cassettes 
-worldwide using "Local-First" search logic. User types natural language, and the app finds buyable items.
+## Project identity
+AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter natural language; the backend parses intent, searches the web via **Tavily** constrained to a **whitelist of store domains**, extracts structured listings from **snippets**, then validates and ranks. Branding may appear as **AiCrateDigger** or **AiCrateDigg**.
 
-## Tech Stack — NEVER DEVIATE
-- **Backend:** Python 3.11, FastAPI, Pydantic v2, SQLAlchemy 2.0, Crawl4AI, httpx, Poetry
-- **Frontend:** Next.js 14 (App Router), TypeScript 5 (Strict), Tailwind CSS 3, Shadcn/UI
-- **AI:** OpenAI `gpt-4o-mini` only (using AsyncOpenAI)
-- **Search:** Tavily API (Search Depth: Advanced)
-- **Music API:** Discogs REST API v2
-- **Database:** PostgreSQL 15 + SQLAlchemy
+## Tech stack
+- **Backend:** Python 3.11, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async) + asyncpg, httpx, Poetry
+- **Frontend:** Next.js 14 (App Router), React 18, TypeScript 5 (strict), Tailwind CSS 3 (custom theme — no Shadcn in this repo)
+- **AI:** OpenAI **`gpt-4o-mini`** only, via **`AsyncOpenAI`**; JSON-only contracts where applicable (`response_format={"type": "json_object"}` for structured outputs)
+- **Search:** **Tavily** API — batched `include_domains`, configurable depth/score thresholds in `app.config.Settings` (defaults are cost-conscious)
+- **Music metadata:** Discogs REST API v2 (`DISCOGS_TOKEN` optional)
+- **Database:** PostgreSQL 15 (Compose); **optional** when `DATABASE_URL` unset — tables via `create_all` (no Alembic yet)
 - **Infrastructure:** Docker, Docker Compose
 
-## Global Search & Language Logic (CRITICAL)
-- **Local-First Rule:** If the query is in a specific language (e.g., Serbian), Agent 2 MUST generate queries targeting that country's top marketplaces (e.g., KupujemProdajem, Kupindo) using `.rs` or `.com` with local keywords.
-- **Ambiguous English/Spanish:** Default to UK (for English) or Spain (for Spanish) unless a country is explicitly mentioned.
-- **Domain Heuristics:** Agent 2 must use its internal knowledge to identify the top 3 marketplace brands for the target country (e.g., "Mercado Libre" for LatAm, "Yahoo Auctions" for Japan, "OLX" for Bulgaria).
-- **No Global Noise:** Strictly avoid US-based results (eBay.com, Amazon) when a local European, Asian, or Balkan country is detected, unless requested.
+## Retrieval model (important)
+- **No Crawl4AI / no first-party HTML crawler in this repo.** Discovery is **Tavily search results** (titles, URLs, snippets).
+- Do not add scraping guidance here unless the project explicitly adopts a crawler dependency later.
 
-## Folder Structure — STRICT
-- `backend/app/agents/` (parser.py, query_generator.py, extractor.py)
-- `backend/app/services/` (tavily_service.py, crawl_service.py, discogs_service.py)
-- `backend/app/routers/` (search.py, stream.py)
-- `backend/app/models/` (search_query.py, result.py)
-- `backend/app/db/` (database.py, cache.py)
-- `frontend/components/` (ChatInput.tsx, ResultCard.tsx, ReasoningPanel.tsx)
-- `frontend/lib/api.ts` (SSE EventSource & Fetch logic)
+## Local-first & geography
+- **`parse_user_query`** resolves verbatim music fields and infers **`country_code`**, **`search_scope`**, and optional **`resolved_city`** (see `app.domain.parse_schema`).
+- **`run_vinyl_search`** (`app.pipeline.vinyl_search`) walks **geo tiers** (city → country → region → …), caps domains per tier, and may run **per-local-shop Tavily fanout** in city tier.
+- **Store catalogue:** DB-backed `whitelist_stores` (seed/sync from policies) plus **`store_discovery`** (Tavily + LLM) to add indie shops when city coverage is thin.
+- **Query text** for Tavily is built in **`app.policies.search_dsl`** and **`locale_text_variants`** — not a separate “agent 2” LLM step.
+- **Noise avoidance** (e.g. blocking certain domains or path patterns) lives in **`tavily_service`** and **`validators.listings`** — keep behavior consistent with product intent when changing rules.
 
-## AI Agent Rules
-- **Agent 1 (Parser):** Temperature 0. Resolves artist/album (e.g., "2nd album" -> "Strange Days") and extracts Lang/Country.
-- **Agent 2 (Query Gen):** Temperature 0.3. Generates 3-5 localized search strings. MUST include local marketplace names.
-- **Agent 3 (Extractor):** Temperature 0. Converts Crawl4AI Markdown into strict `ListingResult` JSON.
-- **Strict JSON:** Always use `response_format={"type": "json_object"}`.
+## Folder structure (canonical)
+- `backend/app/main.py` — FastAPI app, lifespan (DB init, store seed, cache purge)
+- `backend/app/config.py` — `Settings` / env knobs
+- `backend/app/routers/search.py` — `POST /parse`, `POST /search`, `POST /search-listings`
+- `backend/app/pipeline/vinyl_search.py` — main orchestrator
+- `backend/app/pipeline_context.py` — request-scoped stages / optional debug payload
+- `backend/app/agents/parser/` — `parse_user_query.py`, numbered `steps/`
+- `backend/app/agents/extractor/` — `extract_listings` (`steps/step_05_listings_orchestrator.py`), helpers; legacy **`extract_and_score_results`** exists for tests — live path uses **`extract_listings`**
+- `backend/app/services/` — `tavily_service.py`, `discogs_service.py`, `tavily_domain_batches.py`, `store_discovery.py`
+- `backend/app/policies/` — geo, stores, `search_dsl`, ranking, physical-local heuristics
+- `backend/app/validators/listings.py` — validation gates (e.g. RapidFuzz), URL heuristics
+- `backend/app/db/` — `database.py`, `cache.py`, `store_loader.py`
+- `backend/app/domain/` — `parse_schema.py`, `listing_schema.py`
+- `backend/app/models/` — API models (`result.py`, `search_query.py`)
+- `frontend/app/` — pages and **`app/api/search`**, **`app/api/parse`** proxies to backend
+- `frontend/components/` — `SearchExperience.tsx`, `ListingResultCard.tsx`, `DevJsonInspector.tsx`
+- `frontend/lib/api.ts` — `fetch` helpers (`postSearch`, `postParse`, etc.)
 
-## Scraping Rules (Crawl4AI)
-- Always use `AsyncWebCrawler`.
-- Use `magic_markdown=True` to minimize token usage for Agent 3.
-- Set `bypass_cache=True` for fresh results.
-- Implement a 15-second timeout per URL.
-- Handle common selectors for Price and Condition in markdown extraction.
+## Pipeline mental model
+1. **Parse:** `parse_user_query` → `ParsedQuery` (`domain.parse_schema`).
+2. **Resolve album title:** Discogs when `album_index` set; else literal album.
+3. **Geo + stores:** normalization, optional discovery, `load_active_stores`.
+4. **Search:** `plan_tavily_query_strings` + tier loop → `run_tavily_for_store_domains` (+ city fanout where enabled).
+5. **Extract:** `extract_listings` from snippets → listing rows.
+6. **Validate & rank:** `validate_listing` / listing rank (`listing_rank.py`) — composite signals (semantic, geo, store quality, PDP hints, tier); URL normalization for dedupe.
 
-## Validation & Ranking Logic (Mathematical Approach)
-- **Zero-Hardcode Policy:** Never use static lists of keywords for filtering (e.g., no hardcoded "vinyl", "kassette").
-- **Vector-Based Scoring:** Every search result MUST be evaluated using a scoring function: $Score = (ArtistMatch \times W1) + (MarketplaceSignal \times W2) + (ContextIntersection \times W3)$.
-- **URL Normalization:** Always strip tracking parameters (e.g., `?srsltid=...`) before deduplication to prevent duplicate listings.
-- **Stemming-Lite:** For token comparison, use case-insensitive substring matching or basic character-overlap (Levenshtein) to handle grammatical inflections (padeži) without language-specific dictionaries.
-- **Location Decoupling:** Use Location (City/Country) only for Query Generation (Tavily). In Searcher validation, treat Location as an optional "boost" rather than a hard constraint to avoid false negatives.
+## Validation & ranking
+- Prefer **centralized** scoring and validators (`validators/listings.py`, `listing_rank.py`) over scattered one-off filters.
+- Use **RapidFuzz** where the codebase already does fuzzy matching; respect **`Settings`** thresholds for listing validation.
+- **Location:** drives **which domains / tiers** run; validation treats geo mainly as **ranking/boost**, not a hard user-location requirement on every row.
 
-## Frontend & UI (ChatGPT Minimalist)
-- **Theme:** Deep Dark (`bg-zinc-950`).
-- **Layout:** Centered single column (max-w-3xl).
-- **Input:** Large ChatGPT-like sticky input at the bottom or center.
-- **Streaming:** Use Server-Sent Events (SSE). Results must "pop in" one by one.
-- **ReasoningPanel:** Show AI thoughts (e.g., "Identifying top Serbian marketplaces...") before and during result streaming.
-- **Cards:** `bg-zinc-900` with `border-zinc-800`. Clean typography using Inter/Geist.
+## Frontend & UX
+- **Today:** single **`POST /search`** round-trip; results render when the response returns. **`SearchExperience`** uses a **progress indicator** while waiting — **not SSE streaming** in the current codebase.
+- **Debug:** With **`DEBUG=true`** on the backend, responses may include a **`debug`** object; **`DevJsonInspector`** surfaces parse + pipeline stages + results JSON.
+- Match existing **Tailwind / crate-* theme** and typography choices in `layout.tsx` and components.
 
-## Python & Async Rules
-- All route handlers, agents, and services MUST be `async def`.
-- Use `asyncio.gather` for parallel Tavily/Discogs calls.
-- Type hints are mandatory for all function arguments and return values.
-- No `print()` — use `logging`.
+## Python & async
+- Route handlers and I/O-bound services: **`async def`**.
+- Use **`asyncio.gather`** (or equivalent) for independent parallel calls where it already fits the pattern.
+- Type hints on new/changed public functions.
+- **`logging`** only — no **`print()`** in application code.
 
-## Environment Variables
-- `OPENAI_API_KEY`, `TAVILY_API_KEY`, `DISCOGS_TOKEN`, `DATABASE_URL`
+## Environment variables
+- **`OPENAI_API_KEY`**, **`TAVILY_API_KEY`** — required for full pipeline
+- **`DISCOGS_TOKEN`** — optional, improves release resolution
+- **`DATABASE_URL`** — optional in dev; Compose supplies Postgres URL by default
+- **`DEBUG`** — richer API payload / traces
 
-## General Rules
+## General
 - Comments in English.
-- Use `httpx` for all async HTTP requests.
-- Error handling: Every service call must be wrapped in try/except; return empty defaults on failure.
+- **`httpx`** for async HTTP to external APIs unless an SDK wraps transport.
+- Service calls: **try/except**, log failures, return safe empty defaults where the codebase already follows that pattern.

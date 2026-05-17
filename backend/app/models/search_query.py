@@ -2,10 +2,17 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.parse_schema import ParsedQuery as PipelineParsedQuery
 from app.models.result import ListingResult
 
 ResolutionConfidence = Literal["high", "medium", "low", "unknown"]
 IntentCompleteness = Literal["complete", "partial", "unknown"]
+
+#: Machine-readable reasons emitted by `/search` when the pipeline returned
+#: zero results without running Tavily (so the UI can render a precise hint
+#: instead of guessing from an empty list). Extend conservatively — every new
+#: code is a public API surface for the frontend / clients.
+SearchEmptyReason = Literal["album_unresolved"]
 
 
 class ParsedQuery(BaseModel):
@@ -139,6 +146,22 @@ class SearchResponse(BaseModel):
     results: list[ListingResult] = Field(
         default_factory=list,
         description="Aggregated deduplicated search results (strict ListingResult contract).",
+    )
+    parsed: PipelineParsedQuery | None = Field(
+        default=None,
+        description=(
+            "Parser output that drove this search. Always populated on a successful "
+            "response so the UI can render parser debug AND the result list from a "
+            "single round-trip (no separate `/parse` call needed)."
+        ),
+    )
+    reason: SearchEmptyReason | None = Field(
+        default=None,
+        description=(
+            "Machine-readable explanation when `results` is empty for a structural "
+            "reason (e.g. album_unresolved). Null on a normal Tavily-backed search "
+            "regardless of hit count."
+        ),
     )
     debug: dict | None = Field(
         default=None,

@@ -42,7 +42,15 @@ def intent_matches_snippet(
         if url_suggests_product_detail_page(url):
             if artist_fuzzy_best_vs_blob(artist_l, blob) >= td_pdp_art:
                 return True
+        if artist_fuzzy_best_vs_blob(artist_l, blob) >= 58.0:
+            return True
         return False
+    alb_fuzzy = float(max(fuzz.token_set_ratio(album_l, blob), fuzz.partial_ratio(album_l, blob)))
+    if alb_fuzzy >= 62.0 and artist_l:
+        if artist_substring_in_blob(artist_l, blob):
+            return True
+        if artist_fuzzy_best_vs_blob(artist_l, blob) >= 54.0:
+            return True
     if not url_suggests_product_detail_page(url):
         return False
     ab = max(fuzz.token_set_ratio(album_l, blob), fuzz.partial_ratio(album_l, blob))

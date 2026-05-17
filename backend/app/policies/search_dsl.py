@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Iterable
+
+from app.policies.locale_text_variants import (
+    expand_album_glyph_variants,
+    expand_artist_glyph_variants,
+)
+
 
 def _intent_chunks(artist: str | None, album: str, location: str | None) -> list[str]:
     chunks: list[str] = []
@@ -37,6 +44,90 @@ def build_tavily_core_query(artist: str | None, album: str) -> str:
         parts.append(al)
     parts.append("vinyl")
     return " ".join(parts)
+
+
+def build_tavily_geo_browse_queries(
+    artist_variants: Iterable[str],
+    album_title: str,
+    *,
+    resolved_city: str | None,
+) -> list[str]:
+    """Broad storefront-oriented queries — used when phrase-strict Tavily misses PDPs."""
+
+    geo = (resolved_city or "").strip()
+    if not geo:
+        return []
+
+    qs: list[str] = []
+    al = album_title.strip()
+
+    def _uniq_append(s: str) -> None:
+        t = s.strip()
+        if not t:
+            return
+        if t.casefold() not in {x.casefold() for x in qs}:
+            qs.append(t)
+
+    for art in artist_variants:
+        a = (art or "").strip()
+        if not a:
+            continue
+        _uniq_append(f"{a} vinyl {geo}")
+        _uniq_append(f"{a} record shop {geo}")
+        if al:
+            _uniq_append(f"{a} {al} vinyl {geo}")
+
+    return qs
+
+
+def plan_tavily_query_strings(
+    artist: str | None,
+    album_title: str,
+    *,
+    country_code_for_variants: str | None,
+    resolved_city: str | None,
+) -> tuple[str, list[str]]:
+    """Primary strict Tavily phrase + ordered relaxation ladder (glyph + geo browse).
+
+    Deduped case-insensitively while preserving-first-wins ordering.
+    """
+    alb = album_title.strip()
+    if not alb:
+        return "", []
+
+    art_variants = expand_artist_glyph_variants(artist, country_code=country_code_for_variants)
+    alb_variants = expand_album_glyph_variants(alb, country_code=country_code_for_variants)
+
+    strict_candidates: list[str] = []
+    for av in art_variants[:5]:
+        for bv in alb_variants[:5]:
+            q = build_tavily_core_query(av or artist, bv)
+            if q and q.casefold() not in {s.casefold() for s in strict_candidates}:
+                strict_candidates.append(q)
+
+    primary = strict_candidates[0] if strict_candidates else build_tavily_core_query(artist, alb)
+    relax_geo = build_tavily_geo_browse_queries(
+        art_variants[:3] or ([] if not (artist or "").strip() else [str(artist).strip()]),
+        alb,
+        resolved_city=resolved_city,
+    )
+
+    seen_cf: set[str] = set()
+    relax: list[str] = []
+
+    def _consume(q: str) -> None:
+        k = q.strip().casefold()
+        if k and k not in seen_cf and q.strip() != primary.strip():
+            seen_cf.add(k)
+            relax.append(q.strip())
+
+    for q in strict_candidates[1:6]:
+        _consume(q)
+
+    for q in relax_geo[:6]:
+        _consume(q)
+
+    return primary, relax
 
 
 def build_tavily_local_fanout_narrow_query(*, artist: str | None, album: str) -> str:

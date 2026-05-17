@@ -97,12 +97,42 @@ async def extract_listings(
             snippet_relax_hosts=snippet_relax_hosts,
         )
         diagnostic["final_count"] = len(det)
-        if not det:
-            diagnostic["empty_reason"] = "deterministic_build_failed"
-        else:
+        if det:
             diagnostic["empty_reason"] = None
+            _log_extraction_summary(diagnostic)
+            return ExtractListingsReport(listings=det, diagnostic=diagnostic)
+
+        diagnostic["empty_reason"] = "deterministic_build_failed"
+        diagnostic["deterministic_miss"] = True
+        extracted, raw_json = await llm_extract(candidates[:LLM_MAX_INPUT], diagnostic)
+        diagnostic["llm_rows_returned"] = len(extracted)
+        diagnostic["extraction_mode"] = "deterministic_small_batch_llm_fallback"
+        if not raw_json.strip() or raw_json.strip() == "{}":
+            diagnostic["empty_reason"] = diagnostic.get("empty_reason") or "llm_empty_response"
+
+        out_list = merge_llm_rows_into_listings(
+            extracted,
+            candidates,
+            artist=artist,
+            album=album,
+            artist_l=artist_l,
+            album_l=album_l,
+            diagnostic=diagnostic,
+            snippet_relax_hosts=snippet_relax_hosts,
+        )
+
+        if out_list:
+            diagnostic["empty_reason"] = None
+        elif extracted:
+            diagnostic["empty_reason"] = diagnostic.get("empty_reason") or "post_llm_all_dropped"
+        else:
+            diagnostic["empty_reason"] = diagnostic.get("empty_reason") or (
+                "llm_json_empty_or_failed" if not diagnostic.get("json_parse_ok", True) else "llm_returned_empty_listings_array"
+            )
+
+        diagnostic["final_count"] = len(out_list)
         _log_extraction_summary(diagnostic)
-        return ExtractListingsReport(listings=det, diagnostic=diagnostic)
+        return ExtractListingsReport(listings=out_list, diagnostic=diagnostic)
 
     diagnostic["extraction_mode"] = "llm"
     extracted, raw_json = await llm_extract(candidates[:LLM_MAX_INPUT], diagnostic)

@@ -52,16 +52,21 @@ from app.policies.physical_local import (
     qualifies_as_target_city_local_shop,
     should_prioritize_physical_local_shops,
 )
-from app.policies.search_dsl import build_tavily_core_query
+from app.policies.search_dsl import plan_tavily_query_strings
 from app.policies.store_domain import canonical_store_domain
 from app.agents.extractor.verify_album_match import verify_album_match
 from app.services.discogs_service import resolve_album_by_index
 from app.services.tavily_service import (
+    editorial_discovery_blocked_hosts_from_raw_results,
     normalize_url,
     run_local_site_searches,
     run_tavily_for_store_domains,
 )
-from app.validators.listings import normalize_whitelist_domain, validate_listing
+from app.validators.listings import (
+    global_fallback_matches_parsed_entity,
+    normalize_whitelist_domain,
+    validate_listing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +320,6 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     settings = get_settings()
     debug_enabled = settings.debug
 
-    queries: list[str] = []
     core_query: str = ""
     store_domains: list[str] = []
     raw_results: list[Any] = []
@@ -340,7 +344,12 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             album_title = None
 
     if album_title is None:
-        return {"query": query, "results": []}
+        return {
+            "query": query,
+            "results": [],
+            "parsed": parsed,
+            "reason": "album_unresolved",
+        }
 
     cache_key_value = build_search_cache_key(
         user_query=query,
@@ -351,7 +360,15 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
 
     cached_payload = await get_cached_search_payload(cache_key_value)
     if cached_payload is not None:
-        return hydrate_cached_pipeline_dict(cached_payload)
+        hydrated = hydrate_cached_pipeline_dict(cached_payload)
+        # `parsed` is intentionally re-attached from the live parse rather than
+        # served from the cache: the cache key already incorporates the
+        # parser-derived identity (artist + album_title), so the freshly-parsed
+        # object is always equivalent AND insulates us from schema drift if
+        # `ParsedQuery` ever gains/loses fields.
+        hydrated["parsed"] = parsed
+        hydrated["reason"] = None
+        return hydrated
 
     geo = geo_intent_from_parsed(parsed)
     norm = normalized_geo_from_parsed(parsed)
@@ -396,8 +413,12 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         else frozenset()
     )
 
-    core_query = build_tavily_core_query(parsed.artist, album_title)
-    queries = [core_query]
+    core_query, tavily_relaxation_queries = plan_tavily_query_strings(
+        parsed.artist,
+        album_title,
+        country_code_for_variants=norm.resolved_country,
+        resolved_city=norm.resolved_city,
+    )
 
     tier_queue = list(tier_fallback_order(geo, norm))
     tier_ix = 0
@@ -406,6 +427,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
     aggregated: dict[str, Any] = {}
     listing_tier_map: dict[str, Tier] = {}
     store_lookup: dict[str, StoreEntry] = {}
+    editorial_discovery_blocked: set[str] = set()
     # Per-URL LLM verdict on whether the listing's title actually names the
     # target release. Populated only for city-tier ``local_shop`` rows so the
     # +500 indie bonus doesn't fire on wrong-album local listings.
@@ -479,6 +501,12 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
 
         store_domains = [normalize_whitelist_domain(s.domain) for s in capped if s.domain]
 
+        domains_for_tavily = [
+            d for d in store_domains if d and normalize_whitelist_domain(d) not in editorial_discovery_blocked
+        ]
+        if not domains_for_tavily:
+            domains_for_tavily = store_domains
+
         tkey = build_tavily_tier_cache_key(
             artist=parsed.artist,
             album_title=album_title or "",
@@ -498,8 +526,8 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 "stage": "tavily",
                 "tier": tier,
                 "core_query": core_query,
-                "include_domains_count": len(store_domains),
-                "include_domains": store_domains,
+                "include_domains_count": len(domains_for_tavily),
+                "include_domains": domains_for_tavily,
                 "cache_hit": cache_hit,
             },
         )
@@ -507,7 +535,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         with stage_timer("tavily") as rec:
             rec.input = {
                 "tier": tier,
-                "include_domains": store_domains,
+                "include_domains": domains_for_tavily,
                 "cache_hit": cache_hit,
             }
             if cache_hit:
@@ -515,8 +543,9 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             else:
                 raw_results, _ = await run_tavily_for_store_domains(
                     core_query,
-                    store_domains,
+                    domains_for_tavily,
                     tier=tier,
+                    relaxation_queries=tavily_relaxation_queries,
                 )
 
         # Local site-search fanout — only in the city tier. The batched Tavily
@@ -579,7 +608,7 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 [r.model_dump() for r in raw_results],
                 artist=parsed.artist,
                 album=album_title,
-                allowed_domains=set(store_domains),
+                allowed_domains=set(domains_for_tavily),
                 snippet_relax_hosts=curated_city_local_domains,
             )
             listings = extract_report.listings
@@ -589,6 +618,14 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 "listings_out": len(listings),
                 "diagnostic": extract_report.diagnostic,
             }
+
+        if extract_report is not None and extract_report.diagnostic.get("deterministic_miss"):
+            editorial_discovery_blocked.update(
+                editorial_discovery_blocked_hosts_from_raw_results(
+                    raw_results,
+                    deterministic_failed=True,
+                ),
+            )
 
         with stage_timer("validate") as rec:
             batch = _dedupe_listings_by_normalized_url(listings)
@@ -615,6 +652,22 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 norm=norm,
             ):
                 relaxed = True
+            if tier == "global":
+                snip = getattr(enriched, "source_snippet", None)
+                if not global_fallback_matches_parsed_entity(
+                    listing_title=str(getattr(enriched, "title", "") or ""),
+                    source_snippet=snip if isinstance(snip, str) else None,
+                    validation_artist=parsed.artist,
+                    validation_album=album_title or "",
+                ):
+                    rejected_reasons.append(
+                        {
+                            "url": str(getattr(enriched, "url", ""))[:160],
+                            "title": str(getattr(enriched, "title", ""))[:120],
+                            "reason": "global_fallback_core_entity_mismatch",
+                        }
+                    )
+                    continue
             if not validate_listing(
                 enriched,
                 allowed_domains=all_allowed,
@@ -912,18 +965,22 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
             "per_tier": tier_traces,
         }
 
-    out = {
-        "query": query,
-        "results": [
-            _listing_to_api_row(listing, breakdown=breakdown)
-            for listing, breakdown in zip(head, breakdowns, strict=True)
-        ],
-    }
+    api_rows = [
+        _listing_to_api_row(listing, breakdown=breakdown)
+        for listing, breakdown in zip(head, breakdowns, strict=True)
+    ]
 
+    # Cache payload deliberately excludes `parsed` — see the cache-hit branch
+    # above for the rationale (live re-attach beats cached re-hydration).
     await set_cached_search_payload(
         cache_key_value,
-        out,
+        {"query": query, "results": api_rows},
         ttl_seconds=settings.search_cache_ttl_seconds,
     )
 
-    return out
+    return {
+        "query": query,
+        "results": api_rows,
+        "parsed": parsed,
+        "reason": None,
+    }

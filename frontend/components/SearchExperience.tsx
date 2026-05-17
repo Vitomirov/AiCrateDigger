@@ -4,15 +4,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent } from "react";
 
 import {
-  postParse,
   postSearch,
   type ListingResultDto,
-  type ParsedQueryDto,
   type SearchResponseDto,
 } from "../lib/api";
 import { buildPipelineInspectPayload, DevJsonPanel } from "./DevJsonInspector";
 import HugeVinylRecordBg from "./HugeVinylRecord";
 import ListingResultCard from "./ListingResultCard";
+
+/** Human copy for structured empty-state codes returned by `/search`. */
+const EMPTY_REASON_COPY: Record<NonNullable<SearchResponseDto["reason"]>, string> = {
+  album_unresolved:
+    "Couldn’t pin down which album you meant — try the exact title or add the artist.",
+};
 
 export default function SearchExperience() {
   const [query, setQuery] = useState("");
@@ -20,8 +24,6 @@ export default function SearchExperience() {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [payload, setPayload] = useState<SearchResponseDto | null>(null);
-  const [parsePayload, setParsePayload] = useState<ParsedQueryDto | null>(null);
-  const [parseError, setParseError] = useState<string | null>(null);
   /** After the first Dig, keep JSON panels mounted for debugging. */
   const [hasRunInspect, setHasRunInspect] = useState(false);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -53,30 +55,16 @@ export default function SearchExperience() {
       return;
     }
     setError(null);
-    setParseError(null);
-    setParsePayload(null);
     setHasRunInspect(true);
     setLoading(true);
     rampProgress();
     try {
-      const [parsedOutcome, searchOutcome] = await Promise.allSettled([postParse(q), postSearch(q)]);
-
-      if (parsedOutcome.status === "fulfilled") {
-        setParsePayload(parsedOutcome.value);
-      } else {
-        const reason = parsedOutcome.reason;
-        setParseError(reason instanceof Error ? reason.message : "Parse request failed.");
-      }
-
-      if (searchOutcome.status === "fulfilled") {
-        setPayload(searchOutcome.value);
-        setProgress(100);
-      } else {
-        setProgress(0);
-        setPayload(null);
-        const reason = searchOutcome.reason;
-        setError(reason instanceof Error ? reason.message : "Search failed.");
-      }
+      // Single round-trip: `/search` now returns `parsed` alongside `results`,
+      // so the dev inspector and the result list both render from one response.
+      // This halves parser latency and OpenAI token cost per Dig.
+      const search = await postSearch(q);
+      setPayload(search);
+      setProgress(100);
     } catch (e) {
       setProgress(0);
       setPayload(null);
@@ -92,10 +80,15 @@ export default function SearchExperience() {
   const hasHits = results.length > 0;
   const pct = Math.min(100, Math.max(0, progress));
 
-  const emptyHint =
-    payload && results.length === 0 && !loading && !error
-      ? "Nothing this pass — tweak the title or add a city hint."
-      : null;
+  const emptyHint = (() => {
+    if (!payload || loading || error || results.length > 0) {
+      return null;
+    }
+    if (payload.reason && EMPTY_REASON_COPY[payload.reason]) {
+      return EMPTY_REASON_COPY[payload.reason];
+    }
+    return "Nothing this pass — tweak the title or add a city hint.";
+  })();
 
   return (
     <div className="relative flex min-h-[100dvh] w-full flex-col">
@@ -145,7 +138,7 @@ export default function SearchExperience() {
                         void onDig();
                       }
                     }}
-                    placeholder={'Tool — "10,000 Days"…'}
+                    placeholder={'Tool - Aenima in Belgrade…'}
                     className="box-border h-12 min-h-[3rem] w-full shrink-0 resize-none overflow-y-auto rounded-lg border-[3px] border-crate-rust bg-[#0b0907]/95 px-3 py-2 text-[13px] font-semibold leading-tight text-crate-cream shadow-inner outline-none placeholder:text-crate-cream/45 placeholder:italic focus:border-crate-amber disabled:opacity-55 sm:h-[3.25rem] sm:min-h-[3.25rem] sm:text-[14px] md:h-14 md:min-h-[3.5rem] md:text-[15px]"
                   />
                   <button
@@ -212,10 +205,10 @@ export default function SearchExperience() {
             <div className="mx-auto grid max-w-6xl grid-cols-1 gap-3 lg:grid-cols-3">
               <DevJsonPanel
                 title="Parse"
-                subtitle="POST /parse — parser output"
+                subtitle="POST /search → parsed (single round-trip)"
                 loading={loading}
-                error={parseError}
-                data={parsePayload}
+                error={error}
+                data={error ? null : (payload?.parsed ?? null)}
               />
               <DevJsonPanel
                 title="Query & pipeline"
