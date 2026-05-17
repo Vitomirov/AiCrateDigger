@@ -337,12 +337,14 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
                 artist=parsed.artist,
                 album_index=parsed.album_index,
             )
-            album_title = resolution.album.title if resolution.album else None
+            raw_title = resolution.album.title if resolution.album else None
+            album_title = (raw_title or "").strip() or None
         elif parsed.album:
-            album_title = parsed.album
+            album_title = (parsed.album or "").strip() or None
         else:
             album_title = None
 
+    # No searchable release anchor — skip Tavily entirely and surface a machine reason for UI/API clients.
     if album_title is None:
         return {
             "query": query,

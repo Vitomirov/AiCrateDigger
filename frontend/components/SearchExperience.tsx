@@ -15,7 +15,7 @@ import ListingResultCard from "./ListingResultCard";
 /** Human copy for structured empty-state codes returned by `/search`. */
 const EMPTY_REASON_COPY: Record<NonNullable<SearchResponseDto["reason"]>, string> = {
   album_unresolved:
-    "Couldn’t pin down which album you meant — try the exact title or add the artist.",
+    "Couldn’t resolve which album to hunt — name the release (or spell the artist) so we can search shops.",
 };
 
 export default function SearchExperience() {
@@ -205,7 +205,13 @@ export default function SearchExperience() {
             <div className="mx-auto grid max-w-6xl grid-cols-1 gap-3 lg:grid-cols-3">
               <DevJsonPanel
                 title="Parse"
-                subtitle="POST /search → parsed (single round-trip)"
+                subtitle={
+                  error
+                    ? "POST /search → parsed (single round-trip)"
+                    : payload?.reason
+                      ? `reason: ${payload.reason} · POST /search → parsed`
+                      : "POST /search → parsed (single round-trip)"
+                }
                 loading={loading}
                 error={error}
                 data={error ? null : (payload?.parsed ?? null)}

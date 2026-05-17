@@ -143,6 +143,31 @@ class SearchResult(BaseModel):
 
 
 class SearchResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "results": [],
+                    "parsed": {
+                        "artist": "Tool",
+                        "album": None,
+                        "album_index": 3,
+                        "location": None,
+                        "country_code": None,
+                        "search_scope": "global",
+                        "resolved_city": None,
+                        "geo_confidence": None,
+                        "geo_granularity": None,
+                        "language": "unknown",
+                        "original_query": "third Tool studio album vinyl",
+                    },
+                    "reason": "album_unresolved",
+                    "debug": None,
+                }
+            ]
+        }
+    )
+
     results: list[ListingResult] = Field(
         default_factory=list,
         description="Aggregated deduplicated search results (strict ListingResult contract).",
