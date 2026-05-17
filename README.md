@@ -1,67 +1,123 @@
+<div align="center">
+
 # AiCrateDigger
 
-**AiCrateDigger** (also referenced internally as *AiCrateDigg*) is an AI-assisted search application for **physical music releases**—primarily **vinyl**, plus **CD** and **cassette**. Users describe what they want in natural language (artist, album, format, and optional geography); the system parses the intent, queries the web through curated store domains, and returns **structured listings** (URLs, titles, prices when visible, availability signals, and relevance scoring).
+**Natural-language search for physical music — vinyl, CD, cassette — routed through geo-aware shop domains and structured AI extraction.**
+
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Next.js 14](https://img.shields.io/badge/Next.js-14-000000?style=flat&logo=next.js&logoColor=white)](https://nextjs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
+
+*Portfolio-stage project · end-to-end async pipeline · tests & structured logging*
+
+</div>
 
 ---
 
-## What problem it solves
+## Table of contents
 
-Finding buyable copies of a specific release often means hunting across many regional shops and marketplaces. AiCrateDigger combines:
-
-1. **Structured parsing** of messy user queries (including ordinals like “second album” and location hints).
-2. **Music metadata** from **Discogs** where the pipeline needs canonical album alignment.
-3. **Geo-aware domain targeting** so search is biased toward relevant regions and whitelisted retailers—not generic global noise.
-4. **LLM-assisted extraction** from search snippets to turn raw hits into normalized listing objects.
-5. **Validation and ranking** (e.g. fuzzy matching, PDP heuristics, configurable thresholds).
-
----
-
-## Project stage
-
-| Aspect | Status |
-|--------|--------|
-| **Version** | `0.1.0` (backend and frontend package metadata) |
-| **Maturity** | **Early / alpha** — core search pipeline is implemented end-to-end; behavior and tuning evolve quickly |
-| **Persistence** | PostgreSQL optional in dev (`DATABASE_URL`); startup skips DB features when unset |
-| **Migrations** | SQLAlchemy `create_all` only (**no Alembic** yet) |
-| **Tests** | Small **unittest** suite (`backend/tests/`) focused on helpers and regressions |
-
-Treat production deployment as requiring your own hardening (secrets, rate limits, observability, and legal/compliance review for scraping and third-party APIs).
+- [Why this exists](#why-this-exists)
+- [What it does](#what-it-does)
+- [Architecture](#architecture)
+- [Technology stack](#technology-stack)
+- [Design choices](#design-choices)
+- [Repository layout](#repository-layout)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [API](#api)
+- [Frontend](#frontend)
+- [Observability](#observability)
+- [Testing](#testing)
+- [Status & limitations](#status--limitations)
+- [For recruiters & reviewers](#for-recruiters--reviewers)
 
 ---
 
-## Languages & major frameworks
+## Why this exists
 
-| Layer | Stack |
-|-------|--------|
-| **Backend** | Python **3.11**, **FastAPI**, **Pydantic v2** (`pydantic-settings`), **SQLAlchemy 2.0** (async) + **asyncpg**, **httpx**, **Poetry** |
-| **Frontend** | **Next.js 14** (App Router), **React 18**, **TypeScript 5** (strict), **Tailwind CSS 3** |
-| **Infra** | **Docker** / **Docker Compose**, **PostgreSQL 15** (Compose image) |
+Buying a specific **album** in a specific **place** usually means opening dozens of regional record-shop sites. AiCrateDigger is an experiment in **intent parsing + constrained web retrieval + LLM extraction** so one query can surface **actionable listing-shaped results** (URL, title, price hints, availability signals) instead of a generic web search page.
 
 ---
 
-## External services & APIs
+## What it does
 
-| Service | Role |
-|---------|------|
-| [**OpenAI**](https://platform.openai.com/) | All LLM calls use **`gpt-4o-mini`** via **`AsyncOpenAI`**, JSON-mode responses (`response_format={"type": "json_object"}`), temperature **0** for extraction-style tasks |
-| [**Tavily**](https://tavily.com/) | Web search with **`include_domains`** batching, configurable depth/score thresholds (defaults tuned for cost vs. quality in `Settings`) |
-| [**Discogs API**](https://www.discogs.com/developers/) | Artist/discography and release alignment (`DISCOGS_TOKEN` optional but recommended for enrichment) |
+| Capability | Description |
+|------------|-------------|
+| **Parse** | Single structured JSON parse from natural language: artist, album or ordinal (`album_index`), location, inferred `country_code` and `search_scope`. |
+| **Resolve** | Optional **Discogs** alignment when the user references position (“second album”, “latest”) instead of a literal title. |
+| **Discover stores** | When city-level indie coverage is thin, **Tavily + LLM** can propose vetted shops and upsert into a **whitelist** in Postgres. |
+| **Search** | **Tavily** with **`include_domains`** batches, **geo tiers** (city → country → region → …), optional **per-shop fanout** in city tier. |
+| **Extract** | Snippet-first pipeline: deterministic paths + **gpt-4o-mini** JSON extraction into listing rows. |
+| **Validate & rank** | RapidFuzz gates, PDP heuristics, URL normalization, **composite ranking** (semantic, geo, store quality, tier). |
+| **Explicit empty states** | When no album anchor exists after parse/Discogs, the API returns **`reason: album_unresolved`** so clients don’t look “broken”. |
 
 ---
 
-## LLM usage (high level)
+## Architecture
 
-The **live HTTP pipeline** (`POST /search`) roughly follows:
+```mermaid
+flowchart TB
+  subgraph Client
+    UI[Next.js UI]
+  end
+  subgraph Backend["FastAPI backend"]
+    P[parse_user_query]
+    D[Discogs resolve optional]
+    G[Geo + whitelist stores]
+    T[Tavily batched + fanout]
+    E[extract_listings]
+    V[validate + rank]
+    P --> D --> G --> T --> E --> V
+  end
+  subgraph Data
+    PG[(PostgreSQL)]
+  end
+  UI -->|POST /api/search → /search| P
+  G <-->|stores + cache| PG
+  P --> OpenAI[(OpenAI API)]
+  T --> Tavily[(Tavily API)]
+  D --> Discogs[(Discogs API)]
+  E --> OpenAI
+```
 
-1. **Parse** (`app.agents.parser.parse_user_query`) — one structured JSON object per query: artist, album, album index, location, ISO country code, search scope.
-2. **Search** (`app.services.tavily_service`) — Tavily calls constrained by geo-tiered **whitelist stores** loaded from DB or policy fallbacks.
-3. **Extract** (`app.agents.extractor.extract_listings`) — maps search snippets to listing rows (price, currency, stock hints, titles).
-4. **Validate & rank** (`app.validators.listings`, RapidFuzz, URL normalization) — filters and scores before response.
+**Single round-trip:** `POST /search` returns **`results`**, **`parsed`** (parser output), optional **`reason`**, and optional **`debug`** when `DEBUG=true`.
 
-The repository also keeps **`app.agents.parser.parse_user_input`** (Discogs-aware orchestration) and **`app.agents.extractor.extract_and_score_results`** (legacy ``SearchResult``→``ListingResult`` tests). Shared low-level LLM helpers live under **`app.llm/`** (e.g. field coercion).
+---
 
-> **Note:** Project documentation in `.cursorrules` mentions **Crawl4AI** for full-page markdown extraction. That is **not** present in `pyproject.toml` today; retrieval is **Tavily-centric** with snippet-based LLM extraction.
+## Technology stack
+
+| Layer | Choices |
+|-------|---------|
+| **Runtime** | Python **3.11+**, Node **18+** (typical for Next 14) |
+| **API** | **FastAPI**, **Uvicorn**, **Pydantic v2**, **pydantic-settings** |
+| **DB** | **PostgreSQL 15**, **SQLAlchemy 2.0** async, **asyncpg** |
+| **HTTP client** | **httpx** (async to external APIs) |
+| **Search** | **Tavily** (domain-constrained search, retries/backoff configurable) |
+| **LLM** | **OpenAI** `gpt-4o-mini`, **AsyncOpenAI**, JSON mode for structured steps |
+| **Fuzzy matching** | **RapidFuzz** |
+| **Frontend** | **Next.js 14** App Router, **React 18**, **TypeScript 5** strict, **Tailwind CSS 3** |
+| **Packaging** | **Poetry** (backend), **npm** (frontend) |
+| **Local infra** | **Docker Compose** (optional `chroma_db` volume is legacy; app code does not use Chroma) |
+
+---
+
+## Design choices
+
+1. **Tavily + snippets, not a site crawler** — Full-page scraping would raise latency, ops burden, and compliance questions. Snippets keep token use bounded and make the problem **search → extract**, not **browse → render**.
+
+2. **Whitelist-first retrieval** — Open web search drifts to megamarket SEO. Curated **`whitelist_stores`** (Postgres, seeded from policy) plus **`include_domains`** keeps results **commerce-shaped** and easier to reason about.
+
+3. **Geo tiers, not “paste city into every query string”** — Location drives **which domains and tiers** run; ranking uses geo as **signal**, not a hard user-location filter on every row, to reduce false negatives.
+
+4. **One parser contract for the live path** — `parse_user_query` → `domain.parse_schema.ParsedQuery`. Older alternate parser/extractor paths remain for tests or legacy compatibility only.
+
+5. **Structured failure over silent zeros** — **`album_unresolved`** (and OpenAPI examples on `SearchResponse`) document why a search never reached Tavily.
+
+6. **Cost-aware defaults** — e.g. Tavily **`basic`** depth by default, chunked domains, **TTL caches**, configurable **fanout concurrency** and **HTTP retries** for transient Tavily pressure (429 / 432 / 433 / 503).
+
+7. **Logging ready for aggregation** — `LOG_FORMAT=json` emits NDJSON-friendly records with promoted fields (`stage`, `request_id`, `reason`, …) for Loki/Datadog-style pipelines.
 
 ---
 
@@ -71,47 +127,50 @@ The repository also keeps **`app.agents.parser.parse_user_input`** (Discogs-awar
 AiCrateDigger/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI app + lifespan (DB seed/cache purge)
-│   │   ├── config.py            # Pydantic settings (env-driven)
-│   │   ├── routers/search.py    # /parse, /search, /search-listings
-│   │   ├── pipeline/vinyl_search.py
-│   │   ├── llm/                 # small helpers (e.g. coerce_listing_fields)
-│   │   ├── agents/              # parser/, extractor/ (numbered step modules)
-│   │   ├── services/          # tavily_service, discogs_service, domain batching
-│   │   ├── policies/           # geo_scope, eu_stores, store domains, query DSL
-│   │   ├── db/                 # async SQLAlchemy, cache, store loader
-│   │   ├── domain/             # parse/listing schemas
-│   │   ├── models/             # API-facing Pydantic models
-│   │   └── validators/
-│   └── tests/
+│   │   ├── main.py                 # FastAPI app + lifespan (DB init, store seed, cache purge)
+│   │   ├── config.py               # Settings (env-driven knobs)
+│   │   ├── logging_config.py       # Human vs JSON log formatters
+│   │   ├── routers/search.py       # /parse, /search, /search-listings
+│   │   ├── pipeline/
+│   │   │   └── vinyl_search.py     # Orchestrator: parse → tiers → Tavily → extract → validate
+│   │   ├── pipeline_context.py     # Per-request stage trace (DEBUG payload)
+│   │   ├── agents/
+│   │   │   ├── parser/             # parse_user_query + steps
+│   │   │   └── extractor/        # extract_listings + evidence / verify helpers
+│   │   ├── services/               # tavily_service, discogs_service, store_discovery, batches
+│   │   ├── policies/               # geo_scope, search_dsl, listing_rank, eu_stores, …
+│   │   ├── db/                     # database.py, cache.py, store_loader.py
+│   │   ├── domain/                 # parse_schema, listing_schema
+│   │   ├── models/                 # API models (SearchResponse, ListingResult, …)
+│   │   ├── validators/             # listings validation gates
+│   │   └── llm/                    # small coercion helpers
+│   └── tests/                      # unittest suite (see Testing)
 ├── frontend/
-│   ├── app/                    # Next.js App Router pages & API route proxy
-│   ├── components/
-│   └── lib/api.ts              # Client fetch helpers
+│   ├── app/                        # App Router, /api/search & /api/parse proxies
+│   ├── components/                 # SearchExperience, cards, dev JSON inspector
+│   └── lib/api.ts                  # Typed fetch helpers
 ├── docker-compose.yml
+├── .env.example                    # Copy to .env — never commit secrets
 └── README.md
 ```
 
 ---
 
-## Configuration
+## Quick start
 
-Backend settings are loaded from **environment variables** (and optional `.env`). Important keys:
+### Prerequisites
 
-| Variable | Purpose |
-|----------|---------|
-| `OPENAI_API_KEY` | Required for parsing and extraction |
-| `TAVILY_API_KEY` | Required for web search |
-| `DISCOGS_TOKEN` | Optional; improves music resolution |
-| `DATABASE_URL` | Optional `postgresql+asyncpg://…` or `postgresql://…` (coerced to async driver) |
+- Docker & Docker Compose **or** Poetry + Node + PostgreSQL
+- **OpenAI** and **Tavily** API keys
 
-Additional knobs (TTLs, Tavily chunk sizes, fuzzy validation thresholds, geo tier caps) live in **`backend/app/config.py`** as `Settings` fields.
+### 1. Environment
 
----
+```bash
+cp .env.example .env
+# Edit .env — set OPENAI_API_KEY and TAVILY_API_KEY at minimum
+```
 
-## Running locally
-
-### Docker Compose (recommended)
+### 2. Docker Compose (recommended)
 
 From the repo root:
 
@@ -119,21 +178,22 @@ From the repo root:
 docker compose up --build
 ```
 
-- **Frontend:** http://localhost:3000  
-- **Backend API:** http://localhost:8000  
-- **PostgreSQL:** exposed on host port **5433** by default (see `docker-compose.yml`)
+| Service | URL |
+|---------|-----|
+| Frontend | http://localhost:3000 |
+| Backend API | http://localhost:8000 |
+| PostgreSQL (host port) | localhost:**5433** (default; see `docker-compose.yml`) |
 
-Ensure `.env` or shell exports supply API keys for OpenAI and Tavily.
-
-### Backend only (Poetry)
+### 3. Backend only (Poetry)
 
 ```bash
 cd backend
 poetry install
+export OPENAI_API_KEY=... TAVILY_API_KEY=...
 poetry run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### Frontend only (npm)
+### 4. Frontend only (npm)
 
 ```bash
 cd frontend
@@ -141,42 +201,106 @@ npm install
 npm run dev
 ```
 
-Point the UI at the API with `NEXT_PUBLIC_BACKEND_URL` (browser) and/or `BACKEND_URL` (Next.js server-side proxy in `app/api/search/route.ts`).
+Use **`NEXT_PUBLIC_BACKEND_URL`** for browser-side calls where applicable, and **`BACKEND_URL`** for the Next.js server route proxy (`frontend/app/api/search/route.ts`).
 
 ---
 
-## API overview
+## Configuration
+
+### Required & common variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `OPENAI_API_KEY` | **Yes** | Parser + extractor LLM calls |
+| `TAVILY_API_KEY` | **Yes** | Web search |
+| `DISCOGS_TOKEN` | No | Stronger album resolution for ordinal queries |
+| `DATABASE_URL` | No* | Postgres (`postgresql+asyncpg://…` or `postgresql://…`) — *Compose supplies default |
+| `DEBUG` | No | When `true`, `/search` includes full pipeline **`debug`** trace |
+| `LOG_LEVEL` | No | Default `INFO` |
+| `LOG_FORMAT` | No | `human` (local) or **`json`** (aggregators) |
+
+**Important knobs** (Tavily retries, fanout concurrency, geo caps, fuzzy thresholds, cache TTLs) live in **`backend/app/config.py`** as typed **`Settings`** fields — prefer changing env-backed settings over editing pipeline code.
+
+---
+
+## API
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness |
-| `POST` | `/parse` | Parse query only (debugging / introspection) |
-| `POST` | `/search` | Full pipeline: parse → Tavily → extract → validate |
+| `POST` | `/parse` | Parser only (`ParsedQuery`) |
+| `POST` | `/search` | Full pipeline: **`results`**, **`parsed`**, optional **`reason`**, optional **`debug`** |
 | `POST` | `/search-listings` | Alias of `/search` |
 
-Request body for parse/search: JSON `{"query": "<natural language>"}`.
+**Body:** `{ "query": "Natural language query…" }`
+
+Interactive docs: **`/docs`** (Swagger) when the backend is running.
 
 ---
 
-## Tests
+## Frontend
+
+- **Next.js 14** App Router with a single-page search experience and **server-side proxy** to the backend (avoids CORS for the main flow).
+- **Accessible health hint** via `fetchHealth()` on the home page (`aria-live`).
+- **Dev inspector** panels (parse JSON, optional DEBUG pipeline stages, results array) for demos and interviews.
+
+---
+
+## Observability
+
+- Central **`logging_config`**: switch **`LOG_FORMAT=json`** in deployment for structured logs.
+- Pipeline stages attach **`request_id`** and domain-specific **`extra`** fields suitable for filtering in log drains.
+
+**Operational note:** Keep **`DEBUG=false`** on any publicly reachable deployment — otherwise **`debug`** payloads in JSON responses can expose internal traces.
+
+---
+
+## Testing
 
 ```bash
 cd backend
+export OPENAI_API_KEY=dummy TAVILY_API_KEY=dummy   # required by Settings() in some suites
 poetry run python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
----
-
-## License / naming
-
-Verify licensing before redistribution. Naming varies slightly (**AiCrateDigger** vs **AiCrateDigg**) across files; both refer to this codebase.
+The suite focuses on **policies, extractors, validators, geo ranking, locale variants, and pipeline edge cases** (e.g. early exit when the album cannot be resolved). **CI wiring (GitHub Actions) is left as an easy addition** for your fork.
 
 ---
 
-## Contributing mindset
+## Status & limitations
 
-When extending the project:
+| Topic | Note |
+|-------|------|
+| **Maturity** | **0.1.x — portfolio / demo grade**, not a monetized marketplace |
+| **Migrations** | **SQLAlchemy `create_all`** + targeted `ALTER … IF NOT EXISTS` — plan **Alembic** before multi-environment schema evolution |
+| **Rate limiting / auth** | Not included — rely on edge gateway or private networking for public demos |
+| **Result quality** | Depends on Tavily coverage, snippet richness, and validation thresholds; tuning is expected |
+| **Legal / ToS** | Uses third-party APIs; review vendor terms before commercial use |
 
-- Prefer **async** end-to-end for I/O-bound paths.
-- Keep **secrets out of logs**; use structured logging already wired in `logging_config`.
-- Align new retrieval or extraction steps with existing **whitelist + geo tier** policies so results stay locally relevant and maintainable.
+---
+
+## For recruiters & reviewers
+
+**Suggested reading order (≈15 minutes):**
+
+1. This README  
+2. `backend/app/pipeline/vinyl_search.py` — orchestration and geo tier loop  
+3. `backend/app/services/tavily_service.py` — batching, retries, domain hygiene  
+4. `backend/app/policies/listing_rank.py` — scoring philosophy  
+5. `backend/tests/` — regression coverage
+
+If you **clone and run Compose with valid keys**, you get a **working vertical slice** suitable for a portfolio conversation about **async Python, LLM boundaries, search UX, and pragmatic tradeoffs**.
+
+---
+
+## License & naming
+
+Confirm licensing before redistribution. The FastAPI app title may appear as **AiCrateDigg** in metadata while the product name is **AiCrateDigger** — same codebase.
+
+---
+
+<div align="center">
+
+**Built as a learning & portfolio piece — PRs and forks welcome.**
+
+</div>
