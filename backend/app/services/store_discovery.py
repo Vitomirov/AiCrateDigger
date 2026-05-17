@@ -29,9 +29,7 @@ from app.db.database import WhitelistStoreORM, session_factory
 from app.policies.geo_scope import country_to_region
 from app.policies.store_domain import canonical_store_domain, is_valid_store_host
 
-logger = logging.getLogger(__name__)
-
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+from app.services.tavily_service import _fetch_tavily_results_body
 _TAVILY_TIMEOUT_S = 15.0
 _TAVILY_MAX_RESULTS = 10
 
@@ -130,20 +128,11 @@ async def _tavily_probe(city: str, country_code: str) -> list[dict[str, str]]:
         "max_results_per_query": _TAVILY_MAX_RESULTS,
     }
     async with httpx.AsyncClient(timeout=_TAVILY_TIMEOUT_S) as client:
-        try:
-            resp = await client.post(TAVILY_SEARCH_URL, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPError as exc:
+        data = await _fetch_tavily_results_body(client, payload, query_for_log=query)
+        if data is None:
             logger.warning(
                 "store_discovery_tavily_http_error",
-                extra={"stage": "store_discovery", "reason": str(exc)},
-            )
-            return []
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "store_discovery_tavily_unexpected",
-                extra={"stage": "store_discovery", "reason": str(exc)},
+                extra={"stage": "store_discovery", "reason": "tavily_request_failed_after_retries"},
             )
             return []
 

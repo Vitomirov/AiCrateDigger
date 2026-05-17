@@ -1,350 +1,217 @@
 """Deterministic vinyl-search pipeline orchestrator.
 
-Owns the full request lifecycle. Each stage is wrapped in `stage_timer` for
-structured tracing. NO business logic in this module — every transformation
-lives in the called sub-module. No fallbacks, no error swallowing.
+Owns the full request lifecycle as a small, readable sequence of stages.
+The bulk of the per-stage logic lives in sibling modules of this package:
+
+* :mod:`app.pipeline.tier_runner` — per-tier (city → … → global) iteration
+* :mod:`app.pipeline.finalize`     — post-loop sort / dedupe / cap / scoring
+* :mod:`app.pipeline.listing_dedupe`, :mod:`app.pipeline.local_first`,
+  :mod:`app.pipeline.store_selection`, :mod:`app.pipeline.stop_floors`,
+  :mod:`app.pipeline.constants`, :mod:`app.pipeline.api_mapper`
+
+Each stage is wrapped in ``stage_timer`` for structured tracing. NO business
+logic lives in this module — every transformation lives in the called helper.
+No fallbacks, no error swallowing.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import OrderedDict
 from typing import Any
-
-from rapidfuzz import fuzz
 
 from app.config import get_settings
 from app.db.cache import (
     build_search_cache_key,
-    build_tavily_tier_cache_key,
     get_cached_search_payload,
-    get_cached_tavily_tier_payload,
     hydrate_cached_pipeline_dict,
     set_cached_search_payload,
 )
 from app.db.store_loader import ensure_local_coverage, load_active_stores
-from app.agents.extractor import ExtractListingsReport, extract_listings
 from app.agents.parser.parse_user_query import parse_user_query
-from app.models.search_query import SearchResult
-from app.models.result import ListingResult
+from app.pipeline.api_mapper import listing_to_api_row
+from app.pipeline.finalize import (
+    compute_local_shop_signals,
+    emit_ranking_trace,
+    emit_widening_summary_trace,
+    score_final_listings,
+    sort_dedupe_and_cap_listings,
+)
+from app.pipeline.tier_runner import (
+    TierContext,
+    TierLoopState,
+    process_tier,
+)
 from app.pipeline_context import stage_timer
-from app.policies.eu_stores import StoreEntry
 from app.policies.geo_scope import (
     Tier,
-    TIER_NARROWNESS,
-    cap_stores,
-    filter_stores_for_tier,
     geo_intent_from_parsed,
-    max_domains_for_tier,
     normalized_geo_from_parsed,
-    sort_stores_for_tier,
-    sort_validated_listings_geo,
     tier_fallback_order,
-)
-from app.policies.listing_rank import (
-    ListingRankBreakdown,
-    composite_listing_score,
-    resolve_store_for_url,
 )
 from app.policies.physical_local import (
     curated_city_local_shop_domains,
-    pool_has_qualifying_physical_local_row,
-    qualifies_as_target_city_local_shop,
     should_prioritize_physical_local_shops,
 )
 from app.policies.search_dsl import plan_tavily_query_strings
-from app.policies.store_domain import canonical_store_domain
-from app.agents.extractor.verify_album_match import verify_album_match
 from app.services.discogs_service import resolve_album_by_index
-from app.services.tavily_service import (
-    editorial_discovery_blocked_hosts_from_raw_results,
-    normalize_url,
-    run_local_site_searches,
-    run_tavily_for_store_domains,
-)
-from app.validators.listings import (
-    global_fallback_matches_parsed_entity,
-    normalize_whitelist_domain,
-    validate_listing,
-)
+from app.validators.listings import normalize_whitelist_domain
 
 logger = logging.getLogger(__name__)
 
-_MIN_STORE_DOMAINS_DEFAULT = 2
-_MIN_STORE_DOMAINS_CITY = 1
-#: Result capping (Local-First Strike): when at least one ``local_shop`` validated,
-#: hold non-indie store types to this cap in the final response.
-_MAX_REGIONAL_WHEN_LOCAL_PRESENT = 1
-_MAX_MARKETPLACE_WHEN_LOCAL_PRESENT = 0
-#: Stricter locality-first cap: when prioritized target-city locals validated,
-#: regional giants are withheld entirely unless no such locals exist upstream.
-_MAX_REGIONAL_WHEN_PRIORITIZED_PRIMARY_LOCAL_PRESENT = 0
+
+# ---------------------------------------------------------------------------
+# Stage 1 — parse + Discogs resolution
+# ---------------------------------------------------------------------------
 
 
-def _dedupe_store_entries_by_domain(capped: tuple[StoreEntry, ...]) -> tuple[StoreEntry, ...]:
-    seen: set[str] = set()
-    out: list[StoreEntry] = []
-    for s in capped:
-        k = normalize_whitelist_domain(s.domain)
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(s)
-    return tuple(out)
-
-
-def _tier_validated_stop_floor(tier: Tier, *, settings: Any) -> int:
-    if tier in ("city", "country"):
-        return int(settings.pipeline_geo_stop_country)
-    if tier == "region":
-        return int(settings.pipeline_geo_stop_region)
-    if tier == "continental":
-        return int(settings.pipeline_geo_stop_continental)
-    return 9999
-
-
-def _effective_stop_floor(tier: Tier, *, settings: Any, confidence: float) -> int:
-    """High geo confidence → stop widening sooner; low → require more hits first."""
-    base = _tier_validated_stop_floor(tier, settings=settings)
-    if confidence >= 0.88:
-        return max(1, base)
-    bump = int((0.88 - confidence) * 6)
-    return min(20, max(1, base + max(0, bump)))
-
-
-def _title_album_fuzzy_score(lst: Any, album_title: str) -> float:
-    if not (album_title or "").strip():
-        return 0.0
-    ttl = str(getattr(lst, "title", "") or "").strip().lower()
-    alb = album_title.strip().lower()
-    if not ttl or not alb:
-        return 0.0
-    return float(max(fuzz.partial_ratio(alb, ttl), fuzz.token_set_ratio(alb, ttl)))
-
-
-def _verdict_confirmed_rank(lst: Any, album_match_by_url: dict[str, bool] | None) -> int:
-    """Prefer explicit True verifier keys; missing keys neutral; explicit False suppressed."""
-    if not album_match_by_url:
-        return 1
-    u = str(getattr(lst, "url", "") or "")
-    nk = normalize_url(u)
-    if u in album_match_by_url:
-        return 2 if album_match_by_url[u] else 0
-    if nk in album_match_by_url:
-        return 2 if album_match_by_url[nk] else 0
-    return 1
-
-
-def _pick_best_same_domain_rows(rows: list[Any], *, album_title: str | None, album_match_by_url: dict[str, bool] | None) -> Any:
-    if len(rows) == 1:
-        return rows[0]
-
-    def key(lst: Any) -> tuple[int, float, str]:
-        u = str(getattr(lst, "url", "") or "")
-        return (
-            _verdict_confirmed_rank(lst, album_match_by_url),
-            _title_album_fuzzy_score(lst, album_title or ""),
-            u,
-        )
-
-    return max(rows, key=key)
-
-
-def _dedupe_listings_by_normalized_url(listings: list[Any]) -> list[Any]:
-    order: list[str] = []
-    by_key: dict[str, Any] = {}
-    for lst in listings:
-        u = getattr(lst, "url", None)
-        if not u:
-            continue
-        key = normalize_url(str(u))
-        if key not in by_key:
-            by_key[key] = lst
-            order.append(key)
-    return [by_key[k] for k in order]
-
-
-def _listing_to_api_row(
-    listing: Any,
-    *,
-    breakdown: ListingRankBreakdown,
-) -> ListingResult:
-    title = str(listing.title or "")
-    if len(title) < 5:
-        title = f"{title} · shop"
-
-    price_str = None
-    cur = listing.currency or "EUR"
-    try:
-        if listing.price is not None and float(listing.price) > 0:
-            price_str = f"{float(listing.price):.2f} {cur}".rstrip("0").rstrip(".")
-    except (TypeError, ValueError):
-        price_str = f"{listing.price} {cur}" if listing.price else None
-
-    match_reason = (
-        f"tier={breakdown.discovery_tier}|store_type={breakdown.store_type}"
-        f"|geo={breakdown.geo_proximity:.1f}|sem={breakdown.semantic_match:.1f}"
-        f"|vinyl={breakdown.vinyl_confidence:.1f}"
-    )
-
-    return ListingResult(
-        url=listing.url,
-        title=title,
-        score=breakdown.score_normalized,
-        price=price_str,
-        location=None,
-        availability="available" if listing.in_stock else "unknown",
-        seller_type="store",
-        domain=listing.store,
-        artist_match=1.0,
-        album_match=1.0,
-        match_reason=match_reason,
-    )
-
-
-def _store_type_distribution(stores: tuple[StoreEntry, ...]) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for s in stores:
-        k = s.store_type or "regional_ecommerce"
-        out[k] = out.get(k, 0) + 1
-    return out
-
-
-def _dedupe_listings_by_domain(
-    sorted_listings: list[Any],
-    *,
-    store_by_domain: dict[str, StoreEntry],
-    album_title: str | None = None,
-    artist: str | None = None,
-    album_match_by_url: dict[str, bool] | None = None,
-) -> tuple[list[Any], dict[str, int]]:
-    """Pick the best listing per store domain after scoring, not simply "first in list".
-
-    Groups hosts using the same keying policy as before, but when several URLs
-    share a domain (e.g. multiple Groovie PDPs) we keep the row that best matches
-    the target album title and any explicit ``verify_album_match`` confirmation
-    flags. ``artist`` is accepted for forward-compatible tie metadata (unused for
-    now — title overlap + verifier rank carry the signal).
-
-    ``sorted_listings`` should still be ranked best-first for ordering of *groups*
-    and as a prior when composite scores are tied.
-    """
-    _ = artist  # reserved for future token checks
-    groups: "OrderedDict[str, list[Any]]" = OrderedDict()
-    for lst in sorted_listings:
-        url = str(getattr(lst, "url", "") or "")
-        store = resolve_store_for_url(url, store_by_domain)
-        if store is not None and store.domain:
-            key = normalize_whitelist_domain(store.domain)
-        else:
-            key = canonical_store_domain(url)
-        if not key:
-            continue
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(lst)
-
-    out: list[Any] = []
-    dropped: dict[str, int] = {}
-    for key, rows in groups.items():
-        if len(rows) == 1:
-            out.append(rows[0])
-            continue
-        kept = _pick_best_same_domain_rows(
-            rows,
-            album_title=album_title,
-            album_match_by_url=album_match_by_url,
-        )
-        out.append(kept)
-        dropped[key] = len(rows) - 1
-    return out, dropped
-
-
-def _apply_local_first_caps(
-    sorted_listings: list[Any],
-    *,
-    store_by_domain: dict[str, StoreEntry],
-    generic_local_shop_present_in_pool: bool,
-    prioritize_physical_locals: bool,
-    primary_target_local_shop_present: bool,
-    max_results: int,
-) -> list[Any]:
-    """Local-First result capping.
-
-    If at least one validated ``local_shop`` row exists in the aggregated pool:
-      * ``local_shop`` rows are streamed first until ``max_results``,
-      * ``regional_ecommerce`` capped to 1 normally, or **0** when prioritized
-        target-city indie locals validated (mega-retailer fallback only once
-        indie coverage is exhausted),
-      * ``marketplace`` capped to ``_MAX_MARKETPLACE_WHEN_LOCAL_PRESENT``.
-
-    Without ``generic_local_shop_present_in_pool`` the helper preserves input
-    order (subject only to ``max_results``).
-    """
-    if max_results <= 0:
-        return []
-    if not generic_local_shop_present_in_pool:
-        return sorted_listings[:max_results]
-
-    regional_cap = _MAX_REGIONAL_WHEN_LOCAL_PRESENT
-    if prioritize_physical_locals and primary_target_local_shop_present:
-        regional_cap = _MAX_REGIONAL_WHEN_PRIORITIZED_PRIMARY_LOCAL_PRESENT
-
-    out: list[Any] = []
-    seen_regional = 0
-    seen_market = 0
-    for lst in sorted_listings:
-        store = resolve_store_for_url(str(getattr(lst, "url", "") or ""), store_by_domain)
-        st = (store.store_type if store is not None else "regional_ecommerce") or "regional_ecommerce"
-        if st == "local_shop":
-            out.append(lst)
-        elif st == "regional_ecommerce":
-            if seen_regional < regional_cap:
-                out.append(lst)
-                seen_regional += 1
-        elif st == "marketplace":
-            if seen_market < _MAX_MARKETPLACE_WHEN_LOCAL_PRESENT:
-                out.append(lst)
-                seen_market += 1
-        else:
-            # Unknown / default: treat as regional.
-            if seen_regional < regional_cap:
-                out.append(lst)
-                seen_regional += 1
-        if len(out) >= max_results:
-            break
-    return out
-
-
-async def run_vinyl_search(query: str) -> dict[str, Any]:
-    settings = get_settings()
-    debug_enabled = settings.debug
-
-    core_query: str = ""
-    store_domains: list[str] = []
-    raw_results: list[Any] = []
-    listings: list[Any] = []
-    album_title: str | None = None
-    stores: tuple[Any, ...] = ()
-
+async def _stage_parse(query: str) -> Any:
+    """Parse the user query inside the ``parse`` stage timer."""
     with stage_timer("parse", input={"query": query}) as rec:
         parsed = await parse_user_query(query)
         rec.output = parsed.model_dump()
+    return parsed
 
-    with stage_timer("discogs") as rec:
+
+async def _stage_resolve_album_title(parsed: Any) -> str | None:
+    """Resolve a Discogs release (ordinal queries) or take the literal album."""
+    with stage_timer("discogs"):
         if parsed.album_index is not None:
             resolution = await resolve_album_by_index(
                 artist=parsed.artist,
                 album_index=parsed.album_index,
             )
             raw_title = resolution.album.title if resolution.album else None
-            album_title = (raw_title or "").strip() or None
-        elif parsed.album:
-            album_title = (parsed.album or "").strip() or None
-        else:
-            album_title = None
+            return (raw_title or "").strip() or None
+        if parsed.album:
+            return (parsed.album or "").strip() or None
+        return None
 
-    # No searchable release anchor — skip Tavily entirely and surface a machine reason for UI/API clients.
+
+# ---------------------------------------------------------------------------
+# Stage 2 — geo + local-coverage discovery + active store load
+# ---------------------------------------------------------------------------
+
+
+def _stage_geo_norm(parsed: Any) -> tuple[Any, Any]:
+    """Emit the ``geo_norm`` trace and return ``(geo, norm)``."""
+    geo = geo_intent_from_parsed(parsed)
+    norm = normalized_geo_from_parsed(parsed)
+    with stage_timer("geo_norm") as rec:
+        rec.output = {
+            "raw_location": norm.raw_location,
+            "resolved_country": norm.resolved_country,
+            "resolved_city": norm.resolved_city,
+            "granularity": norm.granularity,
+            "confidence": round(float(norm.confidence), 3),
+            "search_scope": geo.search_scope,
+            "region": geo.region,
+        }
+    return geo, norm
+
+
+async def _stage_ensure_local_coverage(norm: Any) -> None:
+    """LOCAL-FIRST STRIKE phase 2: top up indie ``local_shop`` rows on demand.
+
+    If the resolved city has fewer than the configured number of indie
+    ``local_shop`` rows, discover more via Tavily + LLM before we load the
+    active store catalogue.
+    """
+    if not (norm.resolved_city and norm.resolved_country):
+        return
+    with stage_timer(
+        "store_discovery",
+        input={
+            "city": norm.resolved_city,
+            "country_code": norm.resolved_country,
+        },
+    ) as rec:
+        coverage = await ensure_local_coverage(
+            city=norm.resolved_city,
+            country_code=norm.resolved_country,
+        )
+        rec.output = coverage
+        disc = coverage.get("discovery") or {}
+        if not coverage.get("triggered"):
+            rec.status = "empty"
+        elif not (disc.get("inserted") or disc.get("updated")):
+            rec.status = "empty"
+
+
+async def _stage_load_stores() -> tuple[Any, ...]:
+    with stage_timer("stores"):
+        return await load_active_stores()
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — Tavily query planning
+# ---------------------------------------------------------------------------
+
+
+def _plan_queries(
+    parsed: Any, album_title: str, norm: Any
+) -> tuple[str, Any]:
+    return plan_tavily_query_strings(
+        parsed.artist,
+        album_title,
+        country_code_for_variants=norm.resolved_country,
+        resolved_city=norm.resolved_city,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 — geo widening loop
+# ---------------------------------------------------------------------------
+
+
+async def _run_tier_loop(
+    ctx: TierContext,
+    state: TierLoopState,
+    tier_queue: list[Tier],
+) -> bool:
+    """Drive the geo widening loop, returning whether the global fallback ran."""
+    tier_ix = 0
+    executed_global_fallback = False
+    while True:
+        if tier_ix < len(tier_queue):
+            tier = tier_queue[tier_ix]
+            tier_ix += 1
+            widening_reason = "planned_tier"
+        elif (
+            not state.aggregated
+            and not executed_global_fallback
+            and "global" not in tier_queue
+        ):
+            tier = "global"
+            executed_global_fallback = True
+            widening_reason = "fallback_no_results"
+        else:
+            break
+
+        early_stop = await process_tier(
+            tier=tier,
+            widening_reason=widening_reason,
+            ctx=ctx,
+            state=state,
+        )
+        if early_stop:
+            break
+    return executed_global_fallback
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+async def run_vinyl_search(query: str) -> dict[str, Any]:
+    settings = get_settings()
+    debug_enabled = settings.debug
+
+    parsed = await _stage_parse(query)
+    album_title = await _stage_resolve_album_title(parsed)
+
+    # No searchable release anchor — skip Tavily entirely and surface a
+    # machine-readable reason for UI / API clients.
     if album_title is None:
         return {
             "query": query,
@@ -372,41 +239,9 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         hydrated["reason"] = None
         return hydrated
 
-    geo = geo_intent_from_parsed(parsed)
-    norm = normalized_geo_from_parsed(parsed)
-
-    with stage_timer("geo_norm") as rec:
-        rec.output = {
-            "raw_location": norm.raw_location,
-            "resolved_country": norm.resolved_country,
-            "resolved_city": norm.resolved_city,
-            "granularity": norm.granularity,
-            "confidence": round(float(norm.confidence), 3),
-            "search_scope": geo.search_scope,
-            "region": geo.region,
-        }
-
-    # LOCAL-FIRST STRIKE — phase 2: if the resolved city has fewer than the
-    # configured number of indie ``local_shop`` rows, discover more on demand
-    # via Tavily + LLM before we load the active store catalogue.
-    if norm.resolved_city and norm.resolved_country:
-        with stage_timer("store_discovery", input={
-            "city": norm.resolved_city,
-            "country_code": norm.resolved_country,
-        }) as rec:
-            coverage = await ensure_local_coverage(
-                city=norm.resolved_city,
-                country_code=norm.resolved_country,
-            )
-            rec.output = coverage
-            disc = coverage.get("discovery") or {}
-            if not coverage.get("triggered"):
-                rec.status = "empty"
-            elif not (disc.get("inserted") or disc.get("updated")):
-                rec.status = "empty"
-
-    with stage_timer("stores") as rec:
-        stores = await load_active_stores()
+    geo, norm = _stage_geo_norm(parsed)
+    await _stage_ensure_local_coverage(norm)
+    stores = await _stage_load_stores()
 
     prioritize_physical_locals = should_prioritize_physical_local_shops(geo, norm)
     curated_city_local_domains = (
@@ -415,560 +250,90 @@ async def run_vinyl_search(query: str) -> dict[str, Any]:
         else frozenset()
     )
 
-    core_query, tavily_relaxation_queries = plan_tavily_query_strings(
-        parsed.artist,
-        album_title,
-        country_code_for_variants=norm.resolved_country,
-        resolved_city=norm.resolved_city,
-    )
-
-    tier_queue = list(tier_fallback_order(geo, norm))
-    tier_ix = 0
-    executed_global_fallback = False
-
-    aggregated: dict[str, Any] = {}
-    listing_tier_map: dict[str, Tier] = {}
-    store_lookup: dict[str, StoreEntry] = {}
-    editorial_discovery_blocked: set[str] = set()
-    # Per-URL LLM verdict on whether the listing's title actually names the
-    # target release. Populated only for city-tier ``local_shop`` rows so the
-    # +500 indie bonus doesn't fire on wrong-album local listings.
-    album_match_by_url: dict[str, bool] = {}
-    verifier_summary: list[dict[str, Any]] = []
-    extract_report: ExtractListingsReport | None = None
-    last_tier: Tier = "continental"
-    tiers_attempted: list[Tier] = []
-    tier_traces: list[dict[str, Any]] = []
+    core_query, tavily_relaxation_queries = _plan_queries(parsed, album_title, norm)
 
     all_allowed = frozenset(
         normalize_whitelist_domain(s.domain) for s in stores if getattr(s, "domain", None)
     )
 
-    while True:
-        if tier_ix < len(tier_queue):
-            tier = tier_queue[tier_ix]
-            tier_ix += 1
-            widening_reason = "planned_tier"
-        elif (
-            not aggregated
-            and not executed_global_fallback
-            and "global" not in tier_queue
-        ):
-            tier = "global"
-            executed_global_fallback = True
-            widening_reason = "fallback_no_results"
-        else:
-            break
-
-        tiers_attempted.append(tier)
-
-        pool = filter_stores_for_tier(stores, geo, tier, norm=norm)
-        sorted_pool = sort_stores_for_tier(pool, geo, tier, norm=norm)
-        max_d = max_domains_for_tier(
-            tier,
-            local_max=settings.pipeline_geo_local_max_domains,
-            regional_max=settings.pipeline_geo_regional_max_domains,
-            global_max=settings.pipeline_geo_global_max_domains,
-        )
-
-        capped = cap_stores(sorted_pool, max_domains=max_d)
-        capped = _dedupe_store_entries_by_domain(capped)
-
-        min_dom = _MIN_STORE_DOMAINS_CITY if tier == "city" else _MIN_STORE_DOMAINS_DEFAULT
-        if len(capped) < min_dom:
-            logger.info(
-                "tier_skipped_low_signal",
-                extra={"tier": tier, "domains": len(capped)},
-            )
-            with stage_timer("geo_tier", input={"tier": tier}) as rec:
-                rec.status = "empty"
-                rec.output = {
-                    "tier": tier,
-                    "selected_domains": [s.domain for s in capped],
-                    "pool_size": len(pool),
-                    "store_types": _store_type_distribution(capped),
-                    "min_domain_floor": min_dom,
-                    "widening_reason": widening_reason,
-                    "early_stop": False,
-                    "skipped": True,
-                    "skip_reason": "below_min_domain_floor",
-                    "geo_confidence": round(float(norm.confidence), 3),
-                }
-            continue
-
-        tier_lookup = {normalize_whitelist_domain(s.domain): s for s in capped}
-
-        for dom, row in tier_lookup.items():
-            store_lookup[dom] = row
-
-        store_domains = [normalize_whitelist_domain(s.domain) for s in capped if s.domain]
-
-        domains_for_tavily = [
-            d for d in store_domains if d and normalize_whitelist_domain(d) not in editorial_discovery_blocked
-        ]
-        if not domains_for_tavily:
-            domains_for_tavily = store_domains
-
-        tkey = build_tavily_tier_cache_key(
-            artist=parsed.artist,
-            album_title=album_title or "",
-            tier=tier,
-        )
-
-        cached_raw = await get_cached_tavily_tier_payload(tkey)
-        cache_hit = cached_raw is not None
-
-        # Visibility hook for the local-first audit: dump the exact
-        # ``include_domains`` payload we are about to send to Tavily. This is
-        # the canonical place to verify that newly-discovered domains (e.g.
-        # ``misbits.ro``, ``phono.cz``) are actually included in the request.
-        logger.info(
-            "tavily_include_domains",
-            extra={
-                "stage": "tavily",
-                "tier": tier,
-                "core_query": core_query,
-                "include_domains_count": len(domains_for_tavily),
-                "include_domains": domains_for_tavily,
-                "cache_hit": cache_hit,
-            },
-        )
-
-        with stage_timer("tavily") as rec:
-            rec.input = {
-                "tier": tier,
-                "include_domains": domains_for_tavily,
-                "cache_hit": cache_hit,
-            }
-            if cache_hit:
-                raw_results = [SearchResult.model_validate(x) for x in (cached_raw or [])]
-            else:
-                raw_results, _ = await run_tavily_for_store_domains(
-                    core_query,
-                    domains_for_tavily,
-                    tier=tier,
-                    relaxation_queries=tavily_relaxation_queries,
-                )
-
-        # Local site-search fanout — only in the city tier. The batched Tavily
-        # call above gives every store one shared slate; the fanout below gives
-        # EACH indie local domain its own ``include_domains=[domain]`` request
-        # so deep PDPs surface on small shops that get drowned out in batches.
-        local_site_count = 0
-        local_site_kept = 0
-        if tier == "city":
-            local_domains_for_fanout = [
-                normalize_whitelist_domain(s.domain)
-                for s in capped
-                if s.domain and s.store_type == "local_shop"
-            ]
-            local_domains_for_fanout = [d for d in local_domains_for_fanout if d]
-            if local_domains_for_fanout:
-                logger.info(
-                    "tavily_local_fanout_start",
-                    extra={
-                        "stage": "tavily",
-                        "tier": tier,
-                        "core_query": core_query,
-                        "local_domains_count": len(local_domains_for_fanout),
-                        "local_domains": local_domains_for_fanout,
-                    },
-                )
-                with stage_timer("tavily_local_fanout") as rec_fan:
-                    fanout_results, n_calls = await run_local_site_searches(
-                        core_query,
-                        local_domains_for_fanout,
-                        tier=tier,
-                        artist=parsed.artist,
-                        album_title=album_title or "",
-                    )
-                    rec_fan.input = {
-                        "tier": tier,
-                        "local_domains": local_domains_for_fanout,
-                    }
-                    rec_fan.output = {
-                        "http_calls": n_calls,
-                        "kept": len(fanout_results),
-                    }
-                    rec_fan.status = "success" if fanout_results else "empty"
-                local_site_count = n_calls
-                local_site_kept = len(fanout_results)
-
-                # Merge fanout results into raw_results (URL-dedup, keep top score).
-                existing_by_url: dict[str, SearchResult] = {
-                    normalize_url(r.url): r for r in raw_results
-                }
-                for r in fanout_results:
-                    k = normalize_url(r.url)
-                    prev = existing_by_url.get(k)
-                    if prev is None or r.score > prev.score:
-                        existing_by_url[k] = r
-                raw_results = list(existing_by_url.values())
-
-        with stage_timer("extract") as rec:
-            extract_report = await extract_listings(
-                [r.model_dump() for r in raw_results],
-                artist=parsed.artist,
-                album=album_title,
-                allowed_domains=set(domains_for_tavily),
-                snippet_relax_hosts=curated_city_local_domains,
-            )
-            listings = extract_report.listings
-            rec.output = {
-                "tier": tier,
-                "raw_results_in": len(raw_results),
-                "listings_out": len(listings),
-                "diagnostic": extract_report.diagnostic,
-            }
-
-        if extract_report is not None and extract_report.diagnostic.get("deterministic_miss"):
-            editorial_discovery_blocked.update(
-                editorial_discovery_blocked_hosts_from_raw_results(
-                    raw_results,
-                    deterministic_failed=True,
-                ),
-            )
-
-        with stage_timer("validate") as rec:
-            batch = _dedupe_listings_by_normalized_url(listings)
-
-        accepted: list[Any] = []
-        rejected_reasons: list[dict[str, str]] = []
-        # Local-First Strike: a row from the city tier whose host resolves to a
-        # ``local_shop`` whitelist row passes the validator with relaxed fuzz floors.
-        for lst in batch:
-            enriched = lst.model_copy(
-                update={
-                    "validation_album": album_title,
-                    "validation_artist": parsed.artist,
-                }
-            )
-            relaxed = False
-            enriched_url = str(getattr(enriched, "url", "") or "")
-            host_tier = resolve_store_for_url(enriched_url, tier_lookup)
-            if tier == "city" and host_tier is not None and host_tier.store_type == "local_shop":
-                relaxed = True
-            elif prioritize_physical_locals and qualifies_as_target_city_local_shop(
-                listing_url=enriched_url,
-                store_lookup=store_lookup,
-                norm=norm,
-            ):
-                relaxed = True
-            if tier == "global":
-                snip = getattr(enriched, "source_snippet", None)
-                if not global_fallback_matches_parsed_entity(
-                    listing_title=str(getattr(enriched, "title", "") or ""),
-                    source_snippet=snip if isinstance(snip, str) else None,
-                    validation_artist=parsed.artist,
-                    validation_album=album_title or "",
-                ):
-                    rejected_reasons.append(
-                        {
-                            "url": str(getattr(enriched, "url", ""))[:160],
-                            "title": str(getattr(enriched, "title", ""))[:120],
-                            "reason": "global_fallback_core_entity_mismatch",
-                        }
-                    )
-                    continue
-            if not validate_listing(
-                enriched,
-                allowed_domains=all_allowed,
-                relaxed_local_indie=relaxed,
-            ):
-                rejected_reasons.append(
-                    {
-                        "url": str(getattr(enriched, "url", ""))[:160],
-                        "title": str(getattr(enriched, "title", ""))[:120],
-                    }
-                )
-                continue
-            accepted.append(enriched)
-
-        # Title verification — only for city-tier ``local_shop`` rows. These
-        # are the same rows that get the +500 indie bonus, so a wrong-album
-        # title here would unfairly dominate. We LLM-confirm each title still
-        # names the requested release. Verdicts:
-        #   * "reject"   -> drop the row entirely from this tier.
-        #   * "confirmed"-> mark ``album_match_by_url[url] = True`` (bonus eligible).
-        #   * "unsure"   -> mark False (no bonus, no drop).
-        if tier == "city" and accepted:
-            to_verify: list[Any] = []
-            for lst in accepted:
-                url = str(getattr(lst, "url", "") or "")
-                host_store = resolve_store_for_url(url, tier_lookup)
-                if host_store is not None and host_store.store_type == "local_shop":
-                    to_verify.append(lst)
-
-            if to_verify:
-                with stage_timer("verify_album_match") as rec_v:
-                    rec_v.input = {
-                        "tier": tier,
-                        "candidates": len(to_verify),
-                        "album_title": album_title or "",
-                        "artist": parsed.artist,
-                    }
-                    verdicts = await verify_album_match(
-                        to_verify,
-                        artist=parsed.artist,
-                        album_title=album_title or "",
-                    )
-                    rec_v.output = {
-                        "verdicts_returned": len(verdicts),
-                        "rejected": sum(
-                            1 for v in verdicts.values() if v.verdict == "reject"
-                        ),
-                        "confirmed": sum(
-                            1 for v in verdicts.values() if v.verdict == "confirmed"
-                        ),
-                        "unsure": sum(
-                            1 for v in verdicts.values() if v.verdict == "unsure"
-                        ),
-                    }
-                    rec_v.status = "success" if verdicts else "empty"
-
-                # Drop rejects, mark confirmed/unsure for downstream scoring.
-                surviving: list[Any] = []
-                for lst in accepted:
-                    url = str(getattr(lst, "url", "") or "")
-                    host_store = resolve_store_for_url(url, tier_lookup)
-                    is_local = (
-                        host_store is not None
-                        and host_store.store_type == "local_shop"
-                    )
-                    if not is_local:
-                        surviving.append(lst)
-                        continue
-                    v = verdicts.get(url)
-                    if v is None:
-                        # Verifier silently skipped this row → treat as unsure
-                        # (keep, no bonus).
-                        album_match_by_url[url] = False
-                        album_match_by_url[normalize_url(url)] = False
-                        surviving.append(lst)
-                        continue
-                    if v.verdict == "reject":
-                        keep_physical_local_despite_strict_reject = (
-                            prioritize_physical_locals
-                            and qualifies_as_target_city_local_shop(
-                                listing_url=url,
-                                store_lookup=store_lookup,
-                                norm=norm,
-                            )
-                        )
-                        if keep_physical_local_despite_strict_reject:
-                            album_match_by_url[url] = False
-                            album_match_by_url[normalize_url(url)] = False
-                            verifier_summary.append(
-                                {
-                                    "tier": tier,
-                                    "url": url[:160],
-                                    "verdict": "reject_soft_kept",
-                                    "reason": v.reason[:120],
-                                }
-                            )
-                            surviving.append(lst)
-                            continue
-                        rejected_reasons.append(
-                            {
-                                "url": url[:160],
-                                "title": str(getattr(lst, "title", ""))[:120],
-                                "reason": f"verify_album_match:{v.reason[:80]}",
-                            }
-                        )
-                        verifier_summary.append(
-                            {
-                                "tier": tier,
-                                "url": url[:160],
-                                "verdict": "reject",
-                                "reason": v.reason[:120],
-                            }
-                        )
-                        continue
-                    album_match_by_url[url] = v.verdict == "confirmed"
-                    album_match_by_url[normalize_url(url)] = v.verdict == "confirmed"
-                    surviving.append(lst)
-                    verifier_summary.append(
-                        {
-                            "tier": tier,
-                            "url": url[:160],
-                            "verdict": v.verdict,
-                            "reason": v.reason[:120],
-                        }
-                    )
-                accepted = surviving
-
-        accepted_this_tier_urls: list[str] = []
-        for lst in accepted:
-            k = normalize_url(str(lst.url))
-            prev_tier = listing_tier_map.get(k)
-            if prev_tier is None or TIER_NARROWNESS[tier] < TIER_NARROWNESS[prev_tier]:
-                aggregated[k] = lst
-                listing_tier_map[k] = tier
-                accepted_this_tier_urls.append(k)
-
-        last_tier = tier
-
-        need = _effective_stop_floor(tier, settings=settings, confidence=norm.confidence)
-        early_stop = len(aggregated) >= need
-
-        tier_trace = {
-            "tier": tier,
-            "widening_reason": widening_reason,
-            "pool_size": len(pool),
-            "selected_domains": [s.domain for s in capped],
-            "store_types": _store_type_distribution(capped),
-            "tavily_raw": len(raw_results),
-            "tavily_cache_hit": cache_hit,
-            "tavily_local_fanout_calls": local_site_count,
-            "tavily_local_fanout_kept": local_site_kept,
-            "listings_extracted": len(listings),
-            "listings_accepted": len(accepted),
-            "listings_rejected": len(rejected_reasons),
-            "rejected_sample": rejected_reasons[:5],
-            "accepted_urls": accepted_this_tier_urls[:10],
-            "aggregated_running_total": len(aggregated),
-            "stop_floor": need,
-            "geo_confidence": round(float(norm.confidence), 3),
-            "early_stop": early_stop,
-            "skipped": False,
-        }
-        tier_traces.append(tier_trace)
-
-        with stage_timer("geo_tier", input={"tier": tier}) as rec:
-            rec.output = tier_trace
-
-        if early_stop:
-            break
-
-    list_out = list(aggregated.values())
-
-    # Local-First Strike — generic indie vs target-city indie signals.
-    def _row_store(lst: Any) -> StoreEntry | None:
-        return resolve_store_for_url(str(getattr(lst, "url", "") or ""), store_lookup)
-
-    generic_any_local_shop_present = any(
-        (s := _row_store(r)) is not None and s.store_type == "local_shop"
-        for r in list_out
-    )
-    primary_target_local_shop_present = pool_has_qualifying_physical_local_row(
-        list_out,
-        store_lookup=store_lookup,
+    tier_queue = list(tier_fallback_order(geo, norm))
+    ctx = TierContext(
+        parsed=parsed,
+        album_title=album_title,
+        geo=geo,
         norm=norm,
+        stores=stores,
+        settings=settings,
+        core_query=core_query,
+        tavily_relaxation_queries=tavily_relaxation_queries,
+        curated_city_local_domains=curated_city_local_domains,
+        prioritize_physical_locals=prioritize_physical_locals,
+        all_allowed=all_allowed,
     )
-    pool_for_giant_penalty = (
-        primary_target_local_shop_present
-        if prioritize_physical_locals
-        else generic_any_local_shop_present
+    state = TierLoopState()
+
+    executed_global_fallback = await _run_tier_loop(ctx, state, tier_queue)
+
+    # ---- Post-loop finalisation -----------------------------------------
+    list_out = list(state.aggregated.values())
+
+    (
+        generic_any_local_shop_present,
+        primary_target_local_shop_present,
+        pool_for_giant_penalty,
+    ) = compute_local_shop_signals(
+        list_out,
+        store_lookup=state.store_lookup,
+        norm=norm,
+        prioritize_physical_locals=prioritize_physical_locals,
     )
 
-    sorted_listings = sort_validated_listings_geo(
+    deduped_listings, head, domain_drops = sort_dedupe_and_cap_listings(
         list_out,
-        store_by_domain=store_lookup,
+        store_lookup=state.store_lookup,
         norm=norm,
-        listing_tier_map=listing_tier_map,
+        listing_tier_map=state.listing_tier_map,
         album_title=album_title or "",
         artist=parsed.artist,
-        local_present_in_pool=pool_for_giant_penalty,
-        album_match_by_url=album_match_by_url,
-        prioritize_physical_city_locals=prioritize_physical_locals,
-    )
-
-    # HHV duplicate fix: collapse same-domain rows down to the top-ranked one
-    # BEFORE the local-first cap runs, so that "5x hhv.de" can never crowd out
-    # five separate indie shops just because Tavily liked one giant catalogue.
-    # Prefer the listing that best evidences the requested album (plus verifier flags),
-    # instead of blindly keeping the first composite-ranked row on that host.
-    deduped_listings, domain_drops = _dedupe_listings_by_domain(
-        sorted_listings,
-        store_by_domain=store_lookup,
-        album_title=album_title,
-        artist=parsed.artist,
-        album_match_by_url=(album_match_by_url if len(album_match_by_url) > 0 else None),
-    )
-
-    # Result capping: when locals exist, hold non-indie store types to the cap
-    # BEFORE truncating to ``pipeline_max_results``.
-    head = _apply_local_first_caps(
-        deduped_listings,
-        store_by_domain=store_lookup,
-        generic_local_shop_present_in_pool=generic_any_local_shop_present,
-        prioritize_physical_locals=prioritize_physical_locals,
+        album_match_by_url=state.album_match_by_url,
+        pool_for_giant_penalty=pool_for_giant_penalty,
+        generic_any_local_shop_present=generic_any_local_shop_present,
         primary_target_local_shop_present=primary_target_local_shop_present,
+        prioritize_physical_locals=prioritize_physical_locals,
         max_results=settings.pipeline_max_results,
     )
 
-    breakdowns: list[ListingRankBreakdown] = []
-    for lst in head:
-        u = str(getattr(lst, "url", "") or "")
-        nk = normalize_url(u)
-        st = resolve_store_for_url(u, store_lookup)
-        tier_for = listing_tier_map.get(nk, last_tier)
-        confirmed = album_match_by_url.get(u, album_match_by_url.get(nk, True))
-        breakdowns.append(
-            composite_listing_score(
-                lst,
-                store=st,
-                discovery_tier=tier_for,
-                resolved_country=norm.resolved_country,
-                resolved_city=norm.resolved_city,
-                album_title=album_title or "",
-                artist=parsed.artist,
-                local_present_in_pool=pool_for_giant_penalty,
-                album_match_confirmed=confirmed,
-            )
-        )
+    breakdowns = score_final_listings(
+        head,
+        store_lookup=state.store_lookup,
+        listing_tier_map=state.listing_tier_map,
+        last_tier=state.last_tier,
+        album_match_by_url=state.album_match_by_url,
+        norm=norm,
+        album_title=album_title or "",
+        artist=parsed.artist,
+        pool_for_giant_penalty=pool_for_giant_penalty,
+    )
 
-    with stage_timer("ranking") as rec:
-        avg_total = (
-            round(sum(b.total for b in breakdowns) / len(breakdowns), 3)
-            if breakdowns
-            else 0.0
-        )
-        rec.output = {
-            "scored_count": len(breakdowns),
-            "avg_total_points": avg_total,
-            "breakdowns": [
-                {
-                    "url": str(getattr(lst, "url", ""))[:200],
-                    "title": str(getattr(lst, "title", ""))[:160],
-                    **b.as_dict(),
-                }
-                for lst, b in zip(head, breakdowns, strict=True)
-            ],
-        }
-
-    with stage_timer("geo_widening_summary") as rec:
-        rec.output = {
-            "tiers_planned": list(tier_queue),
-            "tiers_attempted": tiers_attempted,
-            "executed_global_fallback": executed_global_fallback,
-            "total_validated": len(aggregated),
-            "after_domain_dedupe": len(deduped_listings),
-            "domain_duplicates_dropped": domain_drops,
-            "final_returned": len(head),
-            "local_present_in_pool": generic_any_local_shop_present,
-            "primary_target_city_local_shop_present": primary_target_local_shop_present,
-            "prioritize_physical_local_shops": prioritize_physical_locals,
-            "giant_penalty_pool_active": pool_for_giant_penalty,
-            "local_first_caps": {
-                "regional_ecommerce_max": (
-                    _MAX_REGIONAL_WHEN_PRIORITIZED_PRIMARY_LOCAL_PRESENT
-                    if prioritize_physical_locals and primary_target_local_shop_present
-                    else _MAX_REGIONAL_WHEN_LOCAL_PRESENT
-                ),
-                "marketplace_max": _MAX_MARKETPLACE_WHEN_LOCAL_PRESENT,
-            },
-            "verifier_summary": verifier_summary[:25],
-            "verifier_totals": {
-                "confirmed": sum(1 for v in verifier_summary if v["verdict"] == "confirmed"),
-                "reject": sum(1 for v in verifier_summary if v["verdict"] == "reject"),
-                "unsure": sum(1 for v in verifier_summary if v["verdict"] == "unsure"),
-            },
-            "per_tier": tier_traces,
-        }
+    emit_ranking_trace(head, breakdowns)
+    emit_widening_summary_trace(
+        tier_queue=tier_queue,
+        tiers_attempted=state.tiers_attempted,
+        executed_global_fallback=executed_global_fallback,
+        aggregated=state.aggregated,
+        deduped_listings=deduped_listings,
+        domain_drops=domain_drops,
+        head=head,
+        generic_any_local_shop_present=generic_any_local_shop_present,
+        primary_target_local_shop_present=primary_target_local_shop_present,
+        prioritize_physical_locals=prioritize_physical_locals,
+        pool_for_giant_penalty=pool_for_giant_penalty,
+        verifier_summary=state.verifier_summary,
+        tier_traces=state.tier_traces,
+    )
 
     api_rows = [
-        _listing_to_api_row(listing, breakdown=breakdown)
+        listing_to_api_row(listing, breakdown=breakdown)
         for listing, breakdown in zip(head, breakdowns, strict=True)
     ]
 

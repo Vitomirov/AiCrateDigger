@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     tavily_min_result_score: float = Field(default=0.16, ge=0.0, le=1.0)
     #: Raw Tavily JSON cached per (artist, album, tier) before extraction; min 12h.
     tavily_intermediate_cache_ttl_seconds: int = Field(default=43200, ge=43200)
+    #: Tavily intermittently returns 429 / 432 / 433 under burst traffic; retry before giving up.
+    tavily_http_retry_attempts: int = Field(default=5, ge=1, le=10)
+    tavily_http_retry_max_wait_seconds: float = Field(default=14.0, ge=1.0, le=120.0)
+    #: City-tier local fanout fires one asyncio task per shop; cap concurrency to avoid 432 storms.
+    tavily_max_concurrent_domain_fanout: int = Field(default=2, ge=1, le=8)
     pipeline_max_results: int = Field(default=4, ge=1, le=50)
     #: Geo-aware ``include_domains`` caps (query text stays location-free).
     pipeline_geo_local_max_domains: int = Field(default=6, ge=1, le=12)

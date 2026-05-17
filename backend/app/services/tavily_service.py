@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
 from collections.abc import Iterable, Sequence
 from urllib.parse import urlparse, urlsplit, urlunsplit
@@ -47,6 +48,81 @@ def is_valid_result(url: str) -> bool:
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 MAX_RESULTS_PER_QUERY = 8
 REQUEST_TIMEOUT_SECONDS = 15.0
+
+#: Tavily uses 432/433 for account / rate pressure; 429/503 are generic overload signals.
+_RETRYABLE_TAVILY_STATUS: frozenset[int] = frozenset({429, 432, 433, 503})
+
+
+async def _fetch_tavily_results_body(
+    client: httpx.AsyncClient,
+    payload: dict[str, object],
+    *,
+    query_for_log: str,
+) -> dict[str, object] | None:
+    """POST to Tavily search; retry with backoff on transient rate / quota responses."""
+    settings = get_settings()
+    max_attempts = int(settings.tavily_http_retry_attempts)
+    max_wait = float(settings.tavily_http_retry_max_wait_seconds)
+
+    for attempt in range(max_attempts):
+        try:
+            response = await client.post(TAVILY_SEARCH_URL, json=payload)
+        except httpx.RequestError as exc:
+            logger.warning(
+                "tavily_request_error",
+                extra={
+                    "stage": "tavily",
+                    "attempt": attempt + 1,
+                    "reason": str(exc),
+                    "query": query_for_log[:160],
+                },
+            )
+            if attempt < max_attempts - 1:
+                delay = min(max_wait, 0.35 * (2**attempt))
+                await asyncio.sleep(delay * (0.85 + 0.3 * random.random()))
+                continue
+            return None
+
+        if response.status_code in _RETRYABLE_TAVILY_STATUS:
+            logger.warning(
+                "tavily_rate_limited",
+                extra={
+                    "stage": "tavily",
+                    "status_code": response.status_code,
+                    "attempt": attempt + 1,
+                    "query": query_for_log[:160],
+                },
+            )
+            if attempt < max_attempts - 1:
+                delay = min(max_wait, 0.45 * (2**attempt))
+                await asyncio.sleep(delay * (0.85 + 0.3 * random.random()))
+                continue
+            return None
+
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "tavily_http_error",
+                extra={
+                    "stage": "tavily",
+                    "status_code": response.status_code,
+                    "reason": str(exc),
+                    "query": query_for_log[:160],
+                },
+            )
+            return None
+
+        try:
+            return response.json()
+        except Exception:
+            logger.exception(
+                "tavily_json_decode",
+                extra={"stage": "tavily", "query": query_for_log[:160]},
+            )
+            return None
+
+    return None
 # Tavily-reported relevance below this is usually noise (wrong artist/topic).
 # Default is overridden by ``Settings.tavily_min_result_score`` at runtime.
 
@@ -267,20 +343,19 @@ async def _search_single_query(
         per_query_threshold = _whitelist_include_domains_threshold(min_score_base)
 
     with stage_timer("tavily", input={"query": query}) as rec:
-        try:
-            response = await client.post(TAVILY_SEARCH_URL, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPError as exc:
+        data = await _fetch_tavily_results_body(client, payload, query_for_log=query)
+        if data is None:
             rec.status = "fail"
-            rec.error = f"{type(exc).__name__}: {exc}"
+            rec.error = "tavily_request_failed_after_retries"
             logger.warning(
                 "tavily_http_error",
-                extra={"stage": "tavily", "status": "fail", "reason": rec.error, "query": query},
+                extra={
+                    "stage": "tavily",
+                    "status": "fail",
+                    "reason": rec.error,
+                    "query": query,
+                },
             )
-            return []
-        except Exception:
-            logger.exception("tavily_unexpected_error", extra={"stage": "tavily", "status": "fail"})
             return []
 
         raw_items = data.get("results", []) or []
@@ -464,10 +539,15 @@ async def run_tavily_for_store_domains(
     http_calls = 0
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        for _, q in enumerate(qs_plan):
+        for q_ix, q in enumerate(qs_plan):
+            if q_ix > 0:
+                # Relaxation rounds follow strict passes; brief pause reduces 429/432 bursts.
+                await asyncio.sleep(0.12)
             batch_lists: list[list[SearchResult]] = []
             batch_http = 0
-            for chunk in chunks:
+            for c_ix, chunk in enumerate(chunks):
+                if c_ix > 0:
+                    await asyncio.sleep(0.06)
                 logger.info(
                     "tavily_request",
                     extra={
@@ -583,6 +663,8 @@ async def run_local_site_searches(
     max_results = settings.tavily_max_results_per_batch
     aggregate_floor = _fanout_single_domain_threshold(float(settings.tavily_min_result_score))
 
+    sem = asyncio.Semaphore(max(1, int(settings.tavily_max_concurrent_domain_fanout)))
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         async def _one(domain: str) -> list[SearchResult]:
             logger.info(
@@ -629,7 +711,11 @@ async def run_local_site_searches(
                         merged[nk] = sr
             return list(merged.values())
 
-        gathered = await asyncio.gather(*[_one(d) for d in domains])
+        async def _bounded(domain: str) -> list[SearchResult]:
+            async with sem:
+                return await _one(domain)
+
+        gathered = await asyncio.gather(*[_bounded(d) for d in domains])
 
     unique_by_url: dict[str, SearchResult] = {}
     for res_list in gathered:
