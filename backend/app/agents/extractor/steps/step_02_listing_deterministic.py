@@ -6,7 +6,10 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.agents.extractor.evidence_alignment import evidence_blob_matches_target_release
+from app.agents.extractor.evidence_alignment import (
+    evidence_blob_matches_target_release,
+    url_path_evidence_text,
+)
 from app.agents.extractor.listing_domains import normalize_domain
 from app.agents.extractor.utils.price_currency import sniff_price_currency
 from app.domain.listing_schema import Listing
@@ -35,7 +38,11 @@ def deterministic_listings_from_candidates(
             continue
         raw_title = str(c.get("title") or "").strip()
         content = str(c.get("content") or "")
-        evidence_lc = (raw_title + " " + content).strip().lower()
+        slug_text = url_path_evidence_text(url)
+        # See ``step_04_merge_llm_listings.merge_llm_rows_into_listings`` —
+        # indie PDPs frequently put the album in the slug while leaving the
+        # snippet empty; treating the slug as evidence avoids a false miss.
+        evidence_lc = (raw_title + " " + content + " " + slug_text).strip().lower()
         if not evidence_blob_matches_target_release(
             evidence_lc,
             artist=artist,

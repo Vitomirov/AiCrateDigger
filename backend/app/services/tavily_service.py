@@ -25,7 +25,7 @@ from app.policies.search_dsl import (
     build_tavily_local_fanout_plain_album_query,
     build_tavily_local_fanout_plain_artist_album_query,
 )
-from app.policies.store_domain import canonical_store_domain
+from app.policies.store_domain import canonical_store_domain, is_valid_store_host
 from app.services.tavily_domain_batches import chunk_include_domains as _chunk_include_domains
 
 logger = logging.getLogger(__name__)
@@ -182,14 +182,33 @@ def _normalize_store_domain(domain: str) -> str | None:
 
 
 def _dedupe_domains(domains: list[str]) -> list[str]:
+    """Canonicalise, drop empties and any host that fails :func:`is_valid_store_host`.
+
+    Last line of defence before Tavily ``include_domains``: even if a placeholder
+    leaked past the store loader, it is filtered here and logged once per batch
+    so the noise is visible without breaking the request.
+    """
     seen: set[str] = set()
     out: list[str] = []
+    skipped_invalid: list[str] = []
     for raw in domains:
         n = _normalize_store_domain(raw)
         if n is None or n in seen:
             continue
+        if not is_valid_store_host(n):
+            skipped_invalid.append(n[:64])
+            continue
         seen.add(n)
         out.append(n)
+    if skipped_invalid:
+        logger.warning(
+            "tavily_skipped_invalid_include_domain",
+            extra={
+                "stage": "tavily",
+                "skipped_count": len(skipped_invalid),
+                "sample": skipped_invalid[:10],
+            },
+        )
     return out
 
 

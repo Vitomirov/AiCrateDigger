@@ -27,7 +27,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.config import get_settings
 from app.db.database import WhitelistStoreORM, session_factory
 from app.policies.geo_scope import country_to_region
-from app.policies.store_domain import canonical_store_domain
+from app.policies.store_domain import canonical_store_domain, is_valid_store_host
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +256,19 @@ async def _llm_extract_candidates(
             continue
         domain = canonical_store_domain(r.get("domain"))
         if not domain or domain in _DOMAIN_BLACKLIST:
+            continue
+        # Reject ``"none"``/``"unknown"``/single-label noise that GPT sometimes
+        # invents when no real domain appears in the snippets. Logging here makes
+        # the discovery LLM's failure modes visible without breaking the run.
+        if not is_valid_store_host(domain):
+            logger.info(
+                "store_discovery_invalid_domain_rejected",
+                extra={
+                    "stage": "store_discovery",
+                    "raw_domain": str(r.get("domain") or "")[:64],
+                    "normalized": domain[:64],
+                },
+            )
             continue
         name = str(r.get("name") or "").strip()
         if not name:

@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from app.config import get_settings
 from app.db.database import WhitelistStoreORM, session_factory
 from app.policies.eu_stores import ALLOWED_STORES, StoreEntry, StoreType, get_active_stores
-from app.policies.store_domain import canonical_store_domain
+from app.policies.store_domain import canonical_store_domain, is_valid_store_host
 
 ALLOWED_STORE_TYPES: frozenset[str] = frozenset({"local_shop", "regional_ecommerce", "marketplace"})
 
@@ -274,7 +274,31 @@ async def load_active_stores() -> tuple[StoreEntry, ...]:
     if not rows:
         return get_active_stores()
 
-    return tuple(_orm_to_entry(r) for r in rows)
+    entries: list[StoreEntry] = []
+    skipped_invalid: list[str] = []
+    for r in rows:
+        # Defence-in-depth: a placeholder/typo persisted in ``whitelist_stores``
+        # (most often from discovery LLM noise) must never reach Tavily — it
+        # would burn a request slot and yield zero hits.
+        if not is_valid_store_host(r.domain):
+            skipped_invalid.append(str(r.domain or "")[:64])
+            continue
+        entries.append(_orm_to_entry(r))
+
+    if skipped_invalid:
+        logger.warning(
+            "whitelist_stores_skipped_invalid_host",
+            extra={
+                "stage": "stores",
+                "skipped_count": len(skipped_invalid),
+                "sample": skipped_invalid[:10],
+            },
+        )
+
+    if not entries:
+        return get_active_stores()
+
+    return tuple(entries)
 
 
 # Default minimum number of ``local_shop`` rows a resolved city should have before

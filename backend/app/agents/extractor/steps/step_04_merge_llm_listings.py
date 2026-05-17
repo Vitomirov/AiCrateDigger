@@ -10,6 +10,7 @@ from app.agents.extractor.evidence_alignment import (
     evidence_blob_matches_target_release,
     listing_title_grounded_in_evidence,
     looks_like_pure_query_echo_title,
+    url_path_evidence_text,
 )
 from app.agents.extractor.intent_match import snippet_passes_release_intent
 from app.agents.extractor.listing_domains import normalize_domain
@@ -34,8 +35,23 @@ def merge_llm_rows_into_listings(
     diagnostic.setdefault("drop_evidence_target_miss_pdd", 0)
     diagnostic.setdefault("drop_llm_title_ungrounded", 0)
     diagnostic.setdefault("drop_query_echo_pick", 0)
+    diagnostic.setdefault("url_slug_evidence_used", 0)
 
-    by_url_blob = {c["url"]: (c["title"] + " " + c["content"]).lower() for c in candidates}
+    # Indie PDPs often encode artist+album in the URL slug while the SERP snippet
+    # is just the shop name. Including the slug as evidence material lets the
+    # intent/evidence gates ground on real information instead of dropping the
+    # row at ``drop_title_gate`` purely because Tavily returned a thin snippet.
+    by_url_blob: dict[str, str] = {}
+    slug_enriched = 0
+    for c in candidates:
+        snippet_blob = (c["title"] + " " + c["content"]).lower()
+        slug_text = url_path_evidence_text(c["url"])
+        if slug_text:
+            slug_enriched += 1
+            by_url_blob[c["url"]] = f"{snippet_blob} {slug_text}".strip()
+        else:
+            by_url_blob[c["url"]] = snippet_blob
+    diagnostic["url_slug_evidence_used"] = slug_enriched
     by_url_raw_title = {c["url"]: c["title"] for c in candidates}
     by_url_candidate = {c["url"]: c for c in candidates}
     allowed_urls = set(by_url_blob.keys())

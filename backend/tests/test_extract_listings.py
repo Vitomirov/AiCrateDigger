@@ -10,7 +10,11 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.agents.extractor import ExtractListingsReport, extract_listings
-from app.agents.extractor.evidence_alignment import evidence_blob_matches_target_release
+from app.agents.extractor.evidence_alignment import (
+    ascii_fold,
+    evidence_blob_matches_target_release,
+    url_path_evidence_text,
+)
 from app.agents.extractor.intent_match import intent_matches_snippet
 from app.agents.extractor.listing_domains import (
     host_matches_whitelist,
@@ -331,6 +335,141 @@ class TestArtistArticleVariants(unittest.TestCase):
                 album="Strange Days",
             )
         )
+
+
+class TestAsciiFoldRecall(unittest.TestCase):
+    """Diacritic-bearing queries (Polish, Scandinavian, Balkan…) must match
+    plain-ASCII catalogue text and vice versa, language-agnostic."""
+
+    def test_polish_l_with_stroke_folds_to_l(self) -> None:
+        self.assertEqual(ascii_fold("Mgła"), "mgla")
+        self.assertEqual(ascii_fold("MGŁA"), "mgla")
+
+    def test_scandinavian_and_serbian_letters_fold(self) -> None:
+        self.assertEqual(ascii_fold("Mørbid"), "morbid")
+        self.assertEqual(ascii_fold("Đorđe"), "dorde")
+        self.assertEqual(ascii_fold("straße"), "strasse")
+
+    def test_evidence_matches_across_diacritic_boundary(self) -> None:
+        # User typed plain ASCII artist; shop snippet uses the proper diacritic.
+        diacritic_blob = "mgła – exercises in futility 12'' vinyl in stock".lower()
+        self.assertTrue(
+            evidence_blob_matches_target_release(
+                diacritic_blob,
+                artist="Mgla",
+                album="Exercises in Futility",
+            )
+        )
+        # And the reverse direction (user typed diacritic, shop wrote ASCII).
+        ascii_blob = "mgla - exercises in futility lp pre-order".lower()
+        self.assertTrue(
+            evidence_blob_matches_target_release(
+                ascii_blob,
+                artist="Mgła",
+                album="Exercises in Futility",
+            )
+        )
+
+
+class TestUrlPathEvidenceText(unittest.TestCase):
+    def test_decodes_and_splits_slug_separators(self) -> None:
+        text = url_path_evidence_text(
+            "https://store.example.pl/produkty/mgla-exercises-in-futility-12-vinyl"
+        )
+        self.assertIn("mgla", text)
+        self.assertIn("exercises in futility", text)
+        self.assertIn("vinyl", text)
+
+    def test_percent_encoded_path_is_decoded(self) -> None:
+        text = url_path_evidence_text(
+            "https://store.example.pl/produkty/mg%C5%82a-exercises-in-futility"
+        )
+        # ``%C5%82`` is ``ł`` → folded to ``l``.
+        self.assertIn("mgla", text)
+
+    def test_empty_url_returns_empty_string(self) -> None:
+        self.assertEqual(url_path_evidence_text(""), "")
+        self.assertEqual(url_path_evidence_text("https://store.example.pl"), "")
+
+
+class TestThinSnippetSurvivesViaUrlSlug(unittest.TestCase):
+    """Indie PDP with bare-shop snippet + album-bearing URL slug should NOT be
+    dropped at ``drop_title_gate`` — the regression that produced
+    ``post_llm_all_dropped: drop_title_gate=15`` on real city-tier traces.
+
+    No specific artist/shop is hard-coded; the test uses a synthetic indie
+    storefront whose snippet only echoes the shop name (mirroring the real
+    Tavily symptom).
+    """
+
+    def test_url_slug_carries_evidence_when_snippet_is_thin(self) -> None:
+        host = "indie-shop.example.pl"
+        url = f"https://{host}/produkty/mgla-exercises-in-futility-12-vinyl-lp"
+        # Snippet barely has anything — just the shop's name + a vinyl token.
+        thin_snippet = "INDIE SHOP — winyl, płyty, indie"
+        candidates = [
+            {
+                "url": url,
+                "title": thin_snippet,
+                "content": "Indie record store. Płyty winylowe.",
+            }
+        ]
+        llm_rows = [
+            {
+                "url": url,
+                "title": "Mgła — Exercises in Futility 12'' Vinyl",
+                "price": 119.0,
+                "currency": "PLN",
+                "in_stock": True,
+                "store": host,
+            }
+        ]
+        diagnostic: dict = {
+            "drop_url_not_in_candidates": 0,
+            "drop_title_gate": 0,
+            "drop_pydantic": 0,
+            "drop_evidence_target_miss_pdd": 0,
+            "drop_llm_title_ungrounded": 0,
+            "drop_query_echo_pick": 0,
+        }
+        out = merge_llm_rows_into_listings(
+            llm_rows,
+            candidates,
+            artist="Mgła",
+            album="Exercises in Futility",
+            artist_l="mgła",
+            album_l="exercises in futility",
+            diagnostic=diagnostic,
+            snippet_relax_hosts=frozenset({host}),
+        )
+        self.assertEqual(len(out), 1, f"expected 1 listing kept; diagnostic={diagnostic}")
+        self.assertEqual(out[0].url, url)
+        self.assertEqual(diagnostic["drop_title_gate"], 0)
+        # Slug-derived evidence must be reported in the diagnostic for ops visibility.
+        self.assertEqual(diagnostic["url_slug_evidence_used"], 1)
+
+
+class TestPlaceholderDomainsDoNotPoisonTavily(unittest.TestCase):
+    """``_dedupe_domains`` is the last line of defence — verify placeholder
+    hosts emitted by the discovery LLM never reach ``include_domains``."""
+
+    def test_invalid_hosts_filtered_from_dedupe(self) -> None:
+        from app.services.tavily_service import _dedupe_domains  # noqa: PLC0415
+
+        kept = _dedupe_domains([
+            "groovierecords.com",
+            "none",
+            "unknown",
+            "not provided",
+            "",
+            "https://www.misbits.ro/produs/x",
+            "localhost",
+            "foo bar.com",
+        ])
+        self.assertIn("groovierecords.com", kept)
+        self.assertIn("misbits.ro", kept)
+        for bad in ("none", "unknown", "not provided", "", "localhost", "foo bar.com"):
+            self.assertNotIn(bad, kept)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from rapidfuzz import fuzz
 
-from app.agents.extractor.evidence_alignment import artist_fuzzy_best_vs_blob, artist_substring_in_blob
+from app.agents.extractor.evidence_alignment import (
+    artist_fuzzy_best_vs_blob,
+    artist_substring_in_blob,
+    ascii_fold,
+)
 from app.validators.listings import url_suggests_product_detail_page
 
 # Standard mega-retailer / rich-snippet blobs — album title often verbatim.
@@ -26,7 +30,11 @@ def intent_matches_snippet(
     album_l: str,
     relaxed_indie_candidate: bool = False,
 ) -> bool:
-    """Gate whether snippet text references the hunted release."""
+    """Gate whether snippet text references the hunted release.
+
+    Album/artist tokens and the blob are ASCII-folded before comparison so
+    diacritics (Polish ``ł``, Scandinavian ``ø``…) never cost a substring hit.
+    """
     rd = (
         (_RELAX_ARTIST_DETAIL_PDP, _RELAX_ALBUM_PDP_ONLY, _RELAX_ARTIST_ALBUM_IN_BLOB)
         if relaxed_indie_candidate
@@ -34,31 +42,35 @@ def intent_matches_snippet(
     )
     td_pdp_art, td_pdp_album, td_blob_art = rd
 
-    if album_l in blob:
-        if not artist_l:
+    folded_blob = ascii_fold(blob)
+    folded_album = ascii_fold(album_l)
+    folded_artist = ascii_fold(artist_l) if artist_l else ""
+
+    if folded_album and folded_album in folded_blob:
+        if not folded_artist:
             return True
-        if artist_substring_in_blob(artist_l, blob):
+        if artist_substring_in_blob(folded_artist, folded_blob):
             return True
         if url_suggests_product_detail_page(url):
-            if artist_fuzzy_best_vs_blob(artist_l, blob) >= td_pdp_art:
+            if artist_fuzzy_best_vs_blob(folded_artist, folded_blob) >= td_pdp_art:
                 return True
-        if artist_fuzzy_best_vs_blob(artist_l, blob) >= 58.0:
+        if artist_fuzzy_best_vs_blob(folded_artist, folded_blob) >= 58.0:
             return True
         return False
-    alb_fuzzy = float(max(fuzz.token_set_ratio(album_l, blob), fuzz.partial_ratio(album_l, blob)))
-    if alb_fuzzy >= 62.0 and artist_l:
-        if artist_substring_in_blob(artist_l, blob):
+    alb_fuzzy = float(max(fuzz.token_set_ratio(folded_album, folded_blob), fuzz.partial_ratio(folded_album, folded_blob)))
+    if alb_fuzzy >= 62.0 and folded_artist:
+        if artist_substring_in_blob(folded_artist, folded_blob):
             return True
-        if artist_fuzzy_best_vs_blob(artist_l, blob) >= 54.0:
+        if artist_fuzzy_best_vs_blob(folded_artist, folded_blob) >= 54.0:
             return True
     if not url_suggests_product_detail_page(url):
         return False
-    ab = max(fuzz.token_set_ratio(album_l, blob), fuzz.partial_ratio(album_l, blob))
+    ab = max(fuzz.token_set_ratio(folded_album, folded_blob), fuzz.partial_ratio(folded_album, folded_blob))
     if ab < td_pdp_album:
         return False
-    if not artist_l:
+    if not folded_artist:
         return True
-    return artist_fuzzy_best_vs_blob(artist_l, blob) >= td_blob_art
+    return artist_fuzzy_best_vs_blob(folded_artist, folded_blob) >= td_blob_art
 
 
 def snippet_passes_release_intent(
