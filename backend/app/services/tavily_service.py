@@ -312,6 +312,50 @@ def _host_matches_include_domain(netloc: str, allowed_domain: str) -> bool:
     return h == a or h.endswith("." + a)
 
 
+def enforce_include_domains_hosts(
+    results: list[SearchResult],
+    allowed_domains: Sequence[str],
+) -> list[SearchResult]:
+    """Drop rows whose registrable host is not under any ``allowed_domains`` entry.
+
+    Tavily occasionally ignores ``include_domains`` and surfaces global megastore
+    URLs; filtering here keeps the extractor honest without touching validation
+    thresholds (those domains never reach ``extract_listings``).
+    """
+    if not allowed_domains or not results:
+        return results
+    normed: list[str] = []
+    for d in allowed_domains:
+        n = _normalize_store_domain(d)
+        if n:
+            normed.append(n)
+    if not normed:
+        return results
+    kept: list[SearchResult] = []
+    leaked = 0
+    for r in results:
+        try:
+            netloc = urlparse(r.url).netloc or ""
+        except Exception:
+            leaked += 1
+            continue
+        if any(_host_matches_include_domain(netloc, d) for d in normed):
+            kept.append(r)
+        else:
+            leaked += 1
+    if leaked:
+        logger.info(
+            "tavily_include_domains_leak_filtered",
+            extra={
+                "stage": "tavily",
+                "dropped": leaked,
+                "kept": len(kept),
+                "allowed_count": len(normed),
+            },
+        )
+    return kept
+
+
 async def _search_single_query(
     client: httpx.AsyncClient,
     query: str,
@@ -582,6 +626,7 @@ async def run_tavily_for_store_domains(
     unique_by_url = aggregated or {}
 
     sorted_candidates = sorted(unique_by_url.values(), key=lambda x: x.score, reverse=True)
+    sorted_candidates = enforce_include_domains_hosts(sorted_candidates, domains)
     final_results: list[SearchResult] = []
     domain_counts: dict[str, int] = {}
     dropped_by_domain_cap = 0
@@ -710,6 +755,7 @@ async def run_local_site_searches(
                     aggregated[uk] = sr
 
         merged_primary = sorted(aggregated.values(), key=lambda x: x.score, reverse=True)
+        merged_primary = enforce_include_domains_hosts(merged_primary, domains)
 
         if merged_primary:
             final = merged_primary

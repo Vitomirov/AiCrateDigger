@@ -11,6 +11,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from collections.abc import Sequence
+
 from sqlalchemy import delete
 
 from app.config import get_settings
@@ -30,15 +32,38 @@ def hydrate_cached_pipeline_dict(cached: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_tavily_tier_cache_key(*, artist: str | None, album_title: str, tier: str) -> str:
-    """Cache raw Tavily hits per geography tier (before LLM extract)."""
+def build_tavily_tier_cache_key(
+    *,
+    artist: str | None,
+    album_title: str,
+    tier: str,
+    core_query: str = "",
+    include_domains: Sequence[str] | None = None,
+) -> str:
+    """Stable cache identity for raw Tavily SERP rows before extraction.
+
+    v2 incorporates ``core_query`` and the sorted ``include_domains`` fingerprint
+    so different Tavily query plans or domain batches never alias-incorrectly.
+    """
     import hashlib
 
+    dom_key = ""
+    if include_domains:
+        folded = sorted(
+            {
+                d.strip().lower().removeprefix("www.")
+                for d in include_domains
+                if (d or "").strip()
+            }
+        )
+        dom_key = "|".join(folded)
     parts = (
-        "tavily_tier_v1",
+        "tavily_tier_v2",
         (artist or "").strip().lower(),
         (album_title or "").strip().lower(),
         (tier or "").strip().lower(),
+        (core_query or "").strip().lower(),
+        dom_key,
     )
     raw = "\n".join(parts).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()

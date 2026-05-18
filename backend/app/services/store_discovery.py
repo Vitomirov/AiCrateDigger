@@ -33,6 +33,9 @@ from app.services.tavily_service import _fetch_tavily_results_body
 _TAVILY_TIMEOUT_S = 15.0
 _TAVILY_MAX_RESULTS = 10
 
+
+logger = logging.getLogger(__name__)
+
 #: Hosts that are never indie record shops — skipped before the LLM call.
 _DOMAIN_BLACKLIST: frozenset[str] = frozenset(
     {

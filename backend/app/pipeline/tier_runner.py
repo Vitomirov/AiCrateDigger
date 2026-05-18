@@ -21,6 +21,7 @@ The orchestrator in :mod:`app.pipeline.vinyl_search` only has to drive the
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,6 +31,7 @@ from app.agents.extractor.verify_album_match import verify_album_match
 from app.db.cache import (
     build_tavily_tier_cache_key,
     get_cached_tavily_tier_payload,
+    set_cached_tavily_tier_payload,
 )
 from app.domain.parse_schema import ParsedQuery
 from app.models.search_query import SearchResult
@@ -208,24 +210,38 @@ def _record_skipped_tier_trace(
 # ---------------------------------------------------------------------------
 
 
+def _merge_fanout_into_raw(
+    raw_results: list[SearchResult],
+    fanout_results: list[SearchResult],
+) -> list[SearchResult]:
+    """URL-dedup merge; higher Tavily score wins."""
+    existing_by_url: dict[str, SearchResult] = {
+        normalize_url(r.url): r for r in raw_results
+    }
+    for r in fanout_results:
+        k = normalize_url(r.url)
+        prev = existing_by_url.get(k)
+        if prev is None or r.score > prev.score:
+            existing_by_url[k] = r
+    return list(existing_by_url.values())
+
+
 async def _run_tavily_stage(
     ctx: TierContext,
     tier: Tier,
     domains_for_tavily: list[str],
-) -> tuple[list[SearchResult], bool]:
+) -> tuple[list[SearchResult], bool, str]:
     """Batched Tavily call (with per-tier cache) — wraps the ``tavily`` stage."""
     tkey = build_tavily_tier_cache_key(
         artist=ctx.parsed.artist,
         album_title=ctx.album_title or "",
         tier=tier,
+        core_query=ctx.core_query,
+        include_domains=domains_for_tavily,
     )
     cached_raw = await get_cached_tavily_tier_payload(tkey)
     cache_hit = cached_raw is not None
 
-    # Visibility hook for the local-first audit: dump the exact
-    # ``include_domains`` payload we are about to send to Tavily. This is
-    # the canonical place to verify that newly-discovered domains (e.g.
-    # ``misbits.ro``, ``phono.cz``) are actually included in the request.
     logger.info(
         "tavily_include_domains",
         extra={
@@ -254,23 +270,17 @@ async def _run_tavily_stage(
                 relaxation_queries=ctx.tavily_relaxation_queries,
             )
 
-    return raw_results, cache_hit
+    return raw_results, cache_hit, tkey
 
 
-async def _run_city_local_fanout(
+async def _city_fanout_fetch_only(
     ctx: TierContext,
     tier: Tier,
     capped: tuple[StoreEntry, ...],
-    raw_results: list[SearchResult],
 ) -> tuple[list[SearchResult], int, int]:
-    """City-tier only: consolidated multi-store Tavily power queries merged into ``raw_results``.
-
-    The batched Tavily call gives every store one shared slate; this stage adds targeted
-    ``site:``-rich queries executed in chunked parallel bursts (minimal HTTP credits versus
-    per-domain sequential fan-out).
-    """
+    """City-tier local_shop power queries only (no merge into batched SERP)."""
     if tier != "city":
-        return raw_results, 0, 0
+        return [], 0, 0
 
     local_domains_for_fanout = [
         normalize_whitelist_domain(s.domain)
@@ -279,7 +289,7 @@ async def _run_city_local_fanout(
     ]
     local_domains_for_fanout = [d for d in local_domains_for_fanout if d]
     if not local_domains_for_fanout:
-        return raw_results, 0, 0
+        return [], 0, 0
 
     logger.info(
         "tavily_local_fanout_start",
@@ -310,16 +320,76 @@ async def _run_city_local_fanout(
         }
         rec_fan.status = "success" if fanout_results else "empty"
 
-    # Merge fanout results into raw_results (URL-dedup, keep top score).
-    existing_by_url: dict[str, SearchResult] = {
-        normalize_url(r.url): r for r in raw_results
-    }
-    for r in fanout_results:
-        k = normalize_url(r.url)
-        prev = existing_by_url.get(k)
-        if prev is None or r.score > prev.score:
-            existing_by_url[k] = r
-    return list(existing_by_url.values()), n_calls, len(fanout_results)
+    return fanout_results, n_calls, len(fanout_results)
+
+
+def _unpack_gather_tavily(
+    result: tuple[list[SearchResult], bool, str] | Exception,
+) -> tuple[list[SearchResult], bool, str]:
+    if isinstance(result, Exception):
+        logger.error(
+            "tavily_batched_branch_failed",
+            exc_info=result,
+            extra={"stage": "tavily"},
+        )
+        return [], False, ""
+    return result
+
+
+def _unpack_gather_fanout(
+    result: tuple[list[SearchResult], int, int] | Exception,
+) -> tuple[list[SearchResult], int, int]:
+    if isinstance(result, Exception):
+        logger.error(
+            "tavily_city_fanout_branch_failed",
+            exc_info=result,
+            extra={"stage": "tavily_local_fanout"},
+        )
+        return [], 0, 0
+    return result
+
+
+async def _run_city_local_fanout(
+    ctx: TierContext,
+    tier: Tier,
+    capped: tuple[StoreEntry, ...],
+    raw_results: list[SearchResult],
+) -> tuple[list[SearchResult], int, int]:
+    """Sequential merge path when parallel gather is not used."""
+    fanout_results, n_calls, n_kept = await _city_fanout_fetch_only(ctx, tier, capped)
+    merged = _merge_fanout_into_raw(raw_results, fanout_results)
+    return merged, n_calls, n_kept
+
+
+async def _run_tavily_and_fanout_merged(
+    ctx: TierContext,
+    tier: Tier,
+    selection: _TierStoreSelection,
+) -> tuple[list[SearchResult], bool, str, int, int]:
+    """Tavily batched + city fanout concurrently when applicable; returns merged SERPs."""
+    domains_for_tavily = selection.domains_for_tavily
+    use_parallel = tier == "city" and any(
+        s.domain and s.store_type == "local_shop" for s in selection.capped
+    )
+
+    if use_parallel:
+        t_task = asyncio.create_task(
+            _run_tavily_stage(ctx, tier, domains_for_tavily),
+        )
+        f_task = asyncio.create_task(
+            _city_fanout_fetch_only(ctx, tier, selection.capped),
+        )
+        raw_tup, fan_tup = await asyncio.gather(t_task, f_task, return_exceptions=True)
+        raw_results, cache_hit, tkey = _unpack_gather_tavily(raw_tup)
+        fanout_results, local_site_count, local_site_kept = _unpack_gather_fanout(fan_tup)
+        merged = _merge_fanout_into_raw(raw_results, fanout_results)
+        return merged, cache_hit, tkey, local_site_count, local_site_kept
+
+    raw_results, cache_hit, tkey = await _run_tavily_stage(ctx, tier, domains_for_tavily)
+    merged, local_site_count, local_site_kept = await _run_city_local_fanout(
+        ctx, tier, selection.capped, raw_results
+    )
+    return merged, cache_hit, tkey, local_site_count, local_site_kept
 
 
 # ---------------------------------------------------------------------------
@@ -661,12 +731,23 @@ async def process_tier(
     for dom, row in selection.tier_lookup.items():
         state.store_lookup[dom] = row
 
-    raw_results, cache_hit = await _run_tavily_stage(
-        ctx, tier, selection.domains_for_tavily
+    raw_results, cache_hit, tkey, local_site_count, local_site_kept = (
+        await _run_tavily_and_fanout_merged(ctx, tier, selection)
     )
-    raw_results, local_site_count, local_site_kept = await _run_city_local_fanout(
-        ctx, tier, selection.capped, raw_results
-    )
+
+    if not cache_hit and raw_results and tkey:
+        try:
+            await set_cached_tavily_tier_payload(
+                tkey,
+                [r.model_dump() for r in raw_results],
+                ttl_seconds=max(60, int(ctx.settings.tavily_intermediate_cache_ttl_seconds)),
+            )
+        except Exception:
+            logger.warning(
+                "tavily_tier_cache_write_failed",
+                extra={"stage": "search_cache"},
+                exc_info=True,
+            )
 
     extract_report = await _run_extract_stage(
         ctx, tier, raw_results, selection.domains_for_tavily

@@ -9,7 +9,10 @@ from app.agents.extractor.listing_constants import LLM_MAX_INPUT, SMALL_BATCH_NO
 from app.agents.extractor.listing_domains import normalize_allowed_domains
 from app.agents.extractor.report import ExtractListingsReport
 from app.agents.extractor.steps.step_01_snippet_prefilter import collect_snippet_candidates
-from app.agents.extractor.steps.step_02_listing_deterministic import deterministic_listings_from_candidates
+from app.agents.extractor.steps.step_02_listing_deterministic import (
+    candidate_has_extractable_evidence_signal,
+    deterministic_listings_from_candidates,
+)
 from app.agents.extractor.steps.step_03_listing_llm_extract import llm_extract
 from app.agents.extractor.steps.step_04_merge_llm_listings import merge_llm_rows_into_listings
 
@@ -104,6 +107,24 @@ async def extract_listings(
 
         diagnostic["empty_reason"] = "deterministic_build_failed"
         diagnostic["deterministic_miss"] = True
+        if not any(
+            candidate_has_extractable_evidence_signal(
+                url=str(c.get("url") or ""),
+                raw_title=str(c.get("title") or ""),
+                raw_content=str(c.get("content") or ""),
+                artist=artist,
+                album=album,
+                artist_l=artist_l,
+                album_l=album_l,
+                snippet_relax_hosts=snippet_relax_hosts,
+            )
+            for c in candidates
+        ):
+            diagnostic["empty_reason"] = "llm_skipped_no_plausible_snippet_signal"
+            diagnostic["final_count"] = 0
+            _log_extraction_summary(diagnostic)
+            return ExtractListingsReport(listings=[], diagnostic=diagnostic)
+
         extracted, raw_json = await llm_extract(candidates[:LLM_MAX_INPUT], diagnostic)
         diagnostic["llm_rows_returned"] = len(extracted)
         diagnostic["extraction_mode"] = "deterministic_small_batch_llm_fallback"
@@ -133,6 +154,25 @@ async def extract_listings(
         diagnostic["final_count"] = len(out_list)
         _log_extraction_summary(diagnostic)
         return ExtractListingsReport(listings=out_list, diagnostic=diagnostic)
+
+    if not any(
+        candidate_has_extractable_evidence_signal(
+            url=str(c.get("url") or ""),
+            raw_title=str(c.get("title") or ""),
+            raw_content=str(c.get("content") or ""),
+            artist=artist,
+            album=album,
+            artist_l=artist_l,
+            album_l=album_l,
+            snippet_relax_hosts=snippet_relax_hosts,
+        )
+        for c in candidates
+    ):
+        diagnostic["extraction_mode"] = "llm_skipped"
+        diagnostic["empty_reason"] = "llm_skipped_no_plausible_snippet_signal"
+        diagnostic["final_count"] = 0
+        _log_extraction_summary(diagnostic)
+        return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
     diagnostic["extraction_mode"] = "llm"
     extracted, raw_json = await llm_extract(candidates[:LLM_MAX_INPUT], diagnostic)
