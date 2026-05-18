@@ -7,7 +7,8 @@ listings are gathered. This module owns one full iteration of that loop:
     1. Pick + cap stores for the tier (skip with a structured empty trace if
        there is not enough signal),
     2. Run batched Tavily for the selected domains (with per-tier cache),
-    3. In the city tier only, do a per-store Tavily fanout and merge it,
+    3. In the city tier only, chunked consolidated Tavily queries for local_shop
+       domains merge into the SERP artefact bundle,
     4. Run the extractor on the raw results,
     5. Run per-listing validation (with relaxed-local-indie rules),
     6. In the city tier only, run the LLM album-title verifier,
@@ -262,11 +263,11 @@ async def _run_city_local_fanout(
     capped: tuple[StoreEntry, ...],
     raw_results: list[SearchResult],
 ) -> tuple[list[SearchResult], int, int]:
-    """City-tier only: per-indie-store Tavily fanout, merged into ``raw_results``.
+    """City-tier only: consolidated multi-store Tavily power queries merged into ``raw_results``.
 
-    The batched Tavily call gives every store one shared slate; the fanout
-    gives EACH indie local domain its own ``include_domains=[domain]`` request
-    so deep PDPs surface on small shops that get drowned out in batches.
+    The batched Tavily call gives every store one shared slate; this stage adds targeted
+    ``site:``-rich queries executed in chunked parallel bursts (minimal HTTP credits versus
+    per-domain sequential fan-out).
     """
     if tier != "city":
         return raw_results, 0, 0
@@ -293,11 +294,11 @@ async def _run_city_local_fanout(
 
     with stage_timer("tavily_local_fanout") as rec_fan:
         fanout_results, n_calls = await run_local_site_searches(
-            ctx.core_query,
-            local_domains_for_fanout,
+            local_domains=local_domains_for_fanout,
             tier=tier,
             artist=ctx.parsed.artist,
             album_title=ctx.album_title or "",
+            fallback_country_iso=ctx.norm.resolved_country,
         )
         rec_fan.input = {
             "tier": tier,

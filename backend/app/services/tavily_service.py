@@ -21,13 +21,13 @@ import httpx
 from app.config import get_settings
 from app.models.search_query import SearchResult
 from app.pipeline_context import stage_timer
-from app.policies.search_dsl import (
-    build_tavily_local_fanout_narrow_query,
-    build_tavily_local_fanout_plain_album_query,
-    build_tavily_local_fanout_plain_artist_album_query,
-)
 from app.policies.store_domain import canonical_store_domain, is_valid_store_host
+from app.services.tavily_country_boost import tavily_country_from_iso3166_alpha2
 from app.services.tavily_domain_batches import chunk_include_domains as _chunk_include_domains
+from app.services.tavily_power_query import (
+    build_physical_power_query_base,
+    chunk_domains_for_power_queries,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +319,7 @@ async def _search_single_query(
     include_domains: list[str] | None = None,
     max_results: int | None = None,
     fanout_local_shop: bool = False,
+    country: str | None = None,
 ) -> list[SearchResult]:
     settings = get_settings()
     inc = include_domains if include_domains is not None else _include_domains_for_query(query)
@@ -332,6 +333,9 @@ async def _search_single_query(
         "max_results_per_query": max_r,
         "max_results_per_domain": settings.tavily_max_results_per_domain_aggregate,
     }
+    if country:
+        payload["topic"] = "general"
+        payload["country"] = country
     if inc:
         payload["include_domains"] = inc
 
@@ -499,7 +503,8 @@ async def run_tavily_for_store_domains(
     """Run Tavily with **hostname-only** ``include_domains``.
 
     * **≤ 20 domains:** exactly one HTTP POST (no chunking, no parallel calls).
-    * **> 20 domains:** chunks of 20, **sequential** requests, merged and deduped.
+    * **> threshold domains:** chunked hostname batches executed **concurrently**,
+      merged and deduped (one HTTP POST per chunk per query round).
 
     Optionally appends relaxation queries after the strict ``core_query`` when the first
     pass surfaces mostly editorial/hub artefacts.
@@ -543,28 +548,26 @@ async def run_tavily_for_store_domains(
             if q_ix > 0:
                 # Relaxation rounds follow strict passes; brief pause reduces 429/432 bursts.
                 await asyncio.sleep(0.12)
-            batch_lists: list[list[SearchResult]] = []
-            batch_http = 0
-            for c_ix, chunk in enumerate(chunks):
-                if c_ix > 0:
-                    await asyncio.sleep(0.06)
-                logger.info(
-                    "tavily_request",
-                    extra={
-                        "tier": tier,
-                        "domains": len(chunk),
-                        "query": q,
-                    },
+            logger.info(
+                "tavily_request_parallel",
+                extra={
+                    "tier": tier,
+                    "chunks": len(chunks),
+                    "domains": sum(len(c) for c in chunks),
+                    "query": q,
+                },
+            )
+            chunk_tasks = [
+                _search_single_query(
+                    client,
+                    q,
+                    include_domains=c,
+                    max_results=max_batch_results,
                 )
-                batch_lists.append(
-                    await _search_single_query(
-                        client,
-                        q,
-                        include_domains=chunk,
-                        max_results=max_batch_results,
-                    )
-                )
-                batch_http += 1
+                for c in chunks
+            ]
+            batch_lists = list(await asyncio.gather(*chunk_tasks))
+            batch_http = len(chunks)
             http_calls += batch_http
 
             round_unique = _apply_merge_floor_and_collect(batch_lists, merge_floor=merge_floor)
@@ -614,133 +617,130 @@ async def run_tavily_for_store_domains(
 
 
 async def run_local_site_searches(
-    core_query: str,
-    local_domains: list[str],
     *,
+    local_domains: list[str],
     tier: str | None = None,
     artist: str | None = None,
     album_title: str | None = None,
+    fallback_country_iso: str | None = None,
 ) -> tuple[list[SearchResult], int]:
-    """One-call-per-domain Tavily fanout for indie local shops.
+    """Low-credit city-tier local shop coverage using consolidated power queries.
 
-    Optionally runs a **narrow album-phrase** query in addition to the full ``core``
-    string—some EU storefront search indexes barely surface rows for long artist+album packs.
+    Step 1 — one Tavily POST per domain chunk: quoted artist/album + ``(vinyl OR LP)``
+    plus a ``(site:… OR …)`` group, with matching ``include_domains`` for structural
+    precision. Chunks run **concurrently** (``asyncio.gather``). City/country tokens
+    are never injected into the query string.
 
-    Per-request score floors relax when ``fanout_local_shop`` is enabled so SEO-sparse PDP
-    URLs are not clipped before merge.
-
-    Returns ``(deduplicated_results, http_call_count)``.
+    Step 2 — only when Step 1 returns no kept rows: a single open-web Tavily call with
+    the same quoted spine and optional Tavily ``country`` boost derived from ISO-3166.
     """
-    if not (core_query or "").strip() or not local_domains:
+    if not local_domains:
         return [], 0
 
     settings = get_settings()
-    q = core_query.strip()
     domains = _dedupe_domains(list(local_domains))
     if not domains:
         return [], 0
 
-    narrow = build_tavily_local_fanout_narrow_query(
+    power_base = build_physical_power_query_base(
         artist=artist,
-        album=album_title or "",
-    ).strip()
-    sub_queries: list[str] = [q]
-    seen_q = {q.lower()}
-    for extra in (
-        narrow,
-        build_tavily_local_fanout_plain_album_query(album_title or ""),
-        build_tavily_local_fanout_plain_artist_album_query(
-            artist=artist,
-            album=album_title or "",
-        ),
-    ):
-        x = (extra or "").strip()
-        if x and x.lower() not in seen_q:
-            seen_q.add(x.lower())
-            sub_queries.append(x)
-    queries_per_domain = len(sub_queries)
+        album_title=album_title or "",
+    )
+    if not (power_base or "").strip():
+        return [], 0
 
     max_results = settings.tavily_max_results_per_batch
-    aggregate_floor = _fanout_single_domain_threshold(float(settings.tavily_min_result_score))
+    min_score_base = float(settings.tavily_min_result_score)
+    merge_floor = _whitelist_include_domains_threshold(min_score_base)
 
-    sem = asyncio.Semaphore(max(1, int(settings.tavily_max_concurrent_domain_fanout)))
+    planner = chunk_domains_for_power_queries(
+        power_base,
+        domains,
+        max_chars=int(settings.tavily_power_query_max_chars),
+        max_domains_per_chunk=int(settings.tavily_local_power_max_domains_per_chunk),
+    )
+    logger.info(
+        "tavily_local_power_queries",
+        extra={
+            "stage": "tavily",
+            "tier": tier,
+            "domain_total": len(domains),
+            "chunks": len(planner),
+            "power_query_base": power_base[:180],
+        },
+    )
+
+    http_calls = 0
+    aggregated: dict[str, SearchResult] = {}
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        async def _one(domain: str) -> list[SearchResult]:
-            logger.info(
-                "tavily_local_site_search",
-                extra={
-                    "stage": "tavily",
-                    "tier": tier,
-                    "domain": domain,
-                    "queries": sub_queries,
-                },
+        if planner:
+
+            async def _one_chunk(dom_chunk: list[str], q_text: str) -> list[SearchResult]:
+                logger.info(
+                    "tavily_local_site_search",
+                    extra={
+                        "stage": "tavily",
+                        "tier": tier,
+                        "domains_in_chunk": len(dom_chunk),
+                        "query_head": q_text[:200],
+                    },
+                )
+                return await _search_single_query(
+                    client,
+                    q_text,
+                    include_domains=dom_chunk,
+                    max_results=max_results,
+                    fanout_local_shop=False,
+                )
+
+            chunk_lists = await asyncio.gather(*[_one_chunk(dc, qt) for dc, qt in planner])
+            chunk_lists = [
+                [r for r in bl if is_valid_result(r.url)] for bl in chunk_lists
+            ]
+            http_calls += len(planner)
+
+            merged_round = _apply_merge_floor_and_collect(
+                chunk_lists,
+                merge_floor=merge_floor,
             )
-            merged: dict[str, SearchResult] = {}
-            for subq in sub_queries:
-                try:
-                    batch = await _search_single_query(
-                        client,
-                        subq,
-                        include_domains=[domain],
-                        max_results=max_results,
-                        fanout_local_shop=True,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "tavily_local_site_search_failed",
-                        extra={
-                            "stage": "tavily",
-                            "tier": tier,
-                            "domain": domain,
-                            "sub_query": subq,
-                            "reason": str(exc),
-                        },
-                    )
-                    continue
-                for sr in batch:
-                    try:
-                        path_m = urlparse(normalize_url(sr.url)).path or "/"
-                    except Exception:
-                        path_m = "/"
-                    if _product_signal_multiplier(path_m) <= 0.0:
-                        continue
-                    nk = normalize_url(sr.url)
-                    prev = merged.get(nk)
-                    if prev is None or sr.score > prev.score:
-                        merged[nk] = sr
-            return list(merged.values())
+            for uk, sr in merged_round.items():
+                prev = aggregated.get(uk)
+                if prev is None or sr.score > prev.score:
+                    aggregated[uk] = sr
 
-        async def _bounded(domain: str) -> list[SearchResult]:
-            async with sem:
-                return await _one(domain)
+        merged_primary = sorted(aggregated.values(), key=lambda x: x.score, reverse=True)
 
-        gathered = await asyncio.gather(*[_bounded(d) for d in domains])
+        if merged_primary:
+            final = merged_primary
+        else:
+            tav_country = tavily_country_from_iso3166_alpha2(fallback_country_iso)
+            fb = await _search_single_query(
+                client,
+                power_base.strip(),
+                include_domains=None,
+                max_results=max_results,
+                fanout_local_shop=False,
+                country=tav_country,
+            )
+            fb = [r for r in fb if is_valid_result(r.url)]
+            http_calls += 1
+            uniq_fb = _apply_merge_floor_and_collect([fb], merge_floor=float(min_score_base))
+            aggregated = dict(uniq_fb)
+            final = sorted(aggregated.values(), key=lambda x: x.score, reverse=True)
 
-    unique_by_url: dict[str, SearchResult] = {}
-    for res_list in gathered:
-        for res in res_list:
-            if res.score < aggregate_floor:
-                continue
-            if not is_valid_result(res.url):
-                continue
-            existing = unique_by_url.get(res.url)
-            if existing is None or res.score > existing.score:
-                unique_by_url[res.url] = res
-
-    final = sorted(unique_by_url.values(), key=lambda x: x.score, reverse=True)
     logger.info(
         "tavily_local_aggregate",
         extra={
             "stage": "tavily",
             "tier": tier,
-            "domains": len(domains),
-            "queries_per_domain": queries_per_domain,
+            "domains_requested": len(domains),
+            "http_calls": http_calls,
             "kept": len(final),
             "top_domains": _top_domains(final, limit=5),
         },
     )
-    return final, len(domains) * queries_per_domain
+    return final, http_calls
 
 
 def _top_domains(results: list[SearchResult], *, limit: int) -> list[str]:

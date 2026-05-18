@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     tavily_search_depth: str = Field(default="basic", description='Tavily "search_depth" payload value')
     #: Split ``include_domains`` across parallel requests only when above this count (e.g. 21 → 2 calls).
     tavily_domain_chunk_threshold: int = Field(default=20, ge=8, le=100)
+    #: Consolidated ``site:`` power queries truncate before this approximate character budget.
+    tavily_power_query_max_chars: int = Field(default=400, ge=200, le=950)
+    #: Domains bundled into one textual ``(site: · OR ·)`` tail per Tavily POST (city-tier fan-in).
+    tavily_local_power_max_domains_per_chunk: int = Field(default=5, ge=1, le=20)
     #: Drop very low Tavily relevance scores (reduces blog/noise URLs before extraction).
     tavily_min_result_score: float = Field(default=0.16, ge=0.0, le=1.0)
     #: Raw Tavily JSON cached per (artist, album, tier) before extraction; min 12h.
