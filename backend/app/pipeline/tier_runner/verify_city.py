@@ -11,7 +11,7 @@ from app.policies.eu_stores import StoreEntry
 from app.policies.geo_scope import Tier
 from app.policies.listing_rank import resolve_store_for_url
 from app.policies.physical_local import qualifies_as_target_city_local_shop
-from app.services.tavily_service import normalize_url
+from app.services.tavily import normalize_url
 
 
 async def run_city_verify_stage(

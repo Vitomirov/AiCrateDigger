@@ -29,7 +29,7 @@ from app.policies.listing_rank import (
     resolve_store_for_url,
 )
 from app.policies.physical_local import pool_has_qualifying_physical_local_row
-from app.services.tavily_service import normalize_url
+from app.services.tavily import normalize_url
 
 
 # ---------------------------------------------------------------------------

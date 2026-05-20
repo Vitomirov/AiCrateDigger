@@ -26,7 +26,7 @@ from app.pipeline.tier_runner.trace import build_tier_trace
 from app.pipeline.tier_runner.verify_city import run_city_verify_stage
 from app.pipeline_context import stage_timer
 from app.policies.geo_scope import Tier
-from app.services.tavily_service import editorial_discovery_blocked_hosts_from_raw_results
+from app.services.tavily import editorial_discovery_blocked_hosts_from_raw_results
 
 logger = logging.getLogger(__name__)
 

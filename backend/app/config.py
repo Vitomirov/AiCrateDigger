@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     #: Tavily intermittently returns 429 / 432 / 433 under burst traffic; retry before giving up.
     tavily_http_retry_attempts: int = Field(default=5, ge=1, le=10)
     tavily_http_retry_max_wait_seconds: float = Field(default=14.0, ge=1.0, le=120.0)
+    #: Pause before city/country fanout (parallel with batched search) to reduce Tavily 432 bursts.
+    tavily_fanout_stagger_seconds: float = Field(default=0.45, ge=0.0, le=5.0)
+    #: Per-request circuit breaker: trip after N complete retry exhaustions to fail fast
+    #: when Tavily hard-throttles the account (avoids minutes of wasted retries).
+    tavily_circuit_breaker_failure_threshold: int = Field(default=2, ge=1, le=10)
     #: City-tier local fanout fires one asyncio task per shop; cap concurrency to avoid 432 storms.
     tavily_max_concurrent_domain_fanout: int = Field(default=2, ge=1, le=8)
     pipeline_max_results: int = Field(default=4, ge=1, le=50)

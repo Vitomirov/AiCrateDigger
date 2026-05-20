@@ -54,6 +54,7 @@ from app.policies.physical_local import (
 )
 from app.policies.search_dsl import plan_tavily_query_strings
 from app.services.discogs_service import resolve_album_by_index
+from app.services.tavily import tavily_circuit_breaker_scope
 from app.validators.listings import normalize_whitelist_domain
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,13 @@ async def _run_tier_loop(
 
 async def run_vinyl_search(query: str) -> dict[str, Any]:
     settings = get_settings()
+    with tavily_circuit_breaker_scope(
+        failure_threshold=settings.tavily_circuit_breaker_failure_threshold,
+    ):
+        return await _run_vinyl_search_inner(query, settings=settings)
+
+
+async def _run_vinyl_search_inner(query: str, *, settings: Any) -> dict[str, Any]:
     debug_enabled = settings.debug
 
     parsed = await _stage_parse(query)

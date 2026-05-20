@@ -6,7 +6,7 @@ from typing import Any
 
 from app.pipeline.tier_runner.context import TierLoopState
 from app.policies.geo_scope import TIER_NARROWNESS, Tier
-from app.services.tavily_service import normalize_url
+from app.services.tavily import normalize_url
 
 
 def merge_into_aggregate(

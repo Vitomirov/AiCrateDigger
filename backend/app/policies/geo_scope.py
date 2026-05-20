@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 from app.policies.eu_stores import StoreEntry
 from app.policies.geo_proximity import cities_match
-from app.services.tavily_service import normalize_url
+from app.services.tavily import normalize_url
 
 SearchScope = Literal["local", "regional", "global"]
 Region = Literal[

@@ -24,7 +24,7 @@ from openai import AsyncOpenAI
 from app.config import get_settings
 from app.domain.listing_schema import Listing
 from app.agents.extractor.evidence_alignment import evidence_blob_matches_target_release
-from app.services.tavily_service import normalize_url
+from app.services.tavily import normalize_url
 
 logger = logging.getLogger(__name__)
 

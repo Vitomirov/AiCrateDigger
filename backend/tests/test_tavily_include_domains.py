@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 
 from app.models.search_query import SearchResult
-from app.services.tavily_service import enforce_include_domains_hosts
+from app.services.tavily import enforce_include_domains_hosts
 
 
 class TestEnforceIncludeDomainsHosts(unittest.TestCase):

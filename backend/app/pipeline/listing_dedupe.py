@@ -16,7 +16,7 @@ from rapidfuzz import fuzz
 from app.policies.eu_stores import StoreEntry
 from app.policies.listing_rank import resolve_store_for_url
 from app.policies.store_domain import canonical_store_domain
-from app.services.tavily_service import normalize_url
+from app.services.tavily import normalize_url
 from app.validators.listings import normalize_whitelist_domain
 
 
