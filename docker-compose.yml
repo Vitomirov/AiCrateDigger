@@ -17,6 +17,20 @@ services:
       retries: 8
       start_period: 10s
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 5s
+
   backend:
     build:
       context: ./backend
@@ -28,12 +42,17 @@ services:
       DEBUG: ${DEBUG:-false}
       # Matches app.db.database: async SQLAlchemy + asyncpg (host `db` = Compose service name)
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://aicratedigger:aicratedigger@db:5432/aicratedigger}
+      # Redis cache layer for the consolidated pipeline (7-day TTL). Optional —
+      # if unset the cache silently no-ops and every request hits the live API.
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     ports:
       - "8000:8000"
     volumes:
       - ./chroma_db:/app/chroma_db
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   frontend:
@@ -58,3 +77,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:

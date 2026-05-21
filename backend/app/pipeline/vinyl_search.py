@@ -1,72 +1,80 @@
-"""Deterministic vinyl-search pipeline orchestrator.
+"""Consolidated vinyl-search pipeline (Redis cache + single Tavily call).
 
-Owns the full request lifecycle as a small, readable sequence of stages.
-The bulk of the per-stage logic lives in sibling modules of this package:
+This module is the production hot path for the ``/search`` endpoint. It is a
+deliberately small, linear function so latency / cost behaviour stays obvious
+in production logs:
 
-* :mod:`app.pipeline.tier_runner` — per-tier (city → … → global) iteration
-* :mod:`app.pipeline.finalize`     — post-loop sort / dedupe / cap / scoring
-* :mod:`app.pipeline.listing_dedupe`, :mod:`app.pipeline.local_first`,
-  :mod:`app.pipeline.store_selection`, :mod:`app.pipeline.stop_floors`,
-  :mod:`app.pipeline.constants`, :mod:`app.pipeline.api_mapper`
+1. Parse the user query (one ``gpt-4o-mini`` call → :class:`ParsedQuery`).
+2. Resolve the album anchor (literal title or Discogs ordinal).
+3. Build the deterministic Redis key and short-circuit on a cache **hit**:
+   zero Tavily credits, zero further LLM tokens for 7 days.
+4. **Local-shop top-up** (city queries only): :func:`ensure_local_coverage`
+   discovers indie record shops in the resolved city via Tavily + LLM and
+   upserts them into the Postgres ``whitelist_stores`` table. This keeps the
+   dynamic whitelist growing automatically — exactly how
+   ``malasrpskaprodavnica.com`` lands in the DB without anyone hardcoding it.
+5. Load the active store hosts (curated + discovered) and pass them to the
+   pre-filter as a **positive whitelist signal**.
+6. Issue ONE consolidated Tavily call (``max_results=20``,
+   ``search_depth="advanced"``) returning a wide European pool of candidates
+   for the cost of one Tavily credit.
+7. Python pre-filter — blacklist noise (YouTube, news portals, …), require
+   PDP-shaped URLs from unknown hosts, dedupe per host. Cap to ~10 candidates.
+8. LLM extract + verification via :func:`extract_listings`.
+9. Project to :class:`ListingResult`, **deduplicate by host** so one shop never
+   surfaces twice in the visible result list.
+10. Persist the response to BOTH Redis (7-day TTL, fast hot-path read) AND
+    the Postgres ``search_response_cache`` table (operator visibility via
+    DBeaver / SQL).
 
-Each stage is wrapped in ``stage_timer`` for structured tracing. NO business
-logic lives in this module — every transformation lives in the called helper.
-No fallbacks, no error swallowing.
+Fall-back behaviour
+-------------------
+* No ``REDIS_URL`` / unreachable Redis → Redis layer is a no-op; pipeline runs
+  live and writes Postgres only.
+* Tavily circuit breaker tripped → empty result list, fast return, no cache
+  write (so a transient outage does not poison 7 days of cache).
+* No OpenAI key / extractor failure → empty result list, no cache write.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
+from app.agents.extractor import extract_listings
+from app.agents.parser.parse_user_query import parse_user_query
 from app.config import get_settings
 from app.db.cache import (
     build_search_cache_key,
-    get_cached_search_payload,
-    hydrate_cached_pipeline_dict,
     set_cached_search_payload,
 )
+from app.db.redis_cache import (
+    build_redis_search_key,
+    get_cached_search,
+    set_cached_search,
+)
 from app.db.store_loader import ensure_local_coverage, load_active_stores
-from app.agents.parser.parse_user_query import parse_user_query
-from app.pipeline.api_mapper import listing_to_api_row
-from app.pipeline.finalize import (
-    compute_local_shop_signals,
-    emit_ranking_trace,
-    emit_widening_summary_trace,
-    score_final_listings,
-    sort_dedupe_and_cap_listings,
-)
-from app.pipeline.tier_runner import (
-    TierContext,
-    TierLoopState,
-    process_tier,
-)
+from app.domain.listing_schema import Listing
+from app.models.result import ListingResult
 from app.pipeline_context import stage_timer
-from app.policies.geo_scope import (
-    Tier,
-    geo_intent_from_parsed,
-    normalized_geo_from_parsed,
-    tier_fallback_order,
-)
-from app.policies.physical_local import (
-    curated_city_local_shop_domains,
-    should_prioritize_physical_local_shops,
-)
-from app.policies.search_dsl import plan_tavily_query_strings
+from app.policies.format_detect import detect_format_token
+from app.policies.store_domain import canonical_store_domain
 from app.services.discogs_service import resolve_album_by_index
 from app.services.tavily import tavily_circuit_breaker_scope
-from app.validators.listings import normalize_whitelist_domain
+from app.services.tavily.prefilter import prefilter_tavily_results
+from app.services.tavily.single_call import run_consolidated_tavily_search
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — parse + Discogs resolution
+# Stage helpers
 # ---------------------------------------------------------------------------
 
 
 async def _stage_parse(query: str) -> Any:
-    """Parse the user query inside the ``parse`` stage timer."""
+    """Run the parser inside the ``parse`` stage timer."""
     with stage_timer("parse", input={"query": query}) as rec:
         parsed = await parse_user_query(query)
         rec.output = parsed.model_dump()
@@ -88,48 +96,23 @@ async def _stage_resolve_album_title(parsed: Any) -> str | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 — geo + local-coverage discovery + active store load
-# ---------------------------------------------------------------------------
+async def _stage_ensure_local_coverage(parsed: Any) -> None:
+    """Top up indie ``local_shop`` rows in the DB for the resolved city.
 
-
-def _stage_geo_norm(parsed: Any) -> tuple[Any, Any]:
-    """Emit the ``geo_norm`` trace and return ``(geo, norm)``."""
-    geo = geo_intent_from_parsed(parsed)
-    norm = normalized_geo_from_parsed(parsed)
-    with stage_timer("geo_norm") as rec:
-        rec.output = {
-            "raw_location": norm.raw_location,
-            "resolved_country": norm.resolved_country,
-            "resolved_city": norm.resolved_city,
-            "granularity": norm.granularity,
-            "confidence": round(float(norm.confidence), 3),
-            "search_scope": geo.search_scope,
-            "region": geo.region,
-        }
-    return geo, norm
-
-
-async def _stage_ensure_local_coverage(norm: Any) -> None:
-    """LOCAL-FIRST STRIKE phase 2: top up indie ``local_shop`` rows on demand.
-
-    If the resolved city has fewer than the configured number of indie
-    ``local_shop`` rows, discover more via Tavily + LLM before we load the
-    active store catalogue.
+    Runs only when the parser resolved a specific city + country. Uses
+    Tavily + LLM under the hood (:mod:`app.services.store_discovery`) and
+    upserts new rows into ``whitelist_stores`` — so the next request (and the
+    Python prefilter on this request) automatically trusts them.
     """
-    if not (norm.resolved_city and norm.resolved_country):
+    city = (getattr(parsed, "resolved_city", None) or "").strip()
+    cc = (getattr(parsed, "country_code", None) or "").strip()
+    if not city or not cc:
         return
     with stage_timer(
         "store_discovery",
-        input={
-            "city": norm.resolved_city,
-            "country_code": norm.resolved_country,
-        },
+        input={"city": city, "country_code": cc},
     ) as rec:
-        coverage = await ensure_local_coverage(
-            city=norm.resolved_city,
-            country_code=norm.resolved_country,
-        )
+        coverage = await ensure_local_coverage(city=city, country_code=cc)
         rec.output = coverage
         disc = coverage.get("discovery") or {}
         if not coverage.get("triggered"):
@@ -138,65 +121,137 @@ async def _stage_ensure_local_coverage(norm: Any) -> None:
             rec.status = "empty"
 
 
-async def _stage_load_stores() -> tuple[Any, ...]:
-    with stage_timer("stores"):
-        return await load_active_stores()
+async def _load_known_shop_hosts() -> frozenset[str]:
+    """Active host set from ``whitelist_stores`` (curated + discovered indies).
+
+    Returns an empty set if the DB is unavailable. The prefilter treats this as
+    a positive signal — every host listed here passes the noise gate.
+    """
+    try:
+        stores = await load_active_stores()
+    except Exception:
+        logger.exception(
+            "load_active_stores_failed",
+            extra={"stage": "stores"},
+        )
+        return frozenset()
+    hosts: set[str] = set()
+    for s in stores:
+        dom = canonical_store_domain(getattr(s, "domain", "") or "")
+        if dom:
+            hosts.add(dom)
+    return frozenset(hosts)
 
 
-# ---------------------------------------------------------------------------
-# Stage 3 — Tavily query planning
-# ---------------------------------------------------------------------------
+def _host_of(url: str) -> str | None:
+    try:
+        netloc = urlparse(url.strip()).netloc.lower()
+    except Exception:
+        return None
+    if not netloc:
+        return None
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc.split(":", 1)[0] or None
 
 
-def _plan_queries(
-    parsed: Any, album_title: str, norm: Any
-) -> tuple[str, Any]:
-    return plan_tavily_query_strings(
-        parsed.artist,
-        album_title,
-        country_code_for_variants=norm.resolved_country,
-        resolved_city=norm.resolved_city,
+def _listing_to_api_row(listing: Listing) -> ListingResult:
+    """Project a verified :class:`Listing` to the API-facing :class:`ListingResult`.
+
+    A minimal, deterministic projection — the consolidated pipeline does NOT
+    use the legacy composite scorer (which depends on the multi-tier loop),
+    so the API ``score`` reflects pure extractor confidence:
+    1.0 when in stock, 0.85 otherwise.
+    """
+    title = (listing.title or "").strip()
+    if len(title) < 5:
+        title = f"{title} · shop"
+
+    price_str: str | None = None
+    try:
+        price_val = float(listing.price or 0.0)
+        if price_val > 0:
+            currency = (listing.currency or "EUR").strip().upper() or "EUR"
+            price_str = f"{price_val:.2f} {currency}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        price_str = None
+
+    host = _host_of(listing.url) or (listing.store or None)
+    score = 1.0 if listing.in_stock else 0.85
+
+    return ListingResult(
+        url=listing.url,
+        title=title,
+        score=score,
+        price=price_str,
+        location=None,
+        availability="available" if listing.in_stock else "unknown",
+        seller_type="store",
+        domain=host,
+        artist_match=1.0,
+        album_match=1.0,
+        match_reason="consolidated_pipeline",
     )
 
 
-# ---------------------------------------------------------------------------
-# Stage 4 — geo widening loop
-# ---------------------------------------------------------------------------
+def _dedupe_listings_by_host(listings: list[Listing]) -> list[Listing]:
+    """One listing per registrable host. In-stock rows win; among ties the first
+    occurrence (preserving extractor order) wins.
+
+    The Python prefilter intentionally lets up to 2 deep links per host through
+    so the LLM has redundancy. After extraction we hard-collapse to 1 per host
+    so the user-facing result list always shows variety across shops.
+    """
+    best: dict[str, Listing] = {}
+    for lst in listings:
+        host = _host_of(lst.url)
+        if not host:
+            continue
+        prev = best.get(host)
+        if prev is None:
+            best[host] = lst
+            continue
+        if lst.in_stock and not prev.in_stock:
+            best[host] = lst
+    return list(best.values())
 
 
-async def _run_tier_loop(
-    ctx: TierContext,
-    state: TierLoopState,
-    tier_queue: list[Tier],
-) -> bool:
-    """Drive the geo widening loop, returning whether the global fallback ran."""
-    tier_ix = 0
-    executed_global_fallback = False
-    while True:
-        if tier_ix < len(tier_queue):
-            tier = tier_queue[tier_ix]
-            tier_ix += 1
-            widening_reason = "planned_tier"
-        elif (
-            not state.aggregated
-            and not executed_global_fallback
-            and "global" not in tier_queue
-        ):
-            tier = "global"
-            executed_global_fallback = True
-            widening_reason = "fallback_no_results"
-        else:
-            break
+def _empty_response(query: str, parsed: Any | None, reason: str | None) -> dict[str, Any]:
+    return {
+        "query": query,
+        "results": [],
+        "parsed": parsed,
+        "reason": reason,
+    }
 
-        early_stop = await process_tier(
-            tier=tier,
-            widening_reason=widening_reason,
-            ctx=ctx,
-            state=state,
+
+async def _persist_cache_payload(
+    *,
+    redis_key: str,
+    pg_key: str,
+    payload: dict[str, Any],
+    redis_ttl_seconds: int,
+    pg_ttl_seconds: int,
+) -> None:
+    """Write the response to BOTH Redis (hot read) and Postgres (operator audit).
+
+    Failures on either tier are logged but never raised — the user already has
+    the live response in hand by the time this runs.
+    """
+    try:
+        await set_cached_search(redis_key, payload, ttl_seconds=redis_ttl_seconds)
+    except Exception:
+        logger.exception(
+            "redis_cache_write_failed",
+            extra={"stage": "redis_cache", "cache_key_head": redis_key[:64]},
         )
-        if early_stop:
-            break
-    return executed_global_fallback
+    try:
+        await set_cached_search_payload(pg_key, payload, ttl_seconds=pg_ttl_seconds)
+    except Exception:
+        logger.exception(
+            "postgres_cache_write_failed",
+            extra={"stage": "search_cache", "cache_key_head": pg_key[:16]},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -205,152 +260,183 @@ async def _run_tier_loop(
 
 
 async def run_vinyl_search(query: str) -> dict[str, Any]:
+    """Entry point used by the FastAPI router.
+
+    Wraps the inner implementation in the Tavily circuit-breaker scope so any
+    burst of 432/433 throttling fails fast for the rest of the request.
+    """
     settings = get_settings()
     with tavily_circuit_breaker_scope(
         failure_threshold=settings.tavily_circuit_breaker_failure_threshold,
     ):
-        return await _run_vinyl_search_inner(query, settings=settings)
+        return await _run_vinyl_search_inner(query)
 
 
-async def _run_vinyl_search_inner(query: str, *, settings: Any) -> dict[str, Any]:
-    debug_enabled = settings.debug
+async def _run_vinyl_search_inner(query: str) -> dict[str, Any]:
+    settings = get_settings()
 
+    # ---- Stage 1: parse -------------------------------------------------
     parsed = await _stage_parse(query)
+
+    # ---- Stage 2: resolve album anchor ---------------------------------
     album_title = await _stage_resolve_album_title(parsed)
-
-    # No searchable release anchor — skip Tavily entirely and surface a
-    # machine-readable reason for UI / API clients.
     if album_title is None:
-        return {
-            "query": query,
-            "results": [],
-            "parsed": parsed,
-            "reason": "album_unresolved",
-        }
+        return _empty_response(query, parsed, reason="album_unresolved")
 
-    cache_key_value = build_search_cache_key(
+    # ---- Stage 3: Redis cache lookup (7-day TTL short-circuit) ---------
+    format_token = detect_format_token(parsed.original_query)
+    redis_key = build_redis_search_key(
+        format_token=format_token,
+        artist=parsed.artist,
+        album=album_title,
+        country_code=parsed.country_code,
+    )
+    pg_key = build_search_cache_key(
         user_query=query,
         artist=parsed.artist,
         album_title=album_title,
-        debug=debug_enabled,
+        debug=settings.debug,
     )
 
-    cached_payload = await get_cached_search_payload(cache_key_value)
-    if cached_payload is not None:
-        hydrated = hydrate_cached_pipeline_dict(cached_payload)
-        # `parsed` is intentionally re-attached from the live parse rather than
-        # served from the cache: the cache key already incorporates the
-        # parser-derived identity (artist + album_title), so the freshly-parsed
-        # object is always equivalent AND insulates us from schema drift if
-        # `ParsedQuery` ever gains/loses fields.
-        hydrated["parsed"] = parsed
-        hydrated["reason"] = None
-        return hydrated
+    with stage_timer(
+        "redis_cache_lookup",
+        input={"cache_key": redis_key},
+    ) as rec:
+        cached = await get_cached_search(redis_key)
+        rec.output = {"hit": cached is not None}
+        rec.status = "success" if cached is not None else "empty"
 
-    geo, norm = _stage_geo_norm(parsed)
-    await _stage_ensure_local_coverage(norm)
-    stores = await _stage_load_stores()
+    if cached is not None:
+        try:
+            cached_rows = cached.get("results") or []
+            hydrated_rows = [ListingResult.model_validate(row) for row in cached_rows]
+        except Exception:
+            logger.warning(
+                "redis_cache_payload_invalid_falling_back_to_live",
+                extra={"stage": "redis_cache", "cache_key_head": redis_key[:64]},
+            )
+        else:
+            logger.info(
+                "redis_cache_hit",
+                extra={
+                    "stage": "redis_cache",
+                    "cache_key_head": redis_key[:64],
+                    "result_count": len(hydrated_rows),
+                },
+            )
+            return {
+                "query": query,
+                "results": hydrated_rows,
+                "parsed": parsed,
+                "reason": None,
+            }
 
-    prioritize_physical_locals = should_prioritize_physical_local_shops(geo, norm)
-    curated_city_local_domains = (
-        curated_city_local_shop_domains(stores, norm)
-        if prioritize_physical_locals
-        else frozenset()
+    # ---- Stage 4: indie-shop top-up for the resolved city --------------
+    # Discovers new local_shop rows (e.g. malasrpskaprodavnica.com) via Tavily
+    # + LLM and writes them to whitelist_stores BEFORE we read the active set.
+    await _stage_ensure_local_coverage(parsed)
+
+    # ---- Stage 5: load active shop hosts (positive prefilter signal) ---
+    known_shop_hosts = await _load_known_shop_hosts()
+    logger.info(
+        "known_shop_hosts_loaded",
+        extra={"stage": "stores", "host_count": len(known_shop_hosts)},
     )
 
-    core_query, tavily_relaxation_queries = _plan_queries(parsed, album_title, norm)
-
-    all_allowed = frozenset(
-        normalize_whitelist_domain(s.domain) for s in stores if getattr(s, "domain", None)
-    )
-
-    tier_queue = list(tier_fallback_order(geo, norm))
-    ctx = TierContext(
-        parsed=parsed,
-        album_title=album_title,
-        geo=geo,
-        norm=norm,
-        stores=stores,
-        settings=settings,
-        core_query=core_query,
-        tavily_relaxation_queries=tavily_relaxation_queries,
-        curated_city_local_domains=curated_city_local_domains,
-        prioritize_physical_locals=prioritize_physical_locals,
-        all_allowed=all_allowed,
-    )
-    state = TierLoopState()
-
-    executed_global_fallback = await _run_tier_loop(ctx, state, tier_queue)
-
-    # ---- Post-loop finalisation -----------------------------------------
-    list_out = list(state.aggregated.values())
-
-    (
-        generic_any_local_shop_present,
-        primary_target_local_shop_present,
-        pool_for_giant_penalty,
-    ) = compute_local_shop_signals(
-        list_out,
-        store_lookup=state.store_lookup,
-        norm=norm,
-        prioritize_physical_locals=prioritize_physical_locals,
-    )
-
-    deduped_listings, head, domain_drops = sort_dedupe_and_cap_listings(
-        list_out,
-        store_lookup=state.store_lookup,
-        norm=norm,
-        listing_tier_map=state.listing_tier_map,
-        album_title=album_title or "",
+    # ---- Stage 6: ONE consolidated Tavily call (max 20, advanced) ------
+    raw_results = await run_consolidated_tavily_search(
         artist=parsed.artist,
-        album_match_by_url=state.album_match_by_url,
-        pool_for_giant_penalty=pool_for_giant_penalty,
-        generic_any_local_shop_present=generic_any_local_shop_present,
-        primary_target_local_shop_present=primary_target_local_shop_present,
-        prioritize_physical_locals=prioritize_physical_locals,
-        max_results=settings.pipeline_max_results,
+        album=album_title,
+        format_token=format_token,
+        country_code=parsed.country_code,
+        max_results=settings.tavily_single_call_max_results,
+    )
+    if not raw_results:
+        return _empty_response(query, parsed, reason=None)
+
+    # ---- Stage 7: Python pre-filter (blacklist + dedupe per host) ------
+    with stage_timer(
+        "prefilter",
+        input={"raw_count": len(raw_results)},
+    ) as rec:
+        candidates, prefilter_diag = prefilter_tavily_results(
+            raw_results,
+            max_candidates=settings.pipeline_prefilter_max_candidates,
+            max_per_host=settings.pipeline_prefilter_max_per_host,
+            known_shop_hosts=known_shop_hosts,
+        )
+        rec.output = prefilter_diag
+        rec.status = "success" if candidates else "empty"
+
+    if not candidates:
+        return _empty_response(query, parsed, reason=None)
+
+    # ---- Stage 8: LLM extract + verify (gpt-4o-mini) -------------------
+    # ``allowed_domains`` for ``extract_listings`` = the hosts that survived the
+    # Python prefilter. We derive it from the candidates themselves so every
+    # candidate (curated, discovered indie, or PDP-shaped unknown) passes the
+    # extractor's host gate. The dynamic whitelist is loaded earlier and acts
+    # as a *positive* signal inside the prefilter — extract_listings doesn't
+    # need to re-check it.
+    allowed_domains = {c["host"] for c in candidates if c.get("host")}
+    with stage_timer("extractor", input={"candidate_count": len(candidates)}) as rec:
+        report = await extract_listings(
+            raw_results=[
+                {
+                    "url": c["url"],
+                    "title": c["title"],
+                    "content": c["content"],
+                    "score": c.get("score", 0.0),
+                }
+                for c in candidates
+            ],
+            artist=parsed.artist,
+            album=album_title,
+            allowed_domains=allowed_domains,
+        )
+        rec.output = {
+            "final_count": len(report.listings),
+            "diagnostic": report.diagnostic,
+        }
+        rec.status = "success" if report.listings else "empty"
+
+    if not report.listings:
+        return _empty_response(query, parsed, reason=None)
+
+    # ---- Stage 9: per-host dedupe + API projection ---------------------
+    unique_listings = _dedupe_listings_by_host(report.listings)
+    api_rows = [_listing_to_api_row(lst) for lst in unique_listings]
+    api_rows.sort(key=lambda r: r.score, reverse=True)
+    api_rows = api_rows[: settings.pipeline_max_results]
+    logger.info(
+        "results_dedupe_summary",
+        extra={
+            "stage": "pipeline",
+            "extractor_listings": len(report.listings),
+            "deduped_listings": len(unique_listings),
+            "api_rows": len(api_rows),
+        },
     )
 
-    breakdowns = score_final_listings(
-        head,
-        store_lookup=state.store_lookup,
-        listing_tier_map=state.listing_tier_map,
-        last_tier=state.last_tier,
-        album_match_by_url=state.album_match_by_url,
-        norm=norm,
-        album_title=album_title or "",
-        artist=parsed.artist,
-        pool_for_giant_penalty=pool_for_giant_penalty,
-    )
-
-    emit_ranking_trace(head, breakdowns)
-    emit_widening_summary_trace(
-        tier_queue=tier_queue,
-        tiers_attempted=state.tiers_attempted,
-        executed_global_fallback=executed_global_fallback,
-        aggregated=state.aggregated,
-        deduped_listings=deduped_listings,
-        domain_drops=domain_drops,
-        head=head,
-        generic_any_local_shop_present=generic_any_local_shop_present,
-        primary_target_local_shop_present=primary_target_local_shop_present,
-        prioritize_physical_locals=prioritize_physical_locals,
-        pool_for_giant_penalty=pool_for_giant_penalty,
-        verifier_summary=state.verifier_summary,
-        tier_traces=state.tier_traces,
-    )
-
-    api_rows = [
-        listing_to_api_row(listing, breakdown=breakdown)
-        for listing, breakdown in zip(head, breakdowns, strict=True)
-    ]
-
-    # Cache payload deliberately excludes `parsed` — see the cache-hit branch
-    # above for the rationale (live re-attach beats cached re-hydration).
-    await set_cached_search_payload(
-        cache_key_value,
-        {"query": query, "results": api_rows},
-        ttl_seconds=settings.search_cache_ttl_seconds,
+    # ---- Stage 10: persist to BOTH Redis (hot) AND Postgres (audit) ----
+    cache_payload = {
+        "query": query,
+        "results": [row.model_dump(mode="json") for row in api_rows],
+        "cache_meta": {
+            "format": format_token,
+            "artist": (parsed.artist or "").strip() or None,
+            "album": album_title,
+            "country_code": parsed.country_code,
+            "resolved_city": getattr(parsed, "resolved_city", None),
+            "known_shop_host_count": len(known_shop_hosts),
+        },
+    }
+    await _persist_cache_payload(
+        redis_key=redis_key,
+        pg_key=pg_key,
+        payload=cache_payload,
+        redis_ttl_seconds=settings.redis_search_cache_ttl_seconds,
+        pg_ttl_seconds=settings.redis_search_cache_ttl_seconds,
     )
 
     return {

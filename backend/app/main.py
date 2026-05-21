@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from app.config import get_settings
 from app.db.cache import purge_expired_search_cache_rows
 from app.db.database import dispose_engine, init_db
+from app.db.redis_cache import dispose_redis_client
 from app.db.store_loader import (
     repair_whitelist_store_domains,
     seed_whitelist_stores_if_empty,
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI):
         )
     yield
     await dispose_engine()
+    await dispose_redis_client()
 
 
 logger.info(

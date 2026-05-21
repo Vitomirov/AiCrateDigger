@@ -16,6 +16,7 @@ asyncpg = "*"
 openai = "*"
 httpx = "*"
 rapidfuzz = "^3.9"
+redis = "^5.0"
 
 [build-system]
 requires = ["poetry-core"]

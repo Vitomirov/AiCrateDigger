@@ -58,6 +58,7 @@ _DOMAIN_BLACKLIST: frozenset[str] = frozenset(
         "spotify.com",
         "soundcloud.com",
         "bandcamp.com",
+        "leila.rs",
         "ra.co",
         "timeout.com",
         "vinylhub.com",

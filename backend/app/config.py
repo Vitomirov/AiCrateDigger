@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     tavily_api_key: str
     discogs_token: str | None = None
     database_url: str | None = None
+    #: Optional Redis URL (e.g. ``redis://redis:6379/0``). When unset the cache layer
+    #: silently no-ops and every request hits the live pipeline.
+    redis_url: str | None = None
 
     debug: bool = False
     log_level: str = "INFO"
@@ -19,6 +22,17 @@ class Settings(BaseSettings):
     )
     search_cache_enabled: bool = True
     search_cache_ttl_seconds: int = Field(default=3600, ge=60)
+    #: 7-day TTL for the Redis search-results cache (604_800 s). Configurable so a
+    #: human can override at the env layer without code changes.
+    redis_search_cache_ttl_seconds: int = Field(default=604_800, ge=60)
+    #: Hard cap on candidate URLs passed to the LLM extractor after Python pre-filtering.
+    pipeline_prefilter_max_candidates: int = Field(default=10, ge=3, le=20)
+    #: Per-host cap for the Python pre-filter (top-N best-scored deep links per shop).
+    pipeline_prefilter_max_per_host: int = Field(default=2, ge=1, le=5)
+    #: Single consolidated Tavily call: ``max_results`` upper bound.
+    tavily_single_call_max_results: int = Field(default=20, ge=5, le=30)
+    #: Single consolidated Tavily call: ``search_depth`` value.
+    tavily_single_call_depth: str = Field(default="advanced")
 
     #: Legacy cap for :func:`run_tavily_search` multi-query mode; geo pipeline uses chunking below.
     tavily_max_http_calls: int = Field(default=4, ge=1, le=20)
