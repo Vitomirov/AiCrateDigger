@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from app.agents.parser.parse_user_query import parse_user_query
 from app.config import get_settings
@@ -38,7 +38,10 @@ async def parse_search_query(payload: ParseRequest) -> ParsedQuery:
 # MAIN PIPELINE ENDPOINT (REAL)
 # -------------------------
 @router.post("/search", response_model=SearchResponse)
-async def search(payload: ParseRequest) -> SearchResponse:
+async def search(
+    payload: ParseRequest,
+    background_tasks: BackgroundTasks,
+) -> SearchResponse:
     """Single round-trip search endpoint.
 
     Returns the validated listings AND the parser output that drove the
@@ -48,7 +51,10 @@ async def search(payload: ParseRequest) -> SearchResponse:
     """
     with start_pipeline(debug=get_settings().debug) as ctx:
         try:
-            result = await run_vinyl_search(payload.query)
+            result = await run_vinyl_search(
+                payload.query,
+                background_tasks=background_tasks,
+            )
 
             settings = get_settings()
             logger.info(
@@ -91,5 +97,8 @@ async def search(payload: ParseRequest) -> SearchResponse:
 # LEGACY COMPATIBILITY (OLD NAME)
 # -------------------------
 @router.post("/search-listings", response_model=SearchResponse)
-async def search_listings(payload: ParseRequest) -> SearchResponse:
-    return await search(payload)
+async def search_listings(
+    payload: ParseRequest,
+    background_tasks: BackgroundTasks,
+) -> SearchResponse:
+    return await search(payload, background_tasks)

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     #: Per-host cap for the Python pre-filter (top-N best-scored deep links per shop).
     pipeline_prefilter_max_per_host: int = Field(default=2, ge=1, le=5)
     #: Single consolidated Tavily call: ``max_results`` upper bound.
-    tavily_single_call_max_results: int = Field(default=20, ge=5, le=30)
+    tavily_single_call_max_results: int = Field(default=10, ge=5, le=30)
     #: Single consolidated Tavily call: ``search_depth`` value.
     tavily_single_call_depth: str = Field(default="advanced")
 

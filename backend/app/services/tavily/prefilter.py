@@ -1,6 +1,7 @@
 """Programmatic pre-filter for raw Tavily results.
 
-Goal: shrink the 20-row Tavily pool to a high-signal slice (~7-10 candidates)
+Goal: shrink the Tavily SERP pool (size matches ``tavily_single_call_max_results``,
+typically ~10 rows) to a high-signal slice (~7–10 candidates)
 **before** they ever reach the LLM extractor, so we spend OpenAI tokens only on
 URLs that have a realistic chance of being a buyable physical-music product
 page on a multi-shop European pool.

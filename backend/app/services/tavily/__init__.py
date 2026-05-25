@@ -3,7 +3,8 @@
 Submodules by concern:
 - ``client`` — HTTP transport + retries
 - ``search`` — single-query execution (legacy multi-stage helper)
-- ``single_call`` — consolidated ``max_results=20`` ``advanced`` call (hot path)
+- ``single_call`` — consolidated advanced-depth call capped by
+  ``Settings.tavily_single_call_max_results`` (default ``10``)
 - ``prefilter`` — Python pre-LLM noise filter + per-host dedupe
 - ``store_domains`` — batched whitelist search (legacy multi-stage helper)
 - ``local_fanout`` — city/country indie power queries (legacy)

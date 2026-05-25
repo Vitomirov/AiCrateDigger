@@ -1,8 +1,9 @@
 """Single high-yield Tavily request: 1 credit, up to ``max_results`` rows.
 
 Replaces the legacy multi-stage Tavily loop (general → city tier → site-specific
-fanout, ~4+ HTTP calls per request) with **one** advanced-depth call that
-returns a wide European pool for the price of one Tavily credit.
+fanout, ~4+ HTTP calls per request) with **one** advanced-depth call capped by
+``Settings.tavily_single_call_max_results`` (default **10**) that returns a
+diverse European candidate pool for one Tavily credit.
 
 * No ``include_domains`` restriction — diversity across European shops is then
   enforced in Python by :mod:`app.services.tavily.prefilter`.

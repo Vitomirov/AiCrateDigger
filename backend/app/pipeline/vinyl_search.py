@@ -8,16 +8,17 @@ in production logs:
 2. Resolve the album anchor (literal title or Discogs ordinal).
 3. Build the deterministic Redis key and short-circuit on a cache **hit**:
    zero Tavily credits, zero further LLM tokens for 7 days.
-4. **Local-shop top-up** (city queries only): :func:`ensure_local_coverage`
-   discovers indie record shops in the resolved city via Tavily + LLM and
-   upserts them into the Postgres ``whitelist_stores`` table. This keeps the
-   dynamic whitelist growing automatically — exactly how
-   ``malasrpskaprodavnica.com`` lands in the DB without anyone hardcoding it.
+4. **Local-shop top-up** (city queries only, **non-blocking in production**):
+   schedules :func:`ensure_local_coverage` via FastAPI ``BackgroundTasks`` so
+   Tavily + LLM discovery upserts ``whitelist_stores`` after the HTTP response.
+   Tests and callers without ``BackgroundTasks`` still ``await`` it inline so
+   behaviour stays deterministic.
 5. Load the active store hosts (curated + discovered) and pass them to the
    pre-filter as a **positive whitelist signal**.
-6. Issue ONE consolidated Tavily call (``max_results=20``,
-   ``search_depth="advanced"``) returning a wide European pool of candidates
-   for the cost of one Tavily credit.
+6. Issue ONE consolidated Tavily call (``max_results`` from
+   ``Settings.tavily_single_call_max_results``, default ``10``;
+   ``search_depth="advanced"``) returning a European candidate pool for one
+   Tavily credit.
 7. Python pre-filter — blacklist noise (YouTube, news portals, …), require
    PDP-shaped URLs from unknown hosts, dedupe per host. Cap to ~10 candidates.
 8. LLM extract + verification via :func:`extract_listings`.
@@ -26,6 +27,10 @@ in production logs:
 10. Persist the response to BOTH Redis (7-day TTL, fast hot-path read) AND
     the Postgres ``search_response_cache`` table (operator visibility via
     DBeaver / SQL).
+
+Production note: Because store discovery runs in a background task, the *current*
+HTTP response uses the whitelist as it existed when :func:`load_active_stores`
+ran; newly discovered domains apply on subsequent searches.
 
 Fall-back behaviour
 -------------------
@@ -41,6 +46,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 from urllib.parse import urlparse
+
+from fastapi import BackgroundTasks
 
 from app.agents.extractor import extract_listings
 from app.agents.parser.parse_user_query import parse_user_query
@@ -119,6 +126,67 @@ async def _stage_ensure_local_coverage(parsed: Any) -> None:
             rec.status = "empty"
         elif not (disc.get("inserted") or disc.get("updated")):
             rec.status = "empty"
+
+
+async def _background_ensure_local_coverage(parsed: Any) -> None:
+    """Persist discovered indies **after** the HTTP response finishes.
+
+    FastAPI queues this coroutine via :class:`~fastapi.BackgroundTasks`, so UI
+    latency is no longer gated on Tavily + OpenAI discovery. Each call obtains
+    its own SQLAlchemy session(s) inside :func:`~app.db.store_loader.ensure_local_coverage`
+    — no request-scoped connection is captured or reopened here.
+
+    We intentionally skip :func:`stage_timer` / pipeline context tracing: route
+    contextvars reset once the handler returns and would otherwise synthesize a
+    throwaway `PipelineContext` for every background run.
+    """
+    city = (getattr(parsed, "resolved_city", None) or "").strip()
+    cc = (getattr(parsed, "country_code", None) or "").strip()
+    if not city or not cc:
+        return
+
+    try:
+        coverage = await ensure_local_coverage(city=city, country_code=cc)
+    except Exception:
+        logger.exception(
+            "background_store_discovery_failed",
+            extra={"stage": "store_discovery", "city": city, "country_code": cc},
+        )
+        return
+
+    disc = coverage.get("discovery") or {}
+    logger.info(
+        "background_store_discovery_finished",
+        extra={
+            "stage": "store_discovery",
+            "city": city,
+            "country_code": cc,
+            "triggered": coverage.get("triggered"),
+            "inserted": disc.get("inserted"),
+            "updated": disc.get("updated"),
+        },
+    )
+
+
+async def _kick_off_local_shop_discovery(
+    *,
+    parsed: Any,
+    background_tasks: BackgroundTasks | None,
+) -> None:
+    """Inline ``store_discovery`` for tests/callers **or** background for HTTP."""
+    city = (getattr(parsed, "resolved_city", None) or "").strip()
+    cc = (getattr(parsed, "country_code", None) or "").strip()
+    if not city or not cc:
+        return
+    if background_tasks is not None:
+        background_tasks.add_task(_background_ensure_local_coverage, parsed)
+        logger.info(
+            "store_discovery_background_scheduled",
+            extra={"stage": "store_discovery", "city": city, "country_code": cc},
+        )
+        return
+
+    await _stage_ensure_local_coverage(parsed)
 
 
 async def _load_known_shop_hosts() -> frozenset[str]:
@@ -259,20 +327,32 @@ async def _persist_cache_payload(
 # ---------------------------------------------------------------------------
 
 
-async def run_vinyl_search(query: str) -> dict[str, Any]:
+async def run_vinyl_search(
+    query: str,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
     """Entry point used by the FastAPI router.
 
     Wraps the inner implementation in the Tavily circuit-breaker scope so any
     burst of 432/433 throttling fails fast for the rest of the request.
+
+    Pass ``BackgroundTasks`` from the route handler so Indie store discovery runs
+    after the response returns; omit it for tests or CLI callers (discovery
+    awaits inline inside the caller's event loop instead).
     """
     settings = get_settings()
     with tavily_circuit_breaker_scope(
         failure_threshold=settings.tavily_circuit_breaker_failure_threshold,
     ):
-        return await _run_vinyl_search_inner(query)
+        return await _run_vinyl_search_inner(query, background_tasks=background_tasks)
 
 
-async def _run_vinyl_search_inner(query: str) -> dict[str, Any]:
+async def _run_vinyl_search_inner(
+    query: str,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
 
     # ---- Stage 1: parse -------------------------------------------------
@@ -331,10 +411,8 @@ async def _run_vinyl_search_inner(query: str) -> dict[str, Any]:
                 "reason": None,
             }
 
-    # ---- Stage 4: indie-shop top-up for the resolved city --------------
-    # Discovers new local_shop rows (e.g. malasrpskaprodavnica.com) via Tavily
-    # + LLM and writes them to whitelist_stores BEFORE we read the active set.
-    await _stage_ensure_local_coverage(parsed)
+    # ---- Stage 4: indie-shop top-up — background in HTTP, inline in tests -----
+    await _kick_off_local_shop_discovery(parsed=parsed, background_tasks=background_tasks)
 
     # ---- Stage 5: load active shop hosts (positive prefilter signal) ---
     known_shop_hosts = await _load_known_shop_hosts()
@@ -343,7 +421,7 @@ async def _run_vinyl_search_inner(query: str) -> dict[str, Any]:
         extra={"stage": "stores", "host_count": len(known_shop_hosts)},
     )
 
-    # ---- Stage 6: ONE consolidated Tavily call (max 20, advanced) ------
+    # ---- Stage 6: ONE consolidated Tavily call (bounded by Settings, advanced) -----
     raw_results = await run_consolidated_tavily_search(
         artist=parsed.artist,
         album=album_title,
