@@ -45,16 +45,18 @@ def build_consolidated_query(
     album: str | None,
     format_token: str,
     country_code: str | None,
+    resolved_city: str | None = None,
 ) -> str:
     """Build the single Tavily query string.
 
-    Spec: ``"{artist}" "{album}" {format_type} shop {country_code or ''}``.
+    Spec: ``"{artist}" "{album}" {format_type} shop {city?} {country_code?}``.
 
     Both artist and album are double-quoted for phrase match so Tavily ranks
     PDPs that literally name the release first. ``shop`` is appended as a
-    storefront-intent keyword. The ISO country code (if any) acts as an extra
-    geo signal in the query body; the structured ``country`` field on the
-    payload provides the real ranking nudge.
+    storefront-intent keyword. When ``resolved_city`` is set (city-level geo),
+    the city token is injected before the ISO country code so web search
+    respects local constraints. The structured ``country`` field on the Tavily
+    payload provides an additional ranking nudge.
     """
     parts: list[str] = []
     artist_q = _quote_phrase(artist)
@@ -66,6 +68,9 @@ def build_consolidated_query(
     fmt = (format_token or "vinyl").strip().lower() or "vinyl"
     parts.append(fmt)
     parts.append("shop")
+    city = (resolved_city or "").strip()
+    if city:
+        parts.append(city)
     cc = (country_code or "").strip().upper()
     if cc:
         parts.append(cc)
@@ -78,6 +83,7 @@ async def run_consolidated_tavily_search(
     album: str | None,
     format_token: str,
     country_code: str | None,
+    resolved_city: str | None = None,
     max_results: int | None = None,
 ) -> list[dict[str, Any]]:
     """One advanced-depth Tavily call → raw result dicts (no Python filtering yet).
@@ -92,6 +98,7 @@ async def run_consolidated_tavily_search(
         album=album,
         format_token=format_token,
         country_code=country_code,
+        resolved_city=resolved_city,
     )
     if not query:
         return []

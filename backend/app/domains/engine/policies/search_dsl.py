@@ -20,12 +20,18 @@ def _intent_chunks(artist: str | None, album: str, location: str | None) -> list
     return chunks
 
 
-def build_tavily_core_query(artist: str | None, album: str) -> str:
+def build_tavily_core_query(
+    artist: str | None,
+    album: str,
+    *,
+    resolved_city: str | None = None,
+) -> str:
     """Intent string for Tavily only.
 
-    Omits **city/country tokens**: they are not store identifiers and (with
-    ``include_domains`` already set) tend to skew results toward unrelated
-    pages (e.g. live titles mentioning "Paris").
+    When ``resolved_city`` is set, the city token is appended before ``vinyl``
+    so city-tier searches anchor on the resolved locality. Country-level tokens
+    are still omitted here — ``include_domains`` and the Tavily ``country``
+    payload field carry country scope.
 
     Phrase quoting: **3+ word** album titles are double-quoted for phrase match.
     **1–2 word** titles stay unquoted so storefront indexes can match despite
@@ -36,12 +42,16 @@ def build_tavily_core_query(artist: str | None, album: str) -> str:
         parts.append(str(artist).strip())
     al = str(album).strip()
     if not al:
-        return "vinyl"
+        city_only = (resolved_city or "").strip()
+        return f"{city_only} vinyl".strip() if city_only else "vinyl"
     n_words = len(al.split())
     if n_words >= 2:
         parts.append(f'"{al}"' if n_words >= 3 else al)
     else:
         parts.append(al)
+    city = (resolved_city or "").strip()
+    if city:
+        parts.append(city)
     parts.append("vinyl")
     return " ".join(parts)
 
@@ -98,14 +108,19 @@ def plan_tavily_query_strings(
     art_variants = expand_artist_glyph_variants(artist, country_code=country_code_for_variants)
     alb_variants = expand_album_glyph_variants(alb, country_code=country_code_for_variants)
 
+    city_token = (resolved_city or "").strip() or None
     strict_candidates: list[str] = []
     for av in art_variants[:5]:
         for bv in alb_variants[:5]:
-            q = build_tavily_core_query(av or artist, bv)
+            q = build_tavily_core_query(av or artist, bv, resolved_city=city_token)
             if q and q.casefold() not in {s.casefold() for s in strict_candidates}:
                 strict_candidates.append(q)
 
-    primary = strict_candidates[0] if strict_candidates else build_tavily_core_query(artist, alb)
+    primary = (
+        strict_candidates[0]
+        if strict_candidates
+        else build_tavily_core_query(artist, alb, resolved_city=city_token)
+    )
     relax_geo = build_tavily_geo_browse_queries(
         art_variants[:3] or ([] if not (artist or "").strip() else [str(artist).strip()]),
         alb,

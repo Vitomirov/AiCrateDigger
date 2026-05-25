@@ -312,7 +312,12 @@ def _looks_like_product_url(url: str) -> bool:
 
 
 def _host_in_whitelist(host: str, whitelist: frozenset[str] | None) -> bool:
-    """``host`` is a known store from ``whitelist_stores`` (subdomain-safe)."""
+    """``host`` is a known store from ``whitelist_stores`` (subdomain-safe).
+
+    Matches registrable host equality, subdomains of a whitelist entry
+    (``shop.example.com`` when ``example.com`` is listed), and parent domains
+    when discovery persisted a shop subdomain but Tavily returns the apex host.
+    """
     if not host or not whitelist:
         return False
     h = host.lower()
@@ -320,7 +325,13 @@ def _host_in_whitelist(host: str, whitelist: frozenset[str] | None) -> bool:
         h = h[4:]
     if h in whitelist:
         return True
-    return any(h.endswith("." + d) for d in whitelist)
+    for d in whitelist:
+        dl = d.lower()
+        if h.endswith("." + dl):
+            return True
+        if dl.endswith("." + h):
+            return True
+    return False
 
 
 def _result_score(row: dict[str, Any], *, is_known_shop: bool) -> float:
@@ -355,6 +366,7 @@ def prefilter_tavily_results(
     max_candidates: int = 10,
     max_per_host: int = 2,
     known_shop_hosts: Iterable[str] | None = None,
+    trusted_local_shop_hosts: Iterable[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Sanitize ``raw_results`` into an LLM-ready candidate list.
 
@@ -365,12 +377,18 @@ def prefilter_tavily_results(
         known_shop_hosts: hostnames present in the ``whitelist_stores`` table.
             Whitelist hosts always pass the noise gate and get a score boost;
             non-whitelisted hosts must show a PDP-shaped URL to survive.
+        trusted_local_shop_hosts: city-matched ``local_shop`` domains from the
+            active store pool (including freshly discovered rows). Unioned with
+            ``known_shop_hosts`` for whitelist bypass and relaxed thin-path URLs.
 
     Returns ``(kept_candidates, diagnostic_dict)``.
     """
     whitelist: frozenset[str] = frozenset(
         h.strip().lower().removeprefix("www.")
-        for h in (known_shop_hosts or [])
+        for h in (
+            *(known_shop_hosts or []),
+            *(trusted_local_shop_hosts or []),
+        )
         if (h or "").strip()
     )
 

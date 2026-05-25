@@ -122,7 +122,7 @@ async def _stage_resolve_album_title(parsed: Any) -> str | None:
         return None
 
 
-async def _stage_ensure_local_coverage(parsed: Any) -> None:
+async def _stage_ensure_local_coverage(parsed: Any) -> dict[str, object]:
     """Top up indie ``local_shop`` rows in the DB for the resolved city.
 
     Runs only when the parser resolved a specific city + country. Internally
@@ -135,11 +135,13 @@ async def _stage_ensure_local_coverage(parsed: Any) -> None:
     poorly-covered cities (e.g. Porto, smaller Balkans cities) were dropped
     by ``rejected_no_pdp_signal`` because discovery had been pushed into a
     post-response background task.
+
+    Returns the coverage summary dict (empty when inputs are missing).
     """
     city = (getattr(parsed, "resolved_city", None) or "").strip()
     cc = (getattr(parsed, "country_code", None) or "").strip()
     if not city or not cc:
-        return
+        return {}
     with stage_timer(
         "store_discovery",
         input={"city": city, "country_code": cc},
@@ -157,13 +159,60 @@ async def _stage_ensure_local_coverage(parsed: Any) -> None:
             )
             rec.status = "fail"
             rec.error = str(exc)[:240]
-            return
+            return {"triggered": False, "error": str(exc)[:240]}
         rec.output = coverage
         disc = coverage.get("discovery") or {}
         if not coverage.get("triggered"):
             rec.status = "empty"
         elif not (disc.get("inserted") or disc.get("updated")):
             rec.status = "empty"
+        return coverage
+
+
+def _merge_discovery_domains_into_hosts(
+    known_shop_hosts: frozenset[str],
+    discovery_summary: dict[str, object] | None,
+) -> frozenset[str]:
+    """Union freshly upserted discovery domains into the prefilter whitelist."""
+    if not discovery_summary:
+        return known_shop_hosts
+    disc = discovery_summary.get("discovery")
+    if not isinstance(disc, dict):
+        return known_shop_hosts
+    merged: set[str] = set(known_shop_hosts)
+    for key in ("domains_inserted", "domains_updated"):
+        raw = disc.get(key)
+        if not isinstance(raw, list):
+            continue
+        for dom in raw:
+            canonical = canonical_store_domain(str(dom or ""))
+            if canonical:
+                merged.add(canonical)
+    return frozenset(merged)
+
+
+def _primary_discovery_should_skip_opportunistic(
+    primary_discovery_summary: dict[str, object] | None,
+) -> bool:
+    """True when inline store discovery already ran for this request."""
+    if not primary_discovery_summary:
+        return False
+    if primary_discovery_summary.get("triggered"):
+        return True
+    disc = primary_discovery_summary.get("discovery")
+    if isinstance(disc, dict) and int(disc.get("inserted") or 0) > 0:
+        return True
+    return False
+
+
+def _tavily_city_token(parsed: Any) -> str | None:
+    """Resolved city for Tavily query injection when geo is city-level."""
+    city = (getattr(parsed, "resolved_city", None) or "").strip()
+    if city:
+        return city
+    if getattr(parsed, "geo_granularity", None) == "city":
+        return (getattr(parsed, "location", None) or "").strip() or None
+    return None
 
 
 def _select_unknown_host_snippets_for_discovery(
@@ -207,6 +256,7 @@ async def _stage_opportunistic_store_discovery(
     parsed: Any,
     raw_results: list[dict[str, Any]],
     known_shop_hosts: frozenset[str],
+    primary_discovery_summary: dict[str, object] | None = None,
 ) -> frozenset[str]:
     """Verify unknown-host snippets from the *main* Tavily call as local shops.
 
@@ -223,6 +273,29 @@ async def _stage_opportunistic_store_discovery(
     """
     settings = get_settings()
     if not settings.pipeline_opportunistic_store_discovery_enabled:
+        return known_shop_hosts
+
+    if _primary_discovery_should_skip_opportunistic(primary_discovery_summary):
+        city = (getattr(parsed, "resolved_city", None) or "").strip()
+        cc = (getattr(parsed, "country_code", None) or "").strip()
+        logger.info(
+            "opportunistic_store_discovery_skipped_primary_discovery_triggered",
+            extra={
+                "stage": "opportunistic_store_discovery",
+                "city": city,
+                "country_code": cc,
+                "skipped_reason": "skipped_primary_discovery_triggered",
+                "primary_triggered": bool(
+                    (primary_discovery_summary or {}).get("triggered")
+                ),
+            },
+        )
+        with stage_timer(
+            "opportunistic_store_discovery",
+            input={"skipped_reason": "skipped_primary_discovery_triggered"},
+        ) as rec:
+            rec.status = "empty"
+            rec.output = {"skipped_reason": "skipped_primary_discovery_triggered"}
         return known_shop_hosts
 
     city = (getattr(parsed, "resolved_city", None) or "").strip()
@@ -295,6 +368,34 @@ async def _stage_opportunistic_store_discovery(
             },
         )
     return augmented
+
+
+async def _load_trusted_local_shop_hosts(parsed: Any) -> frozenset[str]:
+    """City-matched ``local_shop`` domains from the active store catalogue."""
+    city = (getattr(parsed, "resolved_city", None) or "").strip()
+    cc = (getattr(parsed, "country_code", None) or "").strip().upper()
+    if not cc:
+        return frozenset()
+    try:
+        stores = await load_active_stores()
+    except Exception:
+        return frozenset()
+    from app.domains.engine.policies.geo_proximity import cities_match
+
+    hosts: set[str] = set()
+    for s in stores:
+        if getattr(s, "store_type", None) != "local_shop" or not s.domain:
+            continue
+        if (s.country_code or "").strip().upper() != cc:
+            continue
+        if city:
+            store_city = (getattr(s, "city", None) or "").strip()
+            if store_city and not cities_match(city, store_city):
+                continue
+        dom = canonical_store_domain(s.domain)
+        if dom:
+            hosts.add(dom)
+    return frozenset(hosts)
 
 
 async def _load_known_shop_hosts() -> frozenset[str]:
@@ -531,11 +632,16 @@ async def _run_vinyl_search_inner(
     # in this request's whitelist instead of only the next one's. Backgrounding
     # this step caused local shops in poorly-covered cities (Porto, smaller
     # Balkans cities) to be dropped from the prefilter as ``rejected_no_pdp_signal``.
-    await _stage_ensure_local_coverage(parsed)
+    primary_discovery_summary = await _stage_ensure_local_coverage(parsed)
     _ = background_tasks  # reserved for future post-response telemetry / cache warming.
 
     # ---- Stage 5: load active shop hosts (positive prefilter signal) ---
     known_shop_hosts = await _load_known_shop_hosts()
+    known_shop_hosts = _merge_discovery_domains_into_hosts(
+        known_shop_hosts,
+        primary_discovery_summary,
+    )
+    trusted_local_shop_hosts = await _load_trusted_local_shop_hosts(parsed)
     logger.info(
         "known_shop_hosts_loaded",
         extra={"stage": "stores", "host_count": len(known_shop_hosts)},
@@ -547,6 +653,7 @@ async def _run_vinyl_search_inner(
         album=album_title,
         format_token=format_token,
         country_code=parsed.country_code,
+        resolved_city=_tavily_city_token(parsed),
         max_results=settings.tavily_single_call_max_results,
     )
     if not raw_results:
@@ -564,6 +671,7 @@ async def _run_vinyl_search_inner(
         parsed=parsed,
         raw_results=raw_results,
         known_shop_hosts=known_shop_hosts,
+        primary_discovery_summary=primary_discovery_summary,
     )
 
     # ---- Stage 7: Python pre-filter (blacklist + dedupe per host) ------
@@ -576,6 +684,7 @@ async def _run_vinyl_search_inner(
             max_candidates=settings.pipeline_prefilter_max_candidates,
             max_per_host=settings.pipeline_prefilter_max_per_host,
             known_shop_hosts=known_shop_hosts,
+            trusted_local_shop_hosts=trusted_local_shop_hosts,
         )
         rec.output = prefilter_diag
         rec.status = "success" if candidates else "empty"
