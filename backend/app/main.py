@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from app.core.config import get_settings
 from app.core.db.cache import purge_expired_search_cache_rows
 from app.core.db.database import dispose_engine, init_db
-from app.core.db.redis_cache import dispose_redis_client
+from app.core.db.redis_cache import dispose_redis_client, purge_stale_pipeline_cache_versions
 from app.core.db.store_loader import (
     repair_whitelist_store_domains,
     seed_whitelist_stores_if_empty,
@@ -43,6 +43,21 @@ async def lifespan(app: FastAPI):
             "lifespan_db_skipped",
             extra={"stage": "startup", "reason": "DATABASE_URL unset — stores + cache use in-process defaults only"},
         )
+
+    # Sweep Redis search-cache entries that predate the current pipeline
+    # schema version. After a pipeline-behaviour bump this prevents the next
+    # search from serving a stale snapshot that was computed by the old code
+    # path (which is exactly what happened to "Cascet Undead Soil DE" — the
+    # `v1` entry kept short-circuiting Stage 6.5 opportunistic discovery).
+    stale_purged = await purge_stale_pipeline_cache_versions()
+    logger.info(
+        "lifespan_redis",
+        extra={
+            "stage": "startup",
+            "stale_pipeline_cache_purged": stale_purged,
+        },
+    )
+
     yield
     await dispose_engine()
     await dispose_redis_client()

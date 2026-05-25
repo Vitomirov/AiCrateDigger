@@ -25,10 +25,21 @@ class Settings(BaseSettings):
     #: 7-day TTL for the Redis search-results cache (604_800 s). Configurable so a
     #: human can override at the env layer without code changes.
     redis_search_cache_ttl_seconds: int = Field(default=604_800, ge=60)
+    #: Opportunistic post-Tavily store discovery: when ``True``, the pipeline
+    #: takes unknown-host snippets from the main consolidated Tavily call and
+    #: feeds them into the discovery LLM (gpt-4o-mini) so real local shops
+    #: surfaced by the artist/album query are upserted into ``whitelist_stores``
+    #: AND added to the current request's prefilter whitelist. Adds ~0.5–1.5s
+    #: of latency + one LLM call per uncached city query — disable to revert.
+    pipeline_opportunistic_store_discovery_enabled: bool = True
+    #: Minimum number of unknown-host snippets required before opportunistic
+    #: discovery fires (avoids burning an LLM call on requests where the main
+    #: Tavily output is already dominated by curated / blacklisted hosts).
+    pipeline_opportunistic_discovery_min_unknown_hosts: int = Field(default=2, ge=1, le=10)
     #: Hard cap on candidate URLs passed to the LLM extractor after Python pre-filtering.
-    pipeline_prefilter_max_candidates: int = Field(default=10, ge=3, le=20)
+    pipeline_prefilter_max_candidates: int = Field(default=6, ge=3, le=20)
     #: Per-host cap for the Python pre-filter (top-N best-scored deep links per shop).
-    pipeline_prefilter_max_per_host: int = Field(default=2, ge=1, le=5)
+    pipeline_prefilter_max_per_host: int = Field(default=1, ge=1, le=5)
     #: Single consolidated Tavily call: ``max_results`` upper bound.
     tavily_single_call_max_results: int = Field(default=10, ge=5, le=30)
     #: Single consolidated Tavily call: ``search_depth`` value.
@@ -38,7 +49,7 @@ class Settings(BaseSettings):
     tavily_max_http_calls: int = Field(default=4, ge=1, le=20)
     #: One request carries up to this many ``include_domains``; only then split (see chunk threshold).
     tavily_max_results_per_batch: int = Field(default=6, ge=5, le=8)
-    tavily_max_results_per_domain_aggregate: int = Field(default=2, ge=1, le=5)
+    tavily_max_results_per_domain_aggregate: int = Field(default=1, ge=1, le=5)
     #: ``basic`` reduces Tavily credit burn vs ``advanced``.
     tavily_search_depth: str = Field(default="basic", description='Tavily "search_depth" payload value')
     #: Split ``include_domains`` across parallel requests only when above this count (e.g. 21 → 2 calls).
@@ -48,7 +59,7 @@ class Settings(BaseSettings):
     #: Domains bundled into one textual ``(site: · OR ·)`` tail per Tavily POST (city-tier fan-in).
     tavily_local_power_max_domains_per_chunk: int = Field(default=5, ge=1, le=20)
     #: Drop very low Tavily relevance scores (reduces blog/noise URLs before extraction).
-    tavily_min_result_score: float = Field(default=0.16, ge=0.0, le=1.0)
+    tavily_min_result_score: float = Field(default=0.20, ge=0.0, le=1.0)
     #: Raw Tavily JSON cached per (artist, album, tier) before extraction; min 12h.
     tavily_intermediate_cache_ttl_seconds: int = Field(default=43200, ge=43200)
     #: Tavily intermittently returns 429 / 432 / 433 under burst traffic; retry before giving up.

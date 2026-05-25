@@ -56,7 +56,7 @@ _BLACKLIST_HOST_SUBSTRINGS: tuple[str, ...] = (
     "deezer.com",
     "tidal.com",
     "pandora.com",
-    "bandcamp.com",  # discovery / fan platform, not a multi-artist PDP shop
+    "bandcamp.com",
     "genius.com",
     "azlyrics.com",
     "lyrics.com",
@@ -97,6 +97,33 @@ _BLACKLIST_HOST_SUBSTRINGS: tuple[str, ...] = (
     "tripadvisor.",
     "yelp.",
     "timeout.com",
+    # Marketplace mega-shops (their localised TLD variants too — opportunistic
+    # store discovery skips these so we never spend an LLM call verifying that
+    # eBay-Germany is not an indie record shop).
+    "ebay.com",
+    "ebay.de",
+    "ebay.co.uk",
+    "ebay.it",
+    "ebay.fr",
+    "ebay.es",
+    "ebay.nl",
+    "ebay.at",
+    "ebay.pl",
+    "ebay.ie",
+    "ebay.com.au",
+    "amazon.com",
+    "amazon.de",
+    "amazon.co.uk",
+    "amazon.it",
+    "amazon.fr",
+    "amazon.es",
+    "amazon.nl",
+    "amazon.pl",
+    "amazon.com.au",
+    "etsy.com",
+    "allegro.pl",
+    "avito.ru",
+    "kupindo.com",
     # Discogs metadata (we hit the API server-side; the public site is a hub
     # without consistent buy-now PDP rows for our shop-pool intent).
     "discogs.com",

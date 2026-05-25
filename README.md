@@ -255,11 +255,17 @@ Interactive docs: **`/docs`** (Swagger) when the backend is running.
 
 ```bash
 cd backend
-export OPENAI_API_KEY=dummy TAVILY_API_KEY=dummy   # required by Settings() in some suites
-poetry run python -m unittest discover -s tests -p 'test_*.py' -v
+export OPENAI_API_KEY=dummy TAVILY_API_KEY=dummy   # required unless already in .env
+poetry run python -m unittest tests.test_app_http_e2e -v
 ```
 
-The suite focuses on **policies, extractors, validators, geo ranking, locale variants, and pipeline edge cases** (e.g. early exit when the album cannot be resolved). **CI wiring (GitHub Actions) is left as an easy addition** for your fork.
+`tests/test_app_http_e2e.py` mounts the real FastAPI app and asserts **routing, validation (`422`s), malformed JSON behaviour, mocked `/parse`/`/search` wiring, `/search-listings` alias parity**, and **`/openapi.json`/`/health`** — without calling OpenAI/Tavily/Postgres (DB/Redis URLs are cleared for this module).
+
+For a full **`discover`** run (only this file ships today):
+
+```bash
+poetry run python -m unittest discover -s tests -p 'test_*.py' -v
+```
 
 ---
 

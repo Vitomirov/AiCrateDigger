@@ -11,6 +11,7 @@ import json
 import logging
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import get_settings
 from app.core.db.database import WhitelistStoreORM, session_factory
@@ -254,7 +255,14 @@ async def repair_whitelist_store_domains() -> dict[str, int]:
 
 
 async def load_active_stores() -> tuple[StoreEntry, ...]:
-    """DB-backed allowlist when migrations/seed populated the table; else code tuple."""
+    """DB-backed allowlist when migrations/seed populated the table; else code tuple.
+
+    Robustness contract: any DB-side failure (engine unavailable, connection
+    refused, transient ``OperationalError``, …) silently degrades to the
+    in-code :func:`get_active_stores` tuple. Returning an empty allowlist
+    would empty the prefilter whitelist and cause every curated indie shop
+    URL to be rejected as ``rejected_no_pdp_signal``.
+    """
     settings = get_settings()
     if not settings.database_url:
         return get_active_stores()
@@ -263,13 +271,20 @@ async def load_active_stores() -> tuple[StoreEntry, ...]:
     except RuntimeError:
         return get_active_stores()
 
-    async with sf() as session:
-        result = await session.scalars(
-            select(WhitelistStoreORM)
-            .where(WhitelistStoreORM.is_active.is_(True))
-            .order_by(WhitelistStoreORM.priority.desc(), WhitelistStoreORM.domain.asc())
+    try:
+        async with sf() as session:
+            result = await session.scalars(
+                select(WhitelistStoreORM)
+                .where(WhitelistStoreORM.is_active.is_(True))
+                .order_by(WhitelistStoreORM.priority.desc(), WhitelistStoreORM.domain.asc())
+            )
+            rows = result.all()
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "load_active_stores_db_unavailable_falling_back_to_code_seed",
+            extra={"stage": "stores", "reason": str(exc)[:200]},
         )
-        rows = result.all()
+        return get_active_stores()
 
     if not rows:
         return get_active_stores()
