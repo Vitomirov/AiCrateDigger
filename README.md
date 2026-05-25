@@ -128,22 +128,16 @@ AiCrateDigger/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py                 # FastAPI app + lifespan (DB init, store seed, cache purge)
-│   │   ├── config.py               # Settings (env-driven knobs)
-│   │   ├── logging_config.py       # Human vs JSON log formatters
-│   │   ├── routers/search.py       # /parse, /search, /search-listings
-│   │   ├── pipeline/
-│   │   │   └── vinyl_search.py     # Orchestrator: parse → tiers → Tavily → extract → validate
-│   │   ├── pipeline_context.py     # Per-request stage trace (DEBUG payload)
-│   │   ├── agents/
-│   │   │   ├── parser/             # parse_user_query + steps
-│   │   │   └── extractor/        # extract_listings + evidence / verify helpers
-│   │   ├── services/               # tavily_service, discogs_service, store_discovery, batches
-│   │   ├── policies/               # geo_scope, search_dsl, listing_rank, eu_stores, …
-│   │   ├── db/                     # database.py, cache.py, store_loader.py
-│   │   ├── domain/                 # parse_schema, listing_schema
-│   │   ├── models/                 # API models (SearchResponse, ListingResult, …)
-│   │   ├── validators/             # listings validation gates
-│   │   └── llm/                    # small coercion helpers
+│   │   ├── core/                   # config, logging, db (infra)
+│   │   │   ├── config.py           # Settings (env-driven knobs)
+│   │   │   ├── logging_config.py   # Human vs JSON log formatters
+│   │   │   └── db/                 # database.py, cache.py, store_loader.py, redis_cache.py
+│   │   ├── api/                    # FastAPI routers
+│   │   │   └── routers/search.py # /parse, /search, /search-listings
+│   │   └── domains/               # vertical slices
+│   │       ├── query_parser/      # parse_schema, discogs, parser steps
+│   │       ├── search_pipeline/    # vinyl_search, pipeline_context, tier_runner, models
+│   │       └── engine/            # Tavily (search/), extraction/, policies/, listing_schema, validators, llm/
 │   └── tests/                      # unittest suite (see Testing)
 ├── frontend/
 │   ├── app/                        # App Router, /api/search & /api/parse proxies
@@ -153,6 +147,8 @@ AiCrateDigger/
 ├── .env.example                    # Copy to .env — never commit secrets
 └── README.md
 ```
+
+**Backend imports:** there is no top-level `services/` package — use `app.domains.engine.search` (lazy package facade) or concrete submodules such as `domain_batches` / `power_query` so pure tests do not pull in `httpx` until needed.
 
 ---
 
@@ -219,7 +215,7 @@ Use **`NEXT_PUBLIC_BACKEND_URL`** for browser-side calls where applicable, and *
 | `LOG_LEVEL` | No | Default `INFO` |
 | `LOG_FORMAT` | No | `human` (local) or **`json`** (aggregators) |
 
-**Important knobs** (Tavily retries, fanout concurrency, geo caps, fuzzy thresholds, cache TTLs) live in **`backend/app/config.py`** as typed **`Settings`** fields — prefer changing env-backed settings over editing pipeline code.
+**Important knobs** (Tavily retries, fanout concurrency, geo caps, fuzzy thresholds, cache TTLs) live in **`backend/app/core/config.py`** as typed **`Settings`** fields — prefer changing env-backed settings over editing pipeline code.
 
 ---
 
@@ -248,7 +244,7 @@ Interactive docs: **`/docs`** (Swagger) when the backend is running.
 
 ## Observability
 
-- Central **`logging_config`**: switch **`LOG_FORMAT=json`** in deployment for structured logs.
+- Central **`app.core.logging_config`**: switch **`LOG_FORMAT=json`** in deployment for structured logs.
 - Pipeline stages attach **`request_id`** and domain-specific **`extra`** fields suitable for filtering in log drains.
 
 **Operational note:** Keep **`DEBUG=false`** on any publicly reachable deployment — otherwise **`debug`** payloads in JSON responses can expose internal traces.
@@ -284,9 +280,9 @@ The suite focuses on **policies, extractors, validators, geo ranking, locale var
 **Suggested reading order (≈15 minutes):**
 
 1. This README  
-2. `backend/app/pipeline/vinyl_search.py` — orchestration and geo tier loop  
-3. `backend/app/services/tavily_service.py` — batching, retries, domain hygiene  
-4. `backend/app/policies/listing_rank.py` — scoring philosophy  
+2. `backend/app/domains/search_pipeline/vinyl_search.py` — orchestration and geo tier loop  
+3. `backend/app/domains/engine/search/` — batching, retries, domain hygiene (see package `__init__.py`)  
+4. `backend/app/domains/engine/policies/listing_rank.py` — scoring philosophy  
 5. `backend/tests/` — regression coverage
 
 If you **clone and run Compose with valid keys**, you get a **working vertical slice** suitable for a portfolio conversation about **async Python, LLM boundaries, search UX, and pragmatic tradeoffs**.

@@ -9,22 +9,22 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.agents.extractor import ExtractListingsReport, extract_listings
-from app.agents.extractor.evidence_alignment import (
+from app.domains.engine.extraction import ExtractListingsReport, extract_listings
+from app.domains.engine.extraction.evidence_alignment import (
     ascii_fold,
     evidence_blob_matches_target_release,
     url_path_evidence_text,
 )
-from app.agents.extractor.intent_match import intent_matches_snippet
-from app.agents.extractor.listing_domains import (
+from app.domains.engine.extraction.intent_match import intent_matches_snippet
+from app.domains.engine.extraction.listing_domains import (
     host_matches_whitelist,
     normalize_allowed_domains,
     normalize_domain,
 )
-from app.agents.extractor.steps.step_01_snippet_prefilter import collect_snippet_candidates
-from app.agents.extractor.steps.step_02_listing_deterministic import deterministic_listings_from_candidates
-from app.agents.extractor.steps.step_04_merge_llm_listings import merge_llm_rows_into_listings
-from app.agents.extractor.utils.price_currency import coerce_price_currency, sniff_price_currency
+from app.domains.engine.extraction.steps.step_01_snippet_prefilter import collect_snippet_candidates
+from app.domains.engine.extraction.steps.step_02_listing_deterministic import deterministic_listings_from_candidates
+from app.domains.engine.extraction.steps.step_04_merge_llm_listings import merge_llm_rows_into_listings
+from app.domains.engine.extraction.utils.price_currency import coerce_price_currency, sniff_price_currency
 
 
 class TestDomains(unittest.TestCase):
@@ -237,7 +237,7 @@ class TestExtractListingsPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(r.diagnostic["empty_reason"])
 
     @patch(
-        "app.agents.extractor.steps.step_05_listings_orchestrator.llm_extract",
+        "app.domains.engine.extraction.steps.step_05_listings_orchestrator.llm_extract",
         new_callable=AsyncMock,
     )
     async def test_llm_branch_merges_rows(self, mock_llm: AsyncMock) -> None:
@@ -283,7 +283,7 @@ class TestExtractListingsPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(r.diagnostic["empty_reason"])
 
     @patch(
-        "app.agents.extractor.steps.step_05_listings_orchestrator.llm_extract",
+        "app.domains.engine.extraction.steps.step_05_listings_orchestrator.llm_extract",
         new_callable=AsyncMock,
     )
     async def test_llm_empty_array_sets_diagnostic(self, mock_llm: AsyncMock) -> None:
@@ -450,13 +450,13 @@ class TestThinSnippetSurvivesViaUrlSlug(unittest.TestCase):
 
 
 class TestPlaceholderDomainsDoNotPoisonTavily(unittest.TestCase):
-    """``_dedupe_domains`` is the last line of defence — verify placeholder
+    """``dedupe_domains`` is the last line of defence — verify placeholder
     hosts emitted by the discovery LLM never reach ``include_domains``."""
 
     def test_invalid_hosts_filtered_from_dedupe(self) -> None:
-        from app.services.tavily_service import _dedupe_domains  # noqa: PLC0415
+        from app.domains.engine.search import dedupe_domains  # noqa: PLC0415
 
-        kept = _dedupe_domains([
+        kept = dedupe_domains([
             "groovierecords.com",
             "none",
             "unknown",

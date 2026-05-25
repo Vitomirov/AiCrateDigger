@@ -40,7 +40,7 @@ services:
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       DISCOGS_TOKEN: ${DISCOGS_TOKEN:-}
       DEBUG: ${DEBUG:-false}
-      # Matches app.db.database: async SQLAlchemy + asyncpg (host `db` = Compose service name)
+      # Matches app.core.db.database: async SQLAlchemy + asyncpg (host `db` = Compose service name)
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://aicratedigger:aicratedigger@db:5432/aicratedigger}
       # Redis cache layer for the consolidated pipeline (7-day TTL). Optional —
       # if unset the cache silently no-ops and every request hits the live API.

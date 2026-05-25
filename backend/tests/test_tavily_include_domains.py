@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from app.models.search_query import SearchResult
-from app.services.tavily import enforce_include_domains_hosts
+from app.domains.search_pipeline.models.search_query import SearchResult
+from app.domains.engine.search import enforce_include_domains_hosts
 
 
 class TestEnforceIncludeDomainsHosts(unittest.TestCase):

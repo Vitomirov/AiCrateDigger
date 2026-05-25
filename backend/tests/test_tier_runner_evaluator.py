@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.pipeline.tier_runner.evaluator import compute_early_stop
+from app.domains.search_pipeline.tier_runner.evaluator import compute_early_stop
 
 
 class TestComputeEarlyStop(unittest.TestCase):

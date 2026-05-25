@@ -1,12 +1,12 @@
-"""Unit tests for ``app.policies.physical_local`` (local-first locality signals)."""
+"""Unit tests for ``app.domains.engine.policies.physical_local`` (local-first locality signals)."""
 
 from __future__ import annotations
 
 import unittest
 
-from app.policies.eu_stores import StoreEntry
-from app.policies.geo_scope import GeoIntent, NormalizedGeoIntent
-from app.policies.physical_local import (
+from app.domains.engine.policies.eu_stores import StoreEntry
+from app.domains.engine.policies.geo_scope import GeoIntent, NormalizedGeoIntent
+from app.domains.engine.policies.physical_local import (
     curated_city_local_shop_domains,
     should_prioritize_physical_local_shops,
 )

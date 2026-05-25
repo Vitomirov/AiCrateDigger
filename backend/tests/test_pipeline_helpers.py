@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import unittest
 
-from app.llm.coerce_listing_fields import coerce_in_stock
-from app.services.tavily_domain_batches import chunk_include_domains
-from app.services.tavily_power_query import (
+from app.domains.engine.llm.coerce_listing_fields import coerce_in_stock
+from app.domains.engine.search.domain_batches import chunk_include_domains
+from app.domains.engine.search.power_query import (
     build_physical_power_query_base,
     chunk_domains_for_power_queries,
 )

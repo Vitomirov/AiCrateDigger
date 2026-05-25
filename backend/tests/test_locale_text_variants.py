@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from app.agents.extractor.intent_match import intent_matches_snippet
-from app.policies.locale_text_variants import expand_album_glyph_variants, expand_artist_glyph_variants
+from app.domains.engine.extraction.intent_match import intent_matches_snippet
+from app.domains.engine.policies.locale_text_variants import expand_album_glyph_variants, expand_artist_glyph_variants
 
 
 class TestArtistGlyphVariants(unittest.TestCase):
@@ -41,7 +41,7 @@ class TestSnippetIntent(unittest.TestCase):
 
 class TestGlobalFallbackGate(unittest.TestCase):
     def test_fnac_misc_sku_rejected(self) -> None:
-        from app.validators.listings import global_fallback_matches_parsed_entity
+        from app.domains.engine.validators.listings import global_fallback_matches_parsed_entity
 
         snippet = (
             "I Had Too Much To Dream Last Night - The Electric Prunes - Fnac. "

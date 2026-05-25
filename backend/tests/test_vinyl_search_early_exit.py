@@ -6,16 +6,16 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.domain.parse_schema import ParsedQuery
-from app.pipeline.vinyl_search import run_vinyl_search
-from app.services.discogs_service import Album, AlbumResolution
+from app.domains.query_parser.parse_schema import ParsedQuery
+from app.domains.search_pipeline.vinyl_search import run_vinyl_search
+from app.domains.query_parser.discogs_service import Album, AlbumResolution
 
 
 class TestVinylSearchAlbumUnresolved(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         super().setUp()
         self._settings_patcher = patch(
-            "app.pipeline.vinyl_search.get_settings",
+            "app.domains.search_pipeline.vinyl_search.get_settings",
             return_value=SimpleNamespace(debug=False),
         )
         self._settings_patcher.start()
@@ -32,7 +32,7 @@ class TestVinylSearchAlbumUnresolved(unittest.IsolatedAsyncioTestCase):
             original_query="Someone vinyl",
         )
         with patch(
-            "app.pipeline.vinyl_search.parse_user_query",
+            "app.domains.search_pipeline.vinyl_search.parse_user_query",
             new_callable=AsyncMock,
             return_value=pq,
         ):
@@ -49,7 +49,7 @@ class TestVinylSearchAlbumUnresolved(unittest.IsolatedAsyncioTestCase):
             original_query="Someone vinyl",
         )
         with patch(
-            "app.pipeline.vinyl_search.parse_user_query",
+            "app.domains.search_pipeline.vinyl_search.parse_user_query",
             new_callable=AsyncMock,
             return_value=pq,
         ):
@@ -65,12 +65,12 @@ class TestVinylSearchAlbumUnresolved(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch(
-                "app.pipeline.vinyl_search.parse_user_query",
+                "app.domains.search_pipeline.vinyl_search.parse_user_query",
                 new_callable=AsyncMock,
                 return_value=pq,
             ),
             patch(
-                "app.pipeline.vinyl_search.resolve_album_by_index",
+                "app.domains.search_pipeline.vinyl_search.resolve_album_by_index",
                 new_callable=AsyncMock,
                 return_value=AlbumResolution(album=None, index=None, confidence=0.0),
             ),
@@ -88,12 +88,12 @@ class TestVinylSearchAlbumUnresolved(unittest.IsolatedAsyncioTestCase):
         bogus = Album(title="   ", year=None, discogs_id="1")
         with (
             patch(
-                "app.pipeline.vinyl_search.parse_user_query",
+                "app.domains.search_pipeline.vinyl_search.parse_user_query",
                 new_callable=AsyncMock,
                 return_value=pq,
             ),
             patch(
-                "app.pipeline.vinyl_search.resolve_album_by_index",
+                "app.domains.search_pipeline.vinyl_search.resolve_album_by_index",
                 new_callable=AsyncMock,
                 return_value=AlbumResolution(album=bogus, index=1, confidence=1.0),
             ),

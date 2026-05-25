@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.policies.store_domain import (
+from app.domains.engine.policies.store_domain import (
     canonical_store_domain,
     is_valid_store_host,
     registrable_host_only,

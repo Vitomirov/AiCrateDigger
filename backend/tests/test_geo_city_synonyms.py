@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.policies.geo_proximity import cities_match
+from app.domains.engine.policies.geo_proximity import cities_match
 
 
 class TestCitySynonyms(unittest.TestCase):

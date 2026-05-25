@@ -3,17 +3,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.config import get_settings
-from app.db.cache import purge_expired_search_cache_rows
-from app.db.database import dispose_engine, init_db
-from app.db.redis_cache import dispose_redis_client
-from app.db.store_loader import (
+from app.core.config import get_settings
+from app.core.db.cache import purge_expired_search_cache_rows
+from app.core.db.database import dispose_engine, init_db
+from app.core.db.redis_cache import dispose_redis_client
+from app.core.db.store_loader import (
     repair_whitelist_store_domains,
     seed_whitelist_stores_if_empty,
     sync_whitelist_store_catalogue,
 )
-from app.logging_config import setup_logging
-from app.routers.search import router as search_router
+from app.core.logging_config import setup_logging
+from app.api.routers.search import router as search_router
 
 settings = get_settings()
 setup_logging(level=settings.log_level, log_format=settings.log_format)

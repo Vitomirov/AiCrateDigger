@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import unittest
 
-from app.policies.geo_proximity import cities_match, geo_proximity_bonus
-from app.policies.geo_scope import (
+from app.domains.engine.policies.geo_proximity import cities_match, geo_proximity_bonus
+from app.domains.engine.policies.geo_scope import (
     GeoIntent,
     NormalizedGeoIntent,
     expand_ships_to,
