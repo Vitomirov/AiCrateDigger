@@ -1,63 +1,20 @@
-export type HealthResponse = {
-  status: string;
-  service: string;
-};
+/**
+ * Browser-safe API client. Uses same-origin `/api/*` proxies only — no Node built-ins.
+ */
 
-export type ListingResultDto = {
-  url: string;
-  title: string;
-  score: number;
-  price: string | null;
-  location: string | null;
-  availability: string;
-  seller_type: string;
-  domain: string | null;
-};
+import type {
+  ListingResultDto,
+  ParsedQueryDto,
+  SearchResponseDto,
+} from "./api-types";
 
-/** Mirrors backend `domain.parse_schema.ParsedQuery` (subset for typing). */
-export type ParsedQueryDto = {
-  artist: string | null;
-  album: string | null;
-  album_index: number | null;
-  location: string | null;
-  country_code: string | null;
-  search_scope: string;
-  resolved_city: string | null;
-  geo_confidence: number | null;
-  geo_granularity: string | null;
-  language: string;
-  original_query: string;
-};
-
-/** Machine-readable empty-state code emitted by `/search`. Mirrors backend
- *  `models.search_query.SearchEmptyReason`. Keep in sync. */
-export type SearchEmptyReason = "album_unresolved";
-
-export type SearchResponseDto = {
-  results: ListingResultDto[];
-  /** Parser output that drove the pipeline. Always populated on a 200 — one
-   *  round-trip covers both the result list and the parse-debug pane. */
-  parsed?: ParsedQueryDto | null;
-  /** Structured explanation for an empty `results` array (e.g. the album
-   *  could not be resolved). `null`/omitted on a normal Tavily-backed search. */
-  reason?: SearchEmptyReason | null;
-  debug?: Record<string, unknown> | null;
-};
-
-const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
-
-export async function fetchHealth(): Promise<HealthResponse> {
-  const response = await fetch(`${backendUrl}/health`, {
-    method: "GET",
-    cache: "no-store",
-  });
-
-  if (!response.ok) {
-    throw new Error(`Health-check failed with status ${response.status}`);
-  }
-
-  return (await response.json()) as HealthResponse;
-}
+export type {
+  HealthResponse,
+  ListingResultDto,
+  ParsedQueryDto,
+  SearchEmptyReason,
+  SearchResponseDto,
+} from "./api-types";
 
 export async function postSearch(query: string): Promise<SearchResponseDto> {
   const response = await fetch("/api/search", {

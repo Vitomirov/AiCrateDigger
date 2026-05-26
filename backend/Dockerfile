@@ -1,7 +1,6 @@
 FROM python:3.11-slim
 
-# Runtime: `asyncpg` wheels are prebuilt; SQLAlchemy talks to Postgres over the Docker network.
-# Set `DATABASE_URL=postgresql+asyncpg://USER:PASS@db:5432/DB` (see docker-compose).
+# Runtime: Postgres + Redis URLs come from the repo-root `.env` via docker-compose `env_file`.
 
 ENV POETRY_VERSION=1.8.4 \
     POETRY_VIRTUALENVS_CREATE=false \

@@ -23,6 +23,7 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-e2e-dummy-unused")
 os.environ.setdefault("TAVILY_API_KEY", "tv-e2e-dummy-unused")
 os.environ["DATABASE_URL"] = ""
 os.environ["REDIS_URL"] = ""
+os.environ["DEBUG"] = "false"
 
 from app.core.config import get_settings  # noqa: E402
 
@@ -50,7 +51,11 @@ class TestHTTPAppEdgeCases(unittest.TestCase):
         """Liveness probe: stable JSON contract for gateways / Compose."""
         r = self.client.get("/health")
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json(), {"status": "ok", "service": "backend"})
+        body = r.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["service"], "backend")
+        self.assertIn("database_configured", body)
+        self.assertFalse(body["database_configured"])
 
     def test_openapi_schema_exposed(self) -> None:
         """Regression: Swagger stack and codegen consumers expect bundled OpenAPI."""

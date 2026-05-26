@@ -3,16 +3,18 @@
 When ``DATABASE_URL`` is unset, engines are not created and callers keep using
 in-code policies (e.g. :mod:`app.domains.engine.policies.eu_stores`) only.
 
-Docker Compose should set ``DATABASE_URL=postgresql+asyncpg://...@db:5432/...``
-with host ``db`` equal to the Postgres service name on the Compose network.
+Set ``DATABASE_URL`` in the repo-root ``.env`` or the process environment.
+Inside Docker Compose use host ``db``; from the host machine use
+``localhost`` and the published port (default ``5433``).
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, func, text
+from sqlalchemy import DateTime, Float, Integer, String, Text, func, inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -20,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 _engine: AsyncEngine | None = None
 _async_session_factory: async_sessionmaker[AsyncSession] | None = None
+
+_EXPECTED_TABLES = frozenset({"whitelist_stores", "search_response_cache"})
 
 
 class Base(DeclarativeBase):
@@ -68,6 +72,35 @@ def _to_async_url(database_url: str) -> str:
     )
 
 
+def mask_database_url(database_url: str | None) -> str | None:
+    """Redact password for logs."""
+    if not database_url:
+        return None
+    try:
+        parsed = urlparse(database_url)
+        host = parsed.hostname or "?"
+        port = f":{parsed.port}" if parsed.port else ""
+        db = (parsed.path or "/").lstrip("/") or "?"
+        user = parsed.username or "?"
+        return f"{parsed.scheme}://{user}:***@{host}{port}/{db}"
+    except Exception:
+        return "<invalid DATABASE_URL>"
+
+
+def is_database_configured() -> bool:
+    """True when a Postgres DSN is available from env (``DATABASE_URL`` or ``POSTGRES_*``)."""
+    from app.core.config import get_settings
+
+    return get_settings().database_enabled
+
+
+def get_resolved_database_url() -> str | None:
+    """Central accessor: env ``DATABASE_URL`` or DSN built from ``POSTGRES_*``."""
+    from app.core.config import get_settings
+
+    return get_settings().resolved_database_url
+
+
 def session_factory() -> async_sessionmaker[AsyncSession]:
     if _async_session_factory is None:
         raise RuntimeError("Database is not initialised (missing DATABASE_URL or init_db not run).")
@@ -97,14 +130,43 @@ async def init_db(*, database_url: str, debug: bool = False) -> None:
         ):
             await conn.execute(text(stmt))
 
+        def _verify_tables(sync_conn: Any) -> list[str]:
+            present = set(inspect(sync_conn).get_table_names())
+            missing = _EXPECTED_TABLES - present
+            if missing:
+                logger.error(
+                    "database_tables_missing_after_create_all",
+                    extra={"stage": "database", "missing": sorted(missing)},
+                )
+                for table_name in sorted(missing):
+                    table = Base.metadata.tables.get(table_name)
+                    if table is not None:
+                        table.create(sync_conn, checkfirst=True)
+            return sorted(present & _EXPECTED_TABLES)
+
+        tables_ready = await conn.run_sync(_verify_tables)
+
     logger.info(
         "database_init",
         extra={
             "stage": "database",
             "status": "success",
-            "tables": ["whitelist_stores", "search_response_cache"],
+            "database_url": mask_database_url(database_url),
+            "tables": tables_ready,
         },
     )
+
+
+async def init_db_from_settings() -> bool:
+    """Initialise Postgres from env (``DATABASE_URL`` or ``POSTGRES_*``). Returns whether DB is active."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    url = settings.resolved_database_url
+    if not url:
+        return False
+    await init_db(database_url=url, debug=settings.debug)
+    return True
 
 
 async def dispose_engine() -> None:

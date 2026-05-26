@@ -1,10 +1,9 @@
 import { NextResponse } from "next/server";
 
+import { getServerBackendBase } from "../../../lib/server-backend-url";
+
 export async function POST(request: Request): Promise<NextResponse> {
-  const backendBase =
-    process.env.BACKEND_URL?.replace(/\/$/, "") ??
-    process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/$/, "") ??
-    "http://127.0.0.1:8000";
+  const backendBase = getServerBackendBase();
 
   let body: unknown;
   try {
@@ -28,7 +27,12 @@ export async function POST(request: Request): Promise<NextResponse> {
       status: res.status,
       headers: { "Content-Type": contentType },
     });
-  } catch {
-    return NextResponse.json({ detail: "Could not reach parse backend." }, { status: 502 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "fetch failed";
+    console.error("parse_proxy_failed", { backendBase, message });
+    return NextResponse.json(
+      { detail: `Could not reach parse backend at ${backendBase}.` },
+      { status: 502 },
+    );
   }
 }

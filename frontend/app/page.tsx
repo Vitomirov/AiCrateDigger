@@ -1,5 +1,5 @@
 import SearchExperience from "../components/SearchExperience";
-import { fetchHealth } from "../lib/api";
+import { fetchHealth } from "../lib/api-server";
 
 export default async function HomePage() {
   let healthHint = "";

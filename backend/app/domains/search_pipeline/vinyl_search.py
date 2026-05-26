@@ -68,6 +68,7 @@ from app.domains.query_parser.parse_user_query import parse_user_query
 from app.core.config import get_settings
 from app.core.db.cache import (
     build_search_cache_key,
+    get_cached_search_payload,
     set_cached_search_payload,
 )
 from app.core.db.redis_cache import (
@@ -595,10 +596,15 @@ async def _run_vinyl_search_inner(
 
     with stage_timer(
         "redis_cache_lookup",
-        input={"cache_key": redis_key},
+        input={"cache_key": redis_key, "pg_cache_key_head": pg_key[:16]},
     ) as rec:
         cached = await get_cached_search(redis_key)
-        rec.output = {"hit": cached is not None}
+        cache_source = "redis" if cached is not None else None
+        if cached is None:
+            cached = await get_cached_search_payload(pg_key)
+            if cached is not None:
+                cache_source = "postgres"
+        rec.output = {"hit": cached is not None, "source": cache_source}
         rec.status = "success" if cached is not None else "empty"
 
     if cached is not None:
@@ -612,11 +618,12 @@ async def _run_vinyl_search_inner(
             )
         else:
             logger.info(
-                "redis_cache_hit",
+                "search_cache_hit",
                 extra={
-                    "stage": "redis_cache",
+                    "stage": "search_cache",
                     "cache_key_head": redis_key[:64],
                     "result_count": len(hydrated_rows),
+                    "source": cache_source or "redis",
                 },
             )
             return {

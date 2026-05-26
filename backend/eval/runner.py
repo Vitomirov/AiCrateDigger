@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.core.config import get_settings
 from app.core.db.cache import purge_expired_search_cache_rows
-from app.core.db.database import dispose_engine, init_db
+from app.core.db.database import dispose_engine, init_db_from_settings, is_database_configured
 from app.core.db.redis_cache import purge_stale_pipeline_cache_versions
 from app.core.db.store_loader import (
     repair_whitelist_store_domains,
@@ -51,13 +51,13 @@ async def bootstrap_eval_env() -> None:
     """Mirror API startup so store whitelist + DB are available in Docker."""
     settings = get_settings()
     setup_logging(level=settings.log_level, log_format=settings.log_format)
-    if not settings.database_url:
+    if not is_database_configured():
         logger.warning(
             "eval_db_skipped",
             extra={"stage": "eval", "reason": "DATABASE_URL unset"},
         )
         return
-    await init_db(database_url=settings.database_url, debug=settings.debug)
+    await init_db_from_settings()
     await seed_whitelist_stores_if_empty()
     await sync_whitelist_store_catalogue()
     await repair_whitelist_store_domains()

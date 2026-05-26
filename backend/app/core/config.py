@@ -1,18 +1,50 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
+from urllib.parse import quote_plus
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+_REPO_DIR = _BACKEND_DIR.parent
+
+
+def _discover_env_files() -> tuple[str, ...]:
+    """Load ``.env`` from repo root and/or ``backend/`` (whichever exists).
+
+    OS environment variables always win over file values. Compose injects
+    ``DATABASE_URL`` directly; local ``poetry run`` from ``backend/`` still
+    picks up ``../.env`` when the root file is the only copy.
+    """
+    explicit = (__import__("os").environ.get("ENV_FILE") or "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        return (str(path),) if path.is_file() else ()
+
+    found: list[str] = []
+    for candidate in (_BACKEND_DIR / ".env", _REPO_DIR / ".env"):
+        if candidate.is_file():
+            found.append(str(candidate))
+    return tuple(found)
 
 
 class Settings(BaseSettings):
     openai_api_key: str
     tavily_api_key: str
     discogs_token: str | None = None
+    #: Primary Postgres DSN from env ``DATABASE_URL`` (preferred).
     database_url: str | None = None
-    #: Optional Redis URL (e.g. ``redis://redis:6379/0``). When unset the cache layer
-    #: silently no-ops and every request hits the live pipeline.
+    #: Optional components used to build ``DATABASE_URL`` when the full DSN is not set.
+    postgres_user: str | None = None
+    postgres_password: str | None = None
+    postgres_db: str | None = None
+    postgres_host: str | None = None
+    postgres_port: int | None = None
+    #: From env ``REDIS_URL``. When unset the cache layer silently no-ops.
     redis_url: str | None = None
+    #: Browser URL for the Next.js UI — used when visitors open the API port by mistake.
+    frontend_public_url: str = Field(default="http://localhost:3000")
 
     debug: bool = False
     log_level: str = "INFO"
@@ -104,16 +136,58 @@ class Settings(BaseSettings):
     discogs_user_agent: str = "AiCrateDigger/0.1 (+https://github.com/ai-cratedigger)"
     discogs_timeout_seconds: float = 8.0
 
+    @property
+    def resolved_database_url(self) -> str | None:
+        """``DATABASE_URL`` from env, or built from ``POSTGRES_*`` components."""
+        if self.database_url:
+            return self.database_url
+        user = (self.postgres_user or "").strip()
+        password = (self.postgres_password or "").strip()
+        host = (self.postgres_host or "").strip()
+        db = (self.postgres_db or "").strip()
+        if not (user and password and host and db):
+            return None
+        port = self.postgres_port
+        port_segment = f":{port}" if port else ""
+        return (
+            f"postgresql+asyncpg://{quote_plus(user)}:{quote_plus(password)}"
+            f"@{host}{port_segment}/{quote_plus(db)}"
+        )
+
+    @property
+    def database_enabled(self) -> bool:
+        return bool(self.resolved_database_url)
+
     @field_validator("log_format", mode="before")
     @classmethod
     def _normalize_log_format(cls, v: object) -> str:
         s = str(v or "human").strip().lower()
         return s if s in ("human", "json") else "human"
 
+    @field_validator(
+        "database_url",
+        "redis_url",
+        "discogs_token",
+        "postgres_user",
+        "postgres_password",
+        "postgres_db",
+        "postgres_host",
+        mode="before",
+    )
+    @classmethod
+    def _strip_optional_env_str(cls, v: object) -> object:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s or None
+        return v
+
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_discover_env_files(),
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
 

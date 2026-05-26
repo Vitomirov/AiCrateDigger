@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from sqlalchemy import delete
 
 from app.core.config import get_settings
-from app.core.db.database import SearchResponseCacheORM, session_factory
+from app.core.db.database import SearchResponseCacheORM, is_database_configured, session_factory
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ async def get_cached_tavily_tier_payload(cache_key: str) -> list[dict[str, Any]]
     settings = get_settings()
     if settings.debug:
         return None
-    if not settings.database_url or not settings.search_cache_enabled:
+    if not is_database_configured() or not settings.search_cache_enabled:
         return None
     try:
         sf = session_factory()
@@ -113,9 +113,7 @@ async def set_cached_tavily_tier_payload(
     ttl_seconds: int,
 ) -> None:
     settings = get_settings()
-    if settings.debug:
-        return
-    if not settings.database_url or not settings.search_cache_enabled:
+    if not is_database_configured() or not settings.search_cache_enabled:
         return
     try:
         sf = session_factory()
@@ -165,7 +163,7 @@ async def get_cached_search_payload(cache_key: str) -> dict[str, Any] | None:
     settings = get_settings()
     if settings.debug:
         return None
-    if not settings.database_url or not settings.search_cache_enabled:
+    if not is_database_configured() or not settings.search_cache_enabled:
         return None
     try:
         sf = session_factory()
@@ -190,10 +188,9 @@ async def get_cached_search_payload(cache_key: str) -> dict[str, Any] | None:
 
 
 async def set_cached_search_payload(cache_key: str, payload: dict[str, Any], *, ttl_seconds: int) -> None:
+    """Persist search responses for DBeaver audit; writes run even when ``DEBUG=true``."""
     settings = get_settings()
-    if settings.debug:
-        return
-    if not settings.database_url or not settings.search_cache_enabled:
+    if not is_database_configured() or not settings.search_cache_enabled:
         return
     try:
         sf = session_factory()
@@ -227,7 +224,7 @@ async def set_cached_search_payload(cache_key: str, payload: dict[str, Any], *, 
 async def purge_expired_search_cache_rows() -> int:
     """Best-effort cleanup; safe to call occasionally from lifespan or a cron."""
     settings = get_settings()
-    if not settings.database_url:
+    if not is_database_configured():
         return 0
     try:
         sf = session_factory()

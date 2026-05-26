@@ -2,10 +2,17 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 
 from app.core.config import get_settings
 from app.core.db.cache import purge_expired_search_cache_rows
-from app.core.db.database import dispose_engine, init_db
+from app.core.db.database import (
+    dispose_engine,
+    get_resolved_database_url,
+    init_db_from_settings,
+    is_database_configured,
+    mask_database_url,
+)
 from app.core.db.redis_cache import dispose_redis_client, purge_stale_pipeline_cache_versions
 from app.core.db.store_loader import (
     repair_whitelist_store_domains,
@@ -22,8 +29,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if settings.database_url:
-        await init_db(database_url=settings.database_url, debug=settings.debug)
+    if await init_db_from_settings():
         inserted = await seed_whitelist_stores_if_empty()
         sync_summary = await sync_whitelist_store_catalogue()
         repair_summary = await repair_whitelist_store_domains()
@@ -41,7 +47,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning(
             "lifespan_db_skipped",
-            extra={"stage": "startup", "reason": "DATABASE_URL unset — stores + cache use in-process defaults only"},
+            extra={
+                "stage": "startup",
+                "reason": "DATABASE_URL / POSTGRES_* unset — stores + cache use in-process defaults only",
+            },
         )
 
     # Sweep Redis search-cache entries that predate the current pipeline
@@ -71,7 +80,8 @@ logger.info(
         "debug": settings.debug,
         "log_level": settings.log_level,
         "log_format": settings.log_format,
-        "database_configured": bool(settings.database_url),
+        "database_configured": is_database_configured(),
+        "database_url": mask_database_url(get_resolved_database_url()),
     },
 )
 
@@ -79,7 +89,17 @@ app = FastAPI(title="AiCrateDigg API", version="0.1.0", lifespan=lifespan)
 app.include_router(search_router)
 
 
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    """API has no HTML UI — send browsers to the Next.js app on port 3000."""
+    return RedirectResponse(url=get_settings().frontend_public_url, status_code=307)
+
+
 @app.get("/health")
-async def health_check() -> dict[str, str]:
-    _ = get_settings()
-    return {"status": "ok", "service": "backend"}
+async def health_check() -> dict[str, str | bool]:
+    s = get_settings()
+    return {
+        "status": "ok",
+        "service": "backend",
+        "database_configured": s.database_enabled,
+    }

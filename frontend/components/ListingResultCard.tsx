@@ -1,4 +1,4 @@
-import type { ListingResultDto } from "../lib/api";
+import type { ListingResultDto } from "../lib/api-types";
 
 function prettyDomain(domain: string | null, url: string): string {
   if (domain && domain.trim()) {

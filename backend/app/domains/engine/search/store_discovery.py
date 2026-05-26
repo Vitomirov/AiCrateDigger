@@ -35,7 +35,7 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import get_settings
-from app.core.db.database import WhitelistStoreORM, session_factory
+from app.core.db.database import WhitelistStoreORM, is_database_configured, session_factory
 from app.domains.engine.policies.geo_scope import country_to_region
 from app.domains.engine.policies.store_domain import canonical_store_domain, is_valid_store_host
 
@@ -587,7 +587,7 @@ async def discover_new_stores(city: str, country_code: str) -> DiscoveryReport:
     if not settings.tavily_api_key or not settings.openai_api_key:
         report.error = "missing_api_keys"
         return report
-    if not settings.database_url:
+    if not is_database_configured():
         report.error = "no_database_url"
         return report
 
@@ -654,7 +654,7 @@ async def discover_stores_from_snippets(
     if not settings.openai_api_key:
         report.error = "missing_api_keys"
         return report
-    if not settings.database_url:
+    if not is_database_configured():
         report.error = "no_database_url"
         return report
     if not snippets:

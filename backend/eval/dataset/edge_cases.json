@@ -126,14 +126,14 @@
     },
     {
       "id": "country_only_germany",
-      "query": "Can Tago Mago vinyl Germany",
-      "description": "Country-level local scope without a resolved city.",
+      "query": "Kraftwerk Trans-Europe Express vinyl Germany",
+      "description": "Country-level local scope without a resolved city (unambiguous artist — avoids 'Can' modal-verb ambiguity).",
       "tags": ["geo", "country"],
       "mode": "parse",
       "expect": {
         "parse": {
-          "artist": "Can",
-          "album": "Tago Mago",
+          "artist": "Kraftwerk",
+          "album": "Trans-Europe Express",
           "country_code": "DE",
           "search_scope": "local",
           "fields_absent": ["resolved_city"]

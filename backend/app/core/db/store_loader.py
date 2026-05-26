@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import get_settings
-from app.core.db.database import WhitelistStoreORM, session_factory
+from app.core.db.database import WhitelistStoreORM, is_database_configured, session_factory
 from app.domains.engine.policies.eu_stores import ALLOWED_STORES, StoreEntry, StoreType, get_active_stores
 from app.domains.engine.policies.store_domain import canonical_store_domain, is_valid_store_host
 
@@ -86,7 +86,7 @@ def _orm_to_entry(row: WhitelistStoreORM) -> StoreEntry:
 async def seed_whitelist_stores_if_empty() -> int:
     """Insert :data:`ALLOWED_STORES` when the table has zero rows. Returns rows inserted."""
     settings = get_settings()
-    if not settings.database_url:
+    if not is_database_configured():
         return 0
     try:
         sf = session_factory()
@@ -133,7 +133,7 @@ async def sync_whitelist_store_catalogue() -> dict[str, int]:
     """
     settings = get_settings()
     summary = {"inserted": 0, "city_filled": 0, "type_filled": 0}
-    if not settings.database_url:
+    if not is_database_configured():
         return summary
     try:
         sf = session_factory()
@@ -203,7 +203,7 @@ async def repair_whitelist_store_domains() -> dict[str, int]:
     """
     summary = {"updated": 0, "deactivated_duplicates": 0}
     settings = get_settings()
-    if not settings.database_url:
+    if not is_database_configured():
         return summary
     try:
         sf = session_factory()
@@ -264,7 +264,7 @@ async def load_active_stores() -> tuple[StoreEntry, ...]:
     URL to be rejected as ``rejected_no_pdp_signal``.
     """
     settings = get_settings()
-    if not settings.database_url:
+    if not is_database_configured():
         return get_active_stores()
     try:
         sf = session_factory()
@@ -348,7 +348,7 @@ async def ensure_local_coverage(
     if not city or not country_code:
         summary["skipped_reason"] = "missing_city_or_country_code"
         return summary
-    if not settings.database_url:
+    if not is_database_configured():
         summary["skipped_reason"] = "no_database_url"
         return summary
 
