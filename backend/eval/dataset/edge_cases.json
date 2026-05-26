@@ -1,0 +1,316 @@
+{
+  "version": "1",
+  "description": "Twenty edge cases for the consolidated vinyl-search pipeline (parse → Discogs → stores → Tavily → prefilter → extractor).",
+  "cases": [
+    {
+      "id": "global_artist_album",
+      "query": "Radiohead OK Computer vinyl",
+      "description": "Explicit artist + album, no geography — global scope.",
+      "tags": ["parse", "global", "happy-path"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "Radiohead",
+          "album": "OK Computer",
+          "search_scope": "global",
+          "fields_absent": ["album_index", "country_code"]
+        },
+        "pipeline": {
+          "reason": null,
+          "stages": {
+            "parse": { "required": true, "status_in": ["success"] },
+            "discogs": { "required": true, "status_in": ["success", "empty"] },
+            "redis_cache_lookup": { "required": true, "status_in": ["success", "empty"] },
+            "tavily": { "required": true, "status_in": ["success", "empty"] }
+          }
+        }
+      }
+    },
+    {
+      "id": "city_local_barcelona",
+      "query": "Fleetwood Mac Rumours vinyl Barcelona",
+      "description": "City-level local commerce routing.",
+      "tags": ["geo", "city", "local"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "Fleetwood Mac",
+          "album": "Rumours",
+          "search_scope": "local",
+          "country_code": "ES",
+          "fields_present": ["resolved_city"]
+        }
+      }
+    },
+    {
+      "id": "ordinal_second_album",
+      "query": "Pink Floyd second album vinyl UK",
+      "description": "Ordinal album_index without literal title — Discogs resolution path.",
+      "tags": ["ordinal", "discogs", "geo"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "Pink Floyd",
+          "album_index": 2,
+          "country_code": "GB",
+          "search_scope": "local",
+          "fields_absent": ["album"]
+        },
+        "pipeline": {
+          "stages": {
+            "parse": { "required": true, "status_in": ["success"] },
+            "discogs": { "required": true, "status_in": ["success", "empty"] }
+          }
+        }
+      }
+    },
+    {
+      "id": "ordinal_debut",
+      "query": "Arctic Monkeys debut album vinyl",
+      "description": "Debut / first album ordinal maps to album_index 1.",
+      "tags": ["ordinal", "discogs"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "Arctic Monkeys",
+          "album_index": 1,
+          "search_scope": "global",
+          "fields_absent": ["album"]
+        }
+      }
+    },
+    {
+      "id": "ordinal_latest",
+      "query": "Taylor Swift latest album vinyl Germany",
+      "description": "Latest album ordinal (-1) with country-only geo.",
+      "tags": ["ordinal", "discogs", "country"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "Taylor Swift",
+          "album_index": -1,
+          "country_code": "DE",
+          "search_scope": "local",
+          "fields_absent": ["album"]
+        }
+      }
+    },
+    {
+      "id": "regional_balkans",
+      "query": "David Bowie Heroes vinyl Balkans",
+      "description": "Multi-country regional scope without ISO country.",
+      "tags": ["geo", "regional"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "David Bowie",
+          "album": "Heroes",
+          "search_scope": "regional",
+          "fields_absent": ["country_code"]
+        }
+      }
+    },
+    {
+      "id": "regional_europe",
+      "query": "Kraftwerk Autobahn CD Europe",
+      "description": "Regional Europe phrase + CD format token in query.",
+      "tags": ["geo", "regional", "format"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "Kraftwerk",
+          "album": "Autobahn",
+          "search_scope": "regional"
+        }
+      }
+    },
+    {
+      "id": "country_only_germany",
+      "query": "Can Tago Mago vinyl Germany",
+      "description": "Country-level local scope without a resolved city.",
+      "tags": ["geo", "country"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "Can",
+          "album": "Tago Mago",
+          "country_code": "DE",
+          "search_scope": "local",
+          "fields_absent": ["resolved_city"]
+        }
+      }
+    },
+    {
+      "id": "balkans_city_kragujevac",
+      "query": "Metallica Master of Puppets vinyl Kragujevac",
+      "description": "Smaller Balkans city should resolve RS + local scope.",
+      "tags": ["geo", "city", "balkans"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "Metallica",
+          "album": "Master of Puppets",
+          "country_code": "RS",
+          "search_scope": "local",
+          "fields_present": ["resolved_city"]
+        }
+      }
+    },
+    {
+      "id": "city_porto_indie_coverage",
+      "query": "Nick Cave Murder Ballads vinyl Porto",
+      "description": "City with thin indie coverage — exercises inline store_discovery stage.",
+      "tags": ["geo", "store_discovery", "city"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "Nick Cave",
+          "country_code": "PT",
+          "search_scope": "local",
+          "fields_present": ["resolved_city"]
+        },
+        "pipeline": {
+          "stages": {
+            "parse": { "required": true, "status_in": ["success"] },
+            "store_discovery": { "required": false, "status_in": ["success", "empty", "fail"] },
+            "tavily": { "required": true, "status_in": ["success", "empty"] }
+          }
+        }
+      }
+    },
+    {
+      "id": "german_city_berlin",
+      "query": "Kraftwerk Computer World vinyl Berlin",
+      "description": "Major EU city — Tavily city token + DE country.",
+      "tags": ["geo", "city", "de"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "Kraftwerk",
+          "album": "Computer World",
+          "country_code": "DE",
+          "search_scope": "local"
+        }
+      }
+    },
+    {
+      "id": "uk_normalizes_gb",
+      "query": "The Beatles Abbey Road vinyl UK",
+      "description": "UK location must normalize to GB country_code.",
+      "tags": ["geo", "normalization"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "The Beatles",
+          "album": "Abbey Road",
+          "country_code": "GB",
+          "search_scope": "local"
+        }
+      }
+    },
+    {
+      "id": "cassette_format",
+      "query": "New Order Power Corruption and Lies cassette",
+      "description": "Non-vinyl physical format in user text.",
+      "tags": ["format"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "New Order",
+          "search_scope": "global",
+          "fields_present": ["album"]
+        }
+      }
+    },
+    {
+      "id": "artist_only_unresolved",
+      "query": "Miles Davis vinyl",
+      "description": "No album anchor — pipeline must return album_unresolved.",
+      "tags": ["negative", "album_unresolved"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "Miles Davis",
+          "fields_absent": ["album", "album_index"]
+        },
+        "pipeline": {
+          "reason": "album_unresolved",
+          "max_results": 0,
+          "stages": {
+            "parse": { "required": true, "status_in": ["success"] },
+            "discogs": { "required": true, "status_in": ["success", "empty"] },
+            "tavily": { "required": false, "status_in": ["success", "empty"] }
+          }
+        }
+      }
+    },
+
+    {
+      "id": "explicit_album_quotes",
+      "query": "Björk \"Homogenic\" vinyl Iceland",
+      "description": "Quoted album title + niche country geo.",
+      "tags": ["parse", "quotes"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "Björk",
+          "album": "Homogenic",
+          "search_scope": "local",
+          "fields_present": ["location"]
+        }
+      }
+    },
+    {
+      "id": "third_album_ordinal",
+      "query": "The Strokes third album vinyl USA",
+      "description": "Third album ordinal (album_index 3).",
+      "tags": ["ordinal"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "The Strokes",
+          "album_index": 3,
+          "fields_absent": ["album"]
+        }
+      }
+    },
+    {
+      "id": "typos_city_resolution",
+      "query": "Nirvana Nevermind vinyl barselona",
+      "description": "Misspelled city should still resolve Barcelona / ES when LLM geocodes.",
+      "tags": ["geo", "typo"],
+      "mode": "parse",
+      "expect": {
+        "parse": {
+          "artist": "Nirvana",
+          "album": "Nevermind",
+          "search_scope": "local",
+          "country_code": "ES"
+        }
+      }
+    },
+    {
+      "id": "combined_heavy_query",
+      "query": "King Gizzard & The Lizard Wizard Nonagon Infinity vinyl Melbourne Australia",
+      "description": "Long query: ampersand artist, album, city + country hints.",
+      "tags": ["parse", "full", "long-query"],
+      "mode": "full",
+      "expect": {
+        "parse": {
+          "artist": "King Gizzard & The Lizard Wizard",
+          "album": "Nonagon Infinity",
+          "search_scope": "local",
+          "fields_present": ["location"]
+        },
+        "pipeline": {
+          "stages": {
+            "parse": { "required": true, "status_in": ["success"] },
+            "tavily": { "required": true, "status_in": ["success", "empty", "fail"] },
+            "prefilter": { "required": false, "status_in": ["success", "empty"] },
+            "extractor": { "required": false, "status_in": ["success", "empty"] }
+          }
+        }
+      }
+    }
+  ]
+}

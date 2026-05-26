@@ -16,6 +16,7 @@ COPY pyproject.toml ./
 RUN poetry install --no-interaction --no-ansi --no-root
 
 COPY app ./app
+COPY eval ./eval
 
 EXPOSE 8000
 

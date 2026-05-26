@@ -251,6 +251,34 @@ Interactive docs: **`/docs`** (Swagger) when the backend is running.
 
 ---
 
+## Pipeline evaluation
+
+Twenty curated edge cases (parse geo/ordinals, album-unresolved negatives, store-discovery cities, full pipeline stage traces) live in **`backend/eval/dataset/edge_cases.json`**.
+
+**Docker (recommended — uses Compose Postgres + Redis):**
+
+```bash
+# Requires OPENAI_API_KEY and TAVILY_API_KEY in .env or the environment
+docker compose --profile eval run --rm eval
+
+# Single case, JSON report, or parse-only subset
+docker compose --profile eval run --rm eval -- --case global_artist_album
+docker compose --profile eval run --rm eval -- --json-out /tmp/eval-report.json
+docker compose --profile eval run --rm eval -- --mode parse
+docker compose --profile eval run --rm eval -- --list
+```
+
+**Local (from `backend/`):**
+
+```bash
+poetry run python -m eval.cli
+poetry run python -m eval.cli --case city_local_barcelona --mode full
+```
+
+By default the harness **bypasses Redis cache** so each run exercises Tavily and downstream stages. Pass `--use-cache` to allow cache hits. Exit code is **0** when all selected cases pass, **1** otherwise.
+
+---
+
 ## Testing
 
 ```bash
