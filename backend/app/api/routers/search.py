@@ -1,7 +1,8 @@
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
+from app.core.rate_limiter import ip_rate_limiter
 from app.domains.query_parser.parse_user_query import parse_user_query
 from app.core.config import get_settings
 from app.domains.query_parser.parse_schema import ParsedQuery
@@ -37,8 +38,7 @@ async def parse_search_query(payload: ParseRequest) -> ParsedQuery:
 # -------------------------
 # MAIN PIPELINE ENDPOINT (REAL)
 # -------------------------
-@router.post("/search", response_model=SearchResponse)
-async def search(
+async def _execute_search(
     payload: ParseRequest,
     background_tasks: BackgroundTasks,
 ) -> SearchResponse:
@@ -93,6 +93,15 @@ async def search(
             ) from exc
 
 
+@router.post("/search", response_model=SearchResponse)
+async def search(
+    payload: ParseRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(ip_rate_limiter),
+) -> SearchResponse:
+    return await _execute_search(payload, background_tasks)
+
+
 # -------------------------
 # LEGACY COMPATIBILITY (OLD NAME)
 # -------------------------
@@ -100,5 +109,6 @@ async def search(
 async def search_listings(
     payload: ParseRequest,
     background_tasks: BackgroundTasks,
+    _: None = Depends(ip_rate_limiter),
 ) -> SearchResponse:
-    return await search(payload, background_tasks)
+    return await _execute_search(payload, background_tasks)

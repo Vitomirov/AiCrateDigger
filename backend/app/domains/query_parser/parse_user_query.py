@@ -80,7 +80,7 @@ alpha-2 code in uppercase. Use the United Kingdom code "GB" (never "UK").
        "Berlin"            → "DE"
        "London"            → "GB"
        "Paris"             → "FR"
-       "amsterdam"         → "NL"
+       "Amsterdam"         → "NL"
        "Oslo"              → "NO"
        "Stockholm"         → "SE"
        "Copenhagen"        → "DK"

@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     frontend_public_url: str = Field(default="http://localhost:3000")
 
     debug: bool = False
+    #: Env ``SEARCH_RATE_LIMIT_ENABLED``. When ``False``, ``POST /search`` skips IP rate limiting.
+    search_rate_limit_enabled: bool = Field(
+        default=True,
+        description="Enable 5 searches per IP per 24h on POST /search (SEARCH_RATE_LIMIT_ENABLED).",
+    )
+    search_rate_limit_max_requests: int = Field(default=5, ge=1, le=100)
+    search_rate_limit_window_seconds: int = Field(default=86_400, ge=60)
     log_level: str = "INFO"
     log_format: Literal["human", "json"] = Field(
         default="human",
@@ -157,6 +164,24 @@ class Settings(BaseSettings):
     @property
     def database_enabled(self) -> bool:
         return bool(self.resolved_database_url)
+
+    @field_validator(
+        "debug",
+        "search_cache_enabled",
+        "search_rate_limit_enabled",
+        mode="before",
+    )
+    @classmethod
+    def _parse_bool_env(cls, v: object) -> object:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized in ("true", "1", "yes", "on"):
+                return True
+            if normalized in ("false", "0", "no", "off"):
+                return False
+        return v
 
     @field_validator("log_format", mode="before")
     @classmethod

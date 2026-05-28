@@ -113,7 +113,7 @@ def build_redis_search_key(
     )
 
 
-async def _get_client() -> Any | None:
+async def get_redis_client() -> Any | None:
     """Return a connected async Redis client, or ``None`` if unavailable.
 
     Connection failures flip a sticky ``_client_init_failed`` flag so we don't
@@ -193,7 +193,7 @@ async def get_cached_search(cache_key: str) -> dict[str, Any] | None:
             },
         )
         return None
-    client = await _get_client()
+    client = await get_redis_client()
     if client is None:
         return None
     try:
@@ -250,7 +250,7 @@ async def set_cached_search(
             },
         )
         return False
-    client = await _get_client()
+    client = await get_redis_client()
     if client is None:
         return False
     try:
@@ -296,7 +296,7 @@ async def purge_stale_pipeline_cache_versions() -> int:
 
     Best-effort: returns 0 on any Redis outage / failure.
     """
-    client = await _get_client()
+    client = await get_redis_client()
     if client is None:
         return 0
 
@@ -341,6 +341,7 @@ __all__ = [
     "build_redis_search_key",
     "dispose_redis_client",
     "get_cached_search",
+    "get_redis_client",
     "purge_stale_pipeline_cache_versions",
     "set_cached_search",
 ]

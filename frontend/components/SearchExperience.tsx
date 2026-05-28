@@ -5,12 +5,14 @@ import type { ChangeEvent, KeyboardEvent } from "react";
 
 import {
   postSearch,
+  RateLimitError,
   type ListingResultDto,
   type SearchResponseDto,
 } from "../lib/api";
 import { buildPipelineInspectPayload, DevJsonPanel } from "./DevJsonInspector";
 import HugeVinylRecordBg from "./HugeVinylRecord";
 import ListingResultCard from "./ListingResultCard";
+import RateLimitModal from "./RateLimitModal";
 
 /** Human copy for structured empty-state codes returned by `/search`. */
 const EMPTY_REASON_COPY: Record<NonNullable<SearchResponseDto["reason"]>, string> = {
@@ -23,6 +25,7 @@ export default function SearchExperience() {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [rateLimitOpen, setRateLimitOpen] = useState(false);
   const [payload, setPayload] = useState<SearchResponseDto | null>(null);
   /** After the first Dig, keep JSON panels mounted for debugging. */
   const [hasRunInspect, setHasRunInspect] = useState(false);
@@ -68,7 +71,12 @@ export default function SearchExperience() {
     } catch (e) {
       setProgress(0);
       setPayload(null);
-      setError(e instanceof Error ? e.message : "Search failed.");
+      if (e instanceof RateLimitError) {
+        setError(null);
+        setRateLimitOpen(true);
+      } else {
+        setError(e instanceof Error ? e.message : "Search failed.");
+      }
     } finally {
       cancelProgress();
       setLoading(false);
@@ -257,6 +265,8 @@ export default function SearchExperience() {
           Dejan Vitomirov
         </a>
       </footer>
+
+      <RateLimitModal open={rateLimitOpen} onClose={() => setRateLimitOpen(false)} />
     </div>
   );
 }

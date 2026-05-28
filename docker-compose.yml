@@ -41,6 +41,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./backend/app:/app/app
       - ./chroma_db:/app/chroma_db
     depends_on:
       db:
