@@ -100,7 +100,7 @@ flowchart TB
 | **Fuzzy matching** | **RapidFuzz** |
 | **Frontend** | **Next.js 14** App Router, **React 18**, **TypeScript 5** strict, **Tailwind CSS 3** |
 | **Packaging** | **Poetry** (backend), **npm** (frontend) |
-| **Local infra** | **Docker Compose** (optional `chroma_db` volume is legacy; app code does not use Chroma) |
+| **Local infra** | **Docker Compose** (Postgres, Redis, backend, frontend) |
 
 ---
 
