@@ -32,7 +32,6 @@ def _discover_env_files() -> tuple[str, ...]:
 class Settings(BaseSettings):
     openai_api_key: str
     tavily_api_key: str
-    discogs_token: str | None = None
     #: Primary Postgres DSN from env ``DATABASE_URL`` (preferred).
     database_url: str | None = None
     #: Optional components used to build ``DATABASE_URL`` when the full DSN is not set.
@@ -139,10 +138,6 @@ class Settings(BaseSettings):
     #: Relax album gate in debug (still rejects non-product URLs/titles).
     listing_validation_debug_album_fuzz_min: int = Field(default=82, ge=60, le=100)
 
-    discogs_base_url: str = "https://api.discogs.com"
-    discogs_user_agent: str = "AiCrateDigger/0.1 (+https://github.com/ai-cratedigger)"
-    discogs_timeout_seconds: float = 8.0
-
     @property
     def resolved_database_url(self) -> str | None:
         """``DATABASE_URL`` from env, or built from ``POSTGRES_*`` components."""
@@ -192,7 +187,6 @@ class Settings(BaseSettings):
     @field_validator(
         "database_url",
         "redis_url",
-        "discogs_token",
         "postgres_user",
         "postgres_password",
         "postgres_db",

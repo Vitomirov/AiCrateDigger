@@ -1,1 +1,1 @@
-"""Ordered parser pipeline steps (primary LLM → geo → Discogs finalize)."""
+"""Ordinal album resolution helpers (primary LLM parse)."""

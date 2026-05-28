@@ -13,6 +13,8 @@ class ParseExpectation(BaseModel):
     artist: str | None = None
     album: str | None = None
     album_index: int | None = None
+    resolved_album: str | None = None
+    resolution_confidence: Literal["high", "medium", "low", "unknown"] | None = None
     location: str | None = None
     country_code: str | None = None
     search_scope: Literal["local", "regional", "global"] | None = None

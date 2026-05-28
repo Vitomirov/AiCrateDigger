@@ -38,15 +38,14 @@ class ParsedQuery(BaseModel):
     )
     resolved_album: str | None = Field(
         default=None,
-        description="Deterministically resolved canonical album title (Discogs-backed).",
+        description="LLM-resolved canonical album title for ordinal queries.",
     )
     resolution_confidence: ResolutionConfidence = Field(
         default="unknown",
         description=(
-            "`high`   = Discogs-backed resolution; "
-            "`medium` = Discogs partial hit; "
-            "`low`    = LLM-only fallback; "
-            "`unknown` = user gave a specific title OR no resolution attempted."
+            "`high` = ordinal resolved to resolved_album; "
+            "`low` = ordinal present but unresolved; "
+            "`unknown` = explicit album title or no ordinal resolution attempted."
         ),
     )
 
@@ -152,6 +151,8 @@ class SearchResponse(BaseModel):
                         "artist": "Tool",
                         "album": None,
                         "album_index": 3,
+                        "resolved_album": "Lateralus",
+                        "resolution_confidence": "high",
                         "location": None,
                         "country_code": None,
                         "search_scope": "global",

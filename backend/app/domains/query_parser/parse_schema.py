@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 SearchScope = Literal["local", "regional", "global"]
 GeoGranularity = Literal["city", "country", "region", "none"]
+ResolutionConfidence = Literal["high", "medium", "low", "unknown"]
 
 
 class ParsedQuery(BaseModel):
@@ -33,6 +34,22 @@ class ParsedQuery(BaseModel):
     album_index: int | None = Field(
         default=None,
         description="1-based ordinal (1=debut, 2=second, ...). -1 means 'latest'. Null otherwise.",
+    )
+    resolved_album: str | None = Field(
+        default=None,
+        description=(
+            "Canonical studio album title when the user referenced an ordinal "
+            "(album_index) instead of a literal title. Null when unresolved or "
+            "when the user named the album explicitly."
+        ),
+    )
+    resolution_confidence: ResolutionConfidence = Field(
+        default="unknown",
+        description=(
+            "`high` = ordinal resolved to resolved_album; "
+            "`low` = ordinal present but unresolved; "
+            "`unknown` = explicit album title or no ordinal resolution attempted."
+        ),
     )
     location: str | None = Field(
         default=None,
@@ -80,6 +97,11 @@ class ParsedQuery(BaseModel):
         min_length=1,
         description="Exact user input string for this parse request.",
     )
+
+    @property
+    def effective_album(self) -> str:
+        """Best-known album anchor for search — empty when truly unknown."""
+        return (self.resolved_album or self.album or "").strip()
 
     @field_validator("resolved_city", mode="before")
     @classmethod

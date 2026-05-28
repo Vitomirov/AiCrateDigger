@@ -105,7 +105,7 @@ def default_full_pipeline_stages() -> dict[str, StageExpectation]:
     """Stages recorded by the consolidated ``run_vinyl_search`` hot path."""
     return {
         "parse": StageExpectation(required=True, status_in=["success"]),
-        "discogs": StageExpectation(required=True, status_in=["success", "empty"]),
+        "album_resolve": StageExpectation(required=True, status_in=["success", "empty"]),
         "redis_cache_lookup": StageExpectation(
             required=True,
             status_in=["success", "empty"],

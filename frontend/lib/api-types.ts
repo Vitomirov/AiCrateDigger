@@ -19,6 +19,8 @@ export type ParsedQueryDto = {
   artist: string | null;
   album: string | null;
   album_index: number | null;
+  resolved_album: string | null;
+  resolution_confidence: "high" | "medium" | "low" | "unknown";
   location: string | null;
   country_code: string | null;
   search_scope: string;

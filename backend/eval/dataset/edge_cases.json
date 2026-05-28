@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "description": "Twenty edge cases for the consolidated vinyl-search pipeline (parse → Discogs → stores → Tavily → prefilter → extractor).",
+  "description": "Twenty edge cases for the consolidated vinyl-search pipeline (parse → album resolve → stores → Tavily → prefilter → extractor).",
   "cases": [
     {
       "id": "global_artist_album",
@@ -19,7 +19,7 @@
           "reason": null,
           "stages": {
             "parse": { "required": true, "status_in": ["success"] },
-            "discogs": { "required": true, "status_in": ["success", "empty"] },
+            "album_resolve": { "required": true, "status_in": ["success", "empty"] },
             "redis_cache_lookup": { "required": true, "status_in": ["success", "empty"] },
             "tavily": { "required": true, "status_in": ["success", "empty"] }
           }
@@ -45,8 +45,8 @@
     {
       "id": "ordinal_second_album",
       "query": "Pink Floyd second album vinyl UK",
-      "description": "Ordinal album_index without literal title — Discogs resolution path.",
-      "tags": ["ordinal", "discogs", "geo"],
+      "description": "Ordinal album_index without literal title — LLM resolves resolved_album in parse.",
+      "tags": ["ordinal", "geo"],
       "mode": "full",
       "expect": {
         "parse": {
@@ -59,7 +59,7 @@
         "pipeline": {
           "stages": {
             "parse": { "required": true, "status_in": ["success"] },
-            "discogs": { "required": true, "status_in": ["success", "empty"] }
+            "album_resolve": { "required": true, "status_in": ["success", "empty"] }
           }
         }
       }
@@ -68,7 +68,7 @@
       "id": "ordinal_debut",
       "query": "Arctic Monkeys debut album vinyl",
       "description": "Debut / first album ordinal maps to album_index 1.",
-      "tags": ["ordinal", "discogs"],
+      "tags": ["ordinal"],
       "mode": "parse",
       "expect": {
         "parse": {
@@ -83,7 +83,7 @@
       "id": "ordinal_latest",
       "query": "Taylor Swift latest album vinyl Germany",
       "description": "Latest album ordinal (-1) with country-only geo.",
-      "tags": ["ordinal", "discogs", "country"],
+      "tags": ["ordinal", "country"],
       "mode": "parse",
       "expect": {
         "parse": {
@@ -238,7 +238,7 @@
           "max_results": 0,
           "stages": {
             "parse": { "required": true, "status_in": ["success"] },
-            "discogs": { "required": true, "status_in": ["success", "empty"] },
+            "album_resolve": { "required": true, "status_in": ["success", "empty"] },
             "tavily": { "required": false, "status_in": ["success", "empty"] }
           }
         }

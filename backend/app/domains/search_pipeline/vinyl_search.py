@@ -4,8 +4,9 @@ This module is the production hot path for the ``/search`` endpoint. It is a
 deliberately small, linear function so latency / cost behaviour stays obvious
 in production logs:
 
-1. Parse the user query (one ``gpt-4o-mini`` call → :class:`ParsedQuery`).
-2. Resolve the album anchor (literal title or Discogs ordinal).
+1. Parse the user query (one ``gpt-4o-mini`` call → :class:`ParsedQuery`,
+   including ordinal ``resolved_album`` when applicable).
+2. Resolve the album anchor (``resolved_album`` or literal ``album``).
 3. Build the deterministic Redis key and short-circuit on a cache **hit**:
    zero Tavily credits, zero further LLM tokens for 7 days.
 4. **Local-shop top-up** (city queries only, **awaited inline**):
@@ -82,7 +83,6 @@ from app.domains.search_pipeline.models.result import ListingResult
 from app.domains.search_pipeline.pipeline_context import stage_timer
 from app.domains.engine.policies.format_detect import detect_format_token
 from app.domains.engine.policies.store_domain import canonical_store_domain
-from app.domains.query_parser.discogs_service import resolve_album_by_index
 from app.domains.engine.search import tavily_circuit_breaker_scope
 from app.domains.engine.search.prefilter import (
     _host_in_whitelist,
@@ -109,18 +109,12 @@ async def _stage_parse(query: str) -> Any:
 
 
 async def _stage_resolve_album_title(parsed: Any) -> str | None:
-    """Resolve a Discogs release (ordinal queries) or take the literal album."""
-    with stage_timer("discogs"):
-        if parsed.album_index is not None:
-            resolution = await resolve_album_by_index(
-                artist=parsed.artist,
-                album_index=parsed.album_index,
-            )
-            raw_title = resolution.album.title if resolution.album else None
-            return (raw_title or "").strip() or None
-        if parsed.album:
-            return (parsed.album or "").strip() or None
-        return None
+    """Pick the album search anchor from parser output (fail closed when missing)."""
+    with stage_timer("album_resolve") as rec:
+        title = (getattr(parsed, "effective_album", None) or "").strip() or None
+        rec.output = {"album_title": title}
+        rec.status = "success" if title else "empty"
+    return title
 
 
 async def _stage_ensure_local_coverage(parsed: Any) -> dict[str, object]:
