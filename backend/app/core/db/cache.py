@@ -11,8 +11,6 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from collections.abc import Sequence
-
 from sqlalchemy import delete
 
 from app.core.config import get_settings
@@ -30,119 +28,6 @@ def hydrate_cached_pipeline_dict(cached: dict[str, Any]) -> dict[str, Any]:
         "query": cached.get("query", ""),
         "results": [ListingResult.model_validate(x) for x in rows],
     }
-
-
-def build_tavily_tier_cache_key(
-    *,
-    artist: str | None,
-    album_title: str,
-    tier: str,
-    core_query: str = "",
-    include_domains: Sequence[str] | None = None,
-) -> str:
-    """Stable cache identity for raw Tavily SERP rows before extraction.
-
-    v2 incorporates ``core_query`` and the sorted ``include_domains`` fingerprint
-    so different Tavily query plans or domain batches never alias-incorrectly.
-    """
-    import hashlib
-
-    dom_key = ""
-    if include_domains:
-        folded = sorted(
-            {
-                d.strip().lower().removeprefix("www.")
-                for d in include_domains
-                if (d or "").strip()
-            }
-        )
-        dom_key = "|".join(folded)
-    parts = (
-        "tavily_tier_v2",
-        (artist or "").strip().lower(),
-        (album_title or "").strip().lower(),
-        (tier or "").strip().lower(),
-        (core_query or "").strip().lower(),
-        dom_key,
-    )
-    raw = "\n".join(parts).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-async def get_cached_tavily_tier_payload(cache_key: str) -> list[dict[str, Any]] | None:
-    """Intermediate Tavily JSON (list of result dicts) or ``None``."""
-    settings = get_settings()
-    if settings.debug:
-        return None
-    if not is_database_configured() or not settings.search_cache_enabled:
-        return None
-    try:
-        sf = session_factory()
-    except RuntimeError:
-        return None
-
-    now = datetime.now(UTC)
-    async with sf() as session:
-        row = await session.get(SearchResponseCacheORM, cache_key)
-        if row is None:
-            return None
-        if row.expires_at <= now:
-            await session.delete(row)
-            await session.commit()
-            return None
-        try:
-            body = json.loads(row.payload_json)
-        except json.JSONDecodeError:
-            await session.delete(row)
-            await session.commit()
-            return None
-    raw_list = body.get("tavily_raw_results") if isinstance(body, dict) else body
-    if not isinstance(raw_list, list):
-        return None
-    out: list[dict[str, Any]] = []
-    for x in raw_list:
-        if isinstance(x, dict):
-            out.append(x)
-    return out
-
-
-async def set_cached_tavily_tier_payload(
-    cache_key: str,
-    raw_results: list[dict[str, Any]],
-    *,
-    ttl_seconds: int,
-) -> None:
-    settings = get_settings()
-    if not is_database_configured() or not settings.search_cache_enabled:
-        return
-    try:
-        sf = session_factory()
-    except RuntimeError:
-        return
-
-    now = datetime.now(UTC)
-    expires = now + timedelta(seconds=max(60, ttl_seconds))
-    payload = {"tavily_raw_results": raw_results}
-    body = json.dumps(payload, default=str)
-    async with sf() as session:
-        row = await session.get(SearchResponseCacheORM, cache_key)
-        if row is None:
-            session.add(
-                SearchResponseCacheORM(
-                    cache_key=cache_key,
-                    payload_json=body,
-                    expires_at=expires,
-                )
-            )
-        else:
-            row.payload_json = body
-            row.expires_at = expires
-        await session.commit()
-
-    logger.debug(
-        "tavily_tier_cache_set",
-        extra={"stage": "search_cache", "cache_key_head": cache_key[:12], "ttl_seconds": ttl_seconds},
-    )
 
 
 def build_search_cache_key(*, user_query: str, artist: str | None, album_title: str, debug: bool) -> str:

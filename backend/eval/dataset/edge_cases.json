@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "description": "Twenty edge cases for the consolidated vinyl-search pipeline (parse → album resolve → stores → Tavily → prefilter → extractor).",
+  "description": "Eighteen edge cases for the consolidated vinyl-search pipeline (parse → album resolve → stores → Tavily → prefilter → extractor).",
   "cases": [
     {
       "id": "global_artist_album",

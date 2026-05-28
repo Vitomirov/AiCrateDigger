@@ -45,13 +45,13 @@ Buying a specific **album** in a specific **place** usually means opening dozens
 
 | Capability | Description |
 |------------|-------------|
-| **Parse** | Single structured JSON parse from natural language: artist, album or ordinal (`album_index`), location, inferred `country_code` and `search_scope`. |
-| **Resolve** | Optional **Discogs** alignment when the user references position (“second album”, “latest”) instead of a literal title. |
-| **Discover stores** | When city-level indie coverage is thin, **Tavily + LLM** can propose vetted shops and upsert into a **whitelist** in Postgres. |
-| **Search** | **Tavily** with **`include_domains`** batches, **geo tiers** (city → country → region → …), optional **per-shop fanout** in city tier. |
+| **Parse** | Single structured JSON parse from natural language: artist, album or ordinal (`album_index` + LLM `resolved_album`), location, inferred `country_code` and `search_scope`. |
+| **Discover stores** | When city-level indie coverage is thin, or when Tavily surfaces unknown shop hosts, **Tavily + LLM** can propose vetted shops and upsert into a **whitelist** in Postgres. |
+| **Search** | **One consolidated Tavily call** per request (`advanced` depth, configurable `max_results`), with active whitelist domains as a prefilter signal. |
+| **Prefilter** | Python gate on raw Tavily rows: blacklist noise hosts, require PDP-shaped URLs from unknown shops, dedupe per host, cap candidates before LLM extract. |
 | **Extract** | Snippet-first pipeline: deterministic paths + **gpt-4o-mini** JSON extraction into listing rows. |
-| **Validate & rank** | RapidFuzz gates, PDP heuristics, URL normalization, **composite ranking** (semantic, geo, store quality, tier). |
-| **Explicit empty states** | When no album anchor exists after parse/Discogs, the API returns **`reason: album_unresolved`** so clients don’t look “broken”. |
+| **Cache** | **Redis** (7-day TTL) + optional Postgres rows for repeat queries and operator visibility. |
+| **Explicit empty states** | When no album anchor exists after parse, the API returns **`reason: album_unresolved`** so clients don’t look “broken”. |
 
 ---
 
@@ -64,21 +64,22 @@ flowchart TB
   end
   subgraph Backend["FastAPI backend"]
     P[parse_user_query]
-    D[Discogs resolve optional]
-    G[Geo + whitelist stores]
-    T[Tavily batched + fanout]
+    C[Redis cache lookup]
+    G[Geo + whitelist stores + store_discovery]
+    T[run_consolidated_tavily_search]
+    F[prefilter_tavily_results]
     E[extract_listings]
-    V[validate + rank]
-    P --> D --> G --> T --> E --> V
+    P --> C --> G --> T --> F --> E
   end
   subgraph Data
     PG[(PostgreSQL)]
+    RD[(Redis)]
   end
   UI -->|POST /api/search → /search| P
   G <-->|stores + cache| PG
+  C <-->|search cache| RD
   P --> OpenAI[(OpenAI API)]
   T --> Tavily[(Tavily API)]
-  D --> Discogs[(Discogs API)]
   E --> OpenAI
 ```
 
@@ -107,15 +108,15 @@ flowchart TB
 
 1. **Tavily + snippets, not a site crawler** — Full-page scraping would raise latency, ops burden, and compliance questions. Snippets keep token use bounded and make the problem **search → extract**, not **browse → render**.
 
-2. **Whitelist-first retrieval** — Open web search drifts to megamarket SEO. Curated **`whitelist_stores`** (Postgres, seeded from policy) plus **`include_domains`** keeps results **commerce-shaped** and easier to reason about.
+2. **Whitelist-first retrieval** — Open web search drifts to megamarket SEO. Curated **`whitelist_stores`** (Postgres, seeded from policy) plus inline **`store_discovery`** keeps results **commerce-shaped** and easier to reason about.
 
-3. **Geo tiers, not “paste city into every query string”** — Location drives **which domains and tiers** run; ranking uses geo as **signal**, not a hard user-location filter on every row, to reduce false negatives.
+3. **One Tavily call, not a tier loop** — Location is parsed once and influences store discovery and prefilter whitelist signals; the hot path issues **one** consolidated Tavily request rather than widening geo tiers with multiple HTTP calls.
 
-4. **One parser contract for the live path** — `parse_user_query` → `domain.parse_schema.ParsedQuery`. Older alternate parser/extractor paths remain for tests or legacy compatibility only.
+4. **One parser contract** — `parse_user_query` → `domain.parse_schema.ParsedQuery`. Ordinal album titles are resolved inside the same LLM parse (`resolved_album`), not via a separate metadata service.
 
 5. **Structured failure over silent zeros** — **`album_unresolved`** (and OpenAPI examples on `SearchResponse`) document why a search never reached Tavily.
 
-6. **Cost-aware defaults** — e.g. Tavily **`basic`** depth by default, chunked domains, **TTL caches**, configurable **fanout concurrency** and **HTTP retries** for transient Tavily pressure (429 / 432 / 433 / 503).
+6. **Cost-aware defaults** — e.g. single-call **`advanced`** Tavily depth with a capped candidate pool, **Redis TTL cache**, Tavily **HTTP retries**, and a per-request **circuit breaker** for hard throttling.
 
 7. **Logging ready for aggregation** — `LOG_FORMAT=json` emits NDJSON-friendly records with promoted fields (`stage`, `request_id`, `reason`, …) for Loki/Datadog-style pipelines.
 
@@ -135,9 +136,10 @@ AiCrateDigger/
 │   │   ├── api/                    # FastAPI routers
 │   │   │   └── routers/search.py # /parse, /search, /search-listings
 │   │   └── domains/               # vertical slices
-│   │       ├── query_parser/      # parse_schema, discogs, parser steps
-│   │       ├── search_pipeline/    # vinyl_search, pipeline_context, tier_runner, models
+│   │       ├── query_parser/      # parse_user_query, parse_schema
+│   │       ├── search_pipeline/    # vinyl_search, pipeline_context, models
 │   │       └── engine/            # Tavily (search/), extraction/, policies/, listing_schema, validators, llm/
+│   ├── eval/                       # dataset + CLI harness (edge_cases.json)
 │   └── tests/                      # unittest suite (see Testing)
 ├── frontend/
 │   ├── app/                        # App Router, /api/search & /api/parse proxies
@@ -148,7 +150,7 @@ AiCrateDigger/
 └── README.md
 ```
 
-**Backend imports:** there is no top-level `services/` package — use `app.domains.engine.search` (lazy package facade) or concrete submodules such as `domain_batches` / `power_query` so pure tests do not pull in `httpx` until needed.
+**Backend imports:** there is no top-level `services/` package — use `app.domains.engine.search` (lazy package facade) or concrete submodules such as `single_call` / `prefilter` so pure tests do not pull in `httpx` until needed.
 
 ---
 
@@ -209,13 +211,13 @@ Use **`NEXT_PUBLIC_BACKEND_URL`** for browser-side calls where applicable, and *
 |----------|----------|---------|
 | `OPENAI_API_KEY` | **Yes** | Parser + extractor LLM calls |
 | `TAVILY_API_KEY` | **Yes** | Web search |
-| `DISCOGS_TOKEN` | No | Stronger album resolution for ordinal queries |
 | `DATABASE_URL` | No* | Postgres (`postgresql+asyncpg://…` or `postgresql://…`) — *Compose supplies default |
+| `REDIS_URL` | No | Search-result cache (7-day TTL); no-ops when unset |
 | `DEBUG` | No | When `true`, `/search` includes full pipeline **`debug`** trace |
 | `LOG_LEVEL` | No | Default `INFO` |
 | `LOG_FORMAT` | No | `human` (local) or **`json`** (aggregators) |
 
-**Important knobs** (Tavily retries, fanout concurrency, geo caps, fuzzy thresholds, cache TTLs) live in **`backend/app/core/config.py`** as typed **`Settings`** fields — prefer changing env-backed settings over editing pipeline code.
+**Important knobs** (Tavily single-call limits, prefilter caps, opportunistic discovery, circuit breaker, cache TTLs) live in **`backend/app/core/config.py`** as typed **`Settings`** fields — prefer changing env-backed settings over editing pipeline code.
 
 ---
 
@@ -253,13 +255,14 @@ Interactive docs: **`/docs`** (Swagger) when the backend is running.
 
 ## Pipeline evaluation
 
-Twenty curated edge cases (parse geo/ordinals, album-unresolved negatives, store-discovery cities, full pipeline stage traces) live in **`backend/eval/dataset/edge_cases.json`**.
+Eighteen curated edge cases (parse geo/ordinals, album-unresolved negatives, store-discovery cities, full pipeline stage traces) live in **`backend/eval/dataset/edge_cases.json`**.
 
 **Docker (recommended — uses Compose Postgres + Redis):**
 
 ```bash
 # Requires OPENAI_API_KEY and TAVILY_API_KEY in .env or the environment
-docker compose --profile eval run --rm eval
+# Use --build after pipeline or dataset changes (eval image has no live volume mount)
+docker compose --profile eval run --rm --build eval
 
 # Single case, JSON report, or parse-only subset
 docker compose --profile eval run --rm eval -- --case global_artist_album
@@ -314,9 +317,9 @@ poetry run python -m unittest discover -s tests -p 'test_*.py' -v
 **Suggested reading order (≈15 minutes):**
 
 1. This README  
-2. `backend/app/domains/search_pipeline/vinyl_search.py` — orchestration and geo tier loop  
-3. `backend/app/domains/engine/search/` — batching, retries, domain hygiene (see package `__init__.py`)  
-4. `backend/app/domains/engine/policies/listing_rank.py` — scoring philosophy  
+2. `backend/app/domains/search_pipeline/vinyl_search.py` — consolidated orchestration (cache → stores → Tavily → prefilter → extract)  
+3. `backend/app/domains/engine/search/single_call.py` — Tavily query construction and single-call fetch  
+4. `backend/app/domains/engine/search/prefilter.py` — candidate gating before LLM extract  
 5. `backend/tests/` — regression coverage
 
 If you **clone and run Compose with valid keys**, you get a **working vertical slice** suitable for a portfolio conversation about **async Python, LLM boundaries, search UX, and pragmatic tradeoffs**.

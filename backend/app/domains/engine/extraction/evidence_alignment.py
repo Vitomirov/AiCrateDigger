@@ -161,7 +161,7 @@ def evidence_blob_matches_target_release(
     Used in extract/merge and verifier pre-checks. Thin indie snippets are *not*
     auto-loosened here (that caused false positives vs regional SKUs); storefronts
     rely on intent relax for ``snippet_relax_hosts`` plus
-    ``validate_listing(..., relaxed_local_indie=True)`` for title+snippet fuzz.
+    Used by extraction intent matching for title+snippet fuzz alignment.
 
     Both sides are ASCII-folded so diacritic-bearing queries (Polish ``ł``,
     Scandinavian ``ø``, Serbian ``đ``, …) match plain-ASCII catalogue text and

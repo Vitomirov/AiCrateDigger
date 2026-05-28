@@ -1,1 +1,1 @@
-"""Search orchestration: tiers, Tavily fan-out, extraction hand-off, API DTO models."""
+"""Search orchestration: consolidated Tavily call, extraction, API DTO models."""

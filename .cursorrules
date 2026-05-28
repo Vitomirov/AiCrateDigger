@@ -1,14 +1,14 @@
 # AiCrateDigger — Cursor Rules
 
 ## Project identity
-AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter natural language; the backend parses intent, searches the web via **Tavily** constrained to a **whitelist of store domains**, extracts structured listings from **snippets**, then validates and ranks. Branding may appear as **AiCrateDigger** or **AiCrateDigg**.
+AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter natural language; the backend parses intent, searches the web via **Tavily** constrained to a **whitelist of store domains**, extracts structured listings from **snippets**, then deduplicates and returns listing rows. Branding may appear as **AiCrateDigger** or **AiCrateDigg**.
 
 ## Tech stack
 - **Backend:** Python 3.11, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async) + asyncpg, httpx, Poetry
 - **Frontend:** Next.js 14 (App Router), React 18, TypeScript 5 (strict), Tailwind CSS 3 (custom theme — no Shadcn in this repo)
 - **AI:** OpenAI **`gpt-4o-mini`** only, via **`AsyncOpenAI`**; JSON-only contracts where applicable (`response_format={"type": "json_object"}` for structured outputs)
-- **Search:** **Tavily** API — batched `include_domains`, configurable depth/score thresholds in `app.core.config.Settings` (defaults are cost-conscious)
-- **Music metadata:** Discogs REST API v2 (`DISCOGS_TOKEN` optional)
+- **Search:** **Tavily** API — one consolidated call per search (`single_call.py`), Python prefilter, configurable knobs in `app.core.config.Settings`
+- **Cache:** **Redis** (7-day search cache) + optional Postgres `search_response_cache` rows
 - **Database:** PostgreSQL 15 (Compose); **optional** when `DATABASE_URL` unset — tables via `create_all` (no Alembic yet)
 - **Infrastructure:** Docker, Docker Compose
 
@@ -17,11 +17,11 @@ AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter nat
 - Do not add scraping guidance here unless the project explicitly adopts a crawler dependency later.
 
 ## Local-first & geography
-- **`parse_user_query`** resolves verbatim music fields and infers **`country_code`**, **`search_scope`**, and optional **`resolved_city`** (see `app.domains.query_parser.parse_schema`).
-- **`run_vinyl_search`** (`app.domains.search_pipeline.vinyl_search`) walks **geo tiers** (city → country → region → …), caps domains per tier, and may run **per-local-shop Tavily fanout** in city tier.
-- **Store catalogue:** DB-backed `whitelist_stores` (seed/sync from policies) plus **`store_discovery`** (Tavily + LLM) to add indie shops when city coverage is thin.
-- **Query text** for Tavily is built in **`app.domains.engine.policies.search_dsl`** and **`locale_text_variants`** — not a separate “agent 2” LLM step.
-- **Noise avoidance** (e.g. blocking certain domains or path patterns) lives in **`app.domains.engine.search`** and **`app.domains.engine.validators.listings`** — keep behavior consistent with product intent when changing rules.
+- **`parse_user_query`** (single LLM call) resolves verbatim music fields, ordinal **`resolved_album`** when applicable, and infers **`country_code`**, **`search_scope`**, and optional **`resolved_city`** (see `app.domains.query_parser.parse_schema`).
+- **`run_vinyl_search`** (`app.domains.search_pipeline.vinyl_search`) is the **production hot path**: cache lookup → inline store coverage/discovery → **one** consolidated Tavily call → Python prefilter → `extract_listings`.
+- **Store catalogue:** DB-backed `whitelist_stores` (seed/sync from policies) plus **`store_discovery`** (Tavily + LLM) to add indie shops when city coverage is thin or when opportunistic post-Tavily discovery finds new hosts.
+- **Tavily query text** is built in **`app.domains.engine.search.single_call`** (`build_consolidated_query`) — not a separate query-planning LLM step.
+- **Noise avoidance** (blacklisted hosts, PDP-shaped URL heuristics, per-host caps) lives in **`app.domains.engine.search.prefilter`** and **`app.domains.engine.validators.listings`** (`url_suggests_product_detail_page`).
 
 ## Folder structure (canonical)
 - `backend/app/main.py` — FastAPI app, lifespan (DB init, store seed, cache purge)
@@ -29,11 +29,11 @@ AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter nat
 - `backend/app/core/logging_config.py` — human vs JSON logging
 - `backend/app/core/db/` — `database.py`, `cache.py`, `store_loader.py`, `redis_cache.py`
 - `backend/app/api/routers/search.py` — `POST /parse`, `POST /search`, `POST /search-listings`
-- `backend/app/domains/query_parser/` — `parse_user_query`, `parse_schema`, `discogs_service`, numbered `steps/`
-- `backend/app/domains/search_pipeline/` — `vinyl_search`, `pipeline_context`, `tier_runner/`, helpers, `models/` (API DTOs)
-- `backend/app/domains/engine/search/` — Tavily client, consolidated call, `store_discovery` (package `__init__` is **lazy** — import submodules for pure helpers without loading `httpx`)
-- `backend/app/domains/engine/extraction/` — `extract_listings`, numbered `steps/`, `candidates/`, helpers
-- `backend/app/domains/engine/policies/` — geo, stores, `search_dsl`, ranking, physical-local heuristics
+- `backend/app/domains/query_parser/` — `parse_user_query`, `parse_schema`
+- `backend/app/domains/search_pipeline/` — `vinyl_search`, `pipeline_context`, `models/` (API DTOs)
+- `backend/app/domains/engine/search/` — Tavily client, `single_call`, `prefilter`, `store_discovery`, `circuit_breaker` (package `__init__` is **lazy** — import submodules for pure helpers without loading `httpx`)
+- `backend/app/domains/engine/extraction/` — `extract_listings`, numbered `steps/`, helpers
+- `backend/app/domains/engine/policies/` — geo (`geo_scope`, `geo_proximity`), stores (`eu_stores`, `store_domain`), `format_detect`
 - `backend/app/domains/engine/listing_schema.py`, `validators/listings.py`
 - `backend/app/domains/engine/llm/` — small coercion helpers next to extractor
 - `frontend/app/` — pages and **`app/api/search`**, **`app/api/parse`** proxies to backend
@@ -41,17 +41,18 @@ AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter nat
 - `frontend/lib/api.ts` — `fetch` helpers (`postSearch`, `postParse`, etc.)
 
 ## Pipeline mental model
-1. **Parse:** `parse_user_query` → `ParsedQuery` (`query_parser.parse_schema`).
-2. **Resolve album title:** Discogs when `album_index` set; else literal album.
-3. **Geo + stores:** normalization, optional discovery, `load_active_stores`.
-4. **Search:** `plan_tavily_query_strings` + tier loop → `run_tavily_for_store_domains` (+ city fanout where enabled).
-5. **Extract:** `extract_listings` from snippets → listing rows.
-6. **Validate & rank:** `validate_listing` / listing rank (`listing_rank.py`) — composite signals (semantic, geo, store quality, PDP hints, tier); URL normalization for dedupe.
+1. **Parse:** `parse_user_query` → `ParsedQuery` (`query_parser.parse_schema`), including LLM-resolved **`resolved_album`** for ordinal queries.
+2. **Album anchor:** `effective_album` = `resolved_album` or literal `album`; early exit with **`reason: album_unresolved`** when missing.
+3. **Geo + stores:** `ensure_local_coverage` (city), `load_active_stores`, optional opportunistic **`store_discovery`** from Tavily snippets.
+4. **Search:** one **`run_consolidated_tavily_search`** call → raw result dicts.
+5. **Prefilter:** `prefilter_tavily_results` — blacklist, PDP heuristics, whitelist boost, per-host cap.
+6. **Extract:** `extract_listings` from snippets → listing rows → dedupe by host → cache (Redis + Postgres).
 
-## Validation & ranking
-- Prefer **centralized** scoring and validators (`domains/engine/validators/listings.py`, `listing_rank.py`) over scattered one-off filters.
-- Use **RapidFuzz** where the codebase already does fuzzy matching; respect **`Settings`** thresholds for listing validation.
-- **Location:** drives **which domains / tiers** run; validation treats geo mainly as **ranking/boost**, not a hard user-location requirement on every row.
+## Validation & extraction
+- Listing quality gates live in **`extract_listings`** (intent match, evidence alignment, LLM extract) and **`prefilter`** (URL/title noise).
+- **`validators/listings.py`** exposes PDP URL heuristics for prefilter/extraction; keep behavior consistent with product intent when changing rules.
+- Use **RapidFuzz** where the codebase already does fuzzy matching (extraction evidence alignment, city matching in `geo_proximity`).
+- **Location** influences parse output, store discovery, and prefilter whitelist — not a separate geo-tier Tavily loop.
 
 ## Frontend & UX
 - **Today:** single **`POST /search`** round-trip; results render when the response returns. **`SearchExperience`** uses a **progress indicator** while waiting — **not SSE streaming** in the current codebase.
@@ -66,8 +67,8 @@ AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter nat
 
 ## Environment variables
 - **`OPENAI_API_KEY`**, **`TAVILY_API_KEY`** — required for full pipeline
-- **`DISCOGS_TOKEN`** — optional, improves release resolution
 - **`DATABASE_URL`** — optional in dev; Compose supplies Postgres URL by default
+- **`REDIS_URL`** — optional; when unset the Redis cache layer no-ops (Postgres cache may still write)
 - **`DEBUG`** — richer API payload / traces
 
 ## General

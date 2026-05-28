@@ -1,9 +1,7 @@
-"""Listing-level result schema. Canonical output of Agent 3 (Extractor).
+"""Listing-level result schema. Canonical output of the extractor.
 
-Kept in its own module per the Cursor folder-structure rule. Downstream code
-(e.g. router response models) may still use `SearchResult` from
-`search_query.py` as the API-facing DTO; `ListingResult` is the internal
-contract the extractor produces and the scorer consumes.
+Kept in its own module per the Cursor folder-structure rule. The router
+maps these rows to the public ``/search`` response via ``SearchResponse``.
 """
 
 from __future__ import annotations
