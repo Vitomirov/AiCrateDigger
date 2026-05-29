@@ -74,6 +74,7 @@ from app.core.db.store_loader import ensure_local_coverage, load_active_stores
 from app.domains.engine.listing_schema import Listing
 from app.domains.search_pipeline.models.result import ListingResult
 from app.domains.search_pipeline.pipeline_context import stage_timer
+from app.domains.engine.policies.eu_stores import StoreEntry
 from app.domains.engine.policies.format_detect import detect_format_token
 from app.domains.engine.policies.store_domain import canonical_store_domain
 from app.domains.engine.search import tavily_circuit_breaker_scope
@@ -358,15 +359,43 @@ async def _stage_opportunistic_store_discovery(
     return augmented
 
 
-async def _load_trusted_local_shop_hosts(parsed: Any) -> frozenset[str]:
-    """City-matched ``local_shop`` domains from the active store catalogue."""
+async def _load_active_stores_catalogue() -> tuple[StoreEntry, ...]:
+    """Single DB read of the active whitelist for one pipeline request.
+
+    Robustness contract: an unexpected failure must NEVER leave the pipeline
+    without a usable catalogue — we degrade to the in-code seed
+    (:func:`get_active_stores`) so curated indies are not demoted to unknown hosts.
+    """
+    try:
+        return await load_active_stores()
+    except Exception:
+        logger.exception(
+            "load_active_stores_failed_falling_back_to_code_seed",
+            extra={"stage": "stores"},
+        )
+        from app.domains.engine.policies.eu_stores import get_active_stores
+
+        return get_active_stores()
+
+
+def _known_shop_hosts_from_stores(stores: tuple[StoreEntry, ...]) -> frozenset[str]:
+    """All active hosts — positive prefilter signal for curated + discovered shops."""
+    hosts: set[str] = set()
+    for s in stores:
+        dom = canonical_store_domain(getattr(s, "domain", "") or "")
+        if dom:
+            hosts.add(dom)
+    return frozenset(hosts)
+
+
+def _trusted_local_shop_hosts_from_stores(
+    stores: tuple[StoreEntry, ...],
+    parsed: Any,
+) -> frozenset[str]:
+    """City-matched ``local_shop`` domains from an already-loaded catalogue."""
     city = (getattr(parsed, "resolved_city", None) or "").strip()
     cc = (getattr(parsed, "country_code", None) or "").strip().upper()
     if not cc:
-        return frozenset()
-    try:
-        stores = await load_active_stores()
-    except Exception:
         return frozenset()
     from app.domains.engine.policies.geo_proximity import cities_match
 
@@ -386,32 +415,13 @@ async def _load_trusted_local_shop_hosts(parsed: Any) -> frozenset[str]:
     return frozenset(hosts)
 
 
-async def _load_known_shop_hosts() -> frozenset[str]:
-    """Active host set from ``whitelist_stores`` (curated + discovered indies).
-
-    The prefilter treats this as a positive signal — every host listed here
-    passes the noise gate. Robustness contract: an unexpected failure here
-    must NEVER return an empty whitelist, because that would silently demote
-    every curated indie shop to "unknown host" and the prefilter would drop
-    their URLs as ``rejected_no_pdp_signal``. We therefore degrade to the
-    in-code seed (:func:`get_active_stores`) of :mod:`app.domains.engine.policies.eu_stores`.
-    """
-    try:
-        stores = await load_active_stores()
-    except Exception:
-        logger.exception(
-            "load_active_stores_failed_falling_back_to_code_seed",
-            extra={"stage": "stores"},
-        )
-        from app.domains.engine.policies.eu_stores import get_active_stores
-
-        stores = get_active_stores()
-    hosts: set[str] = set()
-    for s in stores:
-        dom = canonical_store_domain(getattr(s, "domain", "") or "")
-        if dom:
-            hosts.add(dom)
-    return frozenset(hosts)
+async def _load_pipeline_shop_hosts(parsed: Any) -> tuple[frozenset[str], frozenset[str]]:
+    """Return ``(known_shop_hosts, trusted_local_shop_hosts)`` from one catalogue load."""
+    stores = await _load_active_stores_catalogue()
+    return (
+        _known_shop_hosts_from_stores(stores),
+        _trusted_local_shop_hosts_from_stores(stores, parsed),
+    )
 
 
 def _host_of(url: str) -> str | None:
@@ -626,12 +636,11 @@ async def _run_vinyl_search_inner(
     _ = background_tasks  # reserved for future post-response telemetry / cache warming.
 
     # ---- Stage 5: load active shop hosts (positive prefilter signal) ---
-    known_shop_hosts = await _load_known_shop_hosts()
+    known_shop_hosts, trusted_local_shop_hosts = await _load_pipeline_shop_hosts(parsed)
     known_shop_hosts = _merge_discovery_domains_into_hosts(
         known_shop_hosts,
         primary_discovery_summary,
     )
-    trusted_local_shop_hosts = await _load_trusted_local_shop_hosts(parsed)
     logger.info(
         "known_shop_hosts_loaded",
         extra={"stage": "stores", "host_count": len(known_shop_hosts)},
