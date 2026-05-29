@@ -46,13 +46,23 @@ class Settings(BaseSettings):
     frontend_public_url: str = Field(default="http://localhost:3000")
 
     debug: bool = False
-    #: Env ``SEARCH_RATE_LIMIT_ENABLED``. When ``False``, ``POST /search`` skips IP rate limiting.
+    #: Env ``SEARCH_RATE_LIMIT_ENABLED``. When ``False``, paid routes skip IP rate limiting.
     search_rate_limit_enabled: bool = Field(
         default=True,
-        description="Enable 5 searches per IP per 24h on POST /search (SEARCH_RATE_LIMIT_ENABLED).",
+        description=(
+            "Enable per-IP rate limit on POST /search, /search-listings, and /parse "
+            "(SEARCH_RATE_LIMIT_ENABLED)."
+        ),
+    )
+    #: When ``True`` (default), missing or failing Redis returns 503 instead of allowing traffic.
+    search_rate_limit_fail_closed: bool = Field(
+        default=True,
+        description="Reject requests when Redis is unavailable (SEARCH_RATE_LIMIT_FAIL_CLOSED).",
     )
     search_rate_limit_max_requests: int = Field(default=5, ge=1, le=100)
     search_rate_limit_window_seconds: int = Field(default=86_400, ge=60)
+    #: Max characters in ``ParseRequest.query`` (SEARCH_QUERY_MAX_LENGTH).
+    search_query_max_length: int = Field(default=512, ge=64, le=4096)
     log_level: str = "INFO"
     log_format: Literal["human", "json"] = Field(
         default="human",
@@ -115,6 +125,7 @@ class Settings(BaseSettings):
         "debug",
         "search_cache_enabled",
         "search_rate_limit_enabled",
+        "search_rate_limit_fail_closed",
         mode="before",
     )
     @classmethod

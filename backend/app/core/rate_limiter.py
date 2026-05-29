@@ -1,4 +1,4 @@
-"""IP-based sliding-window rate limit for anonymous search requests."""
+"""IP-based sliding-window rate limit for anonymous paid API routes."""
 
 from __future__ import annotations
 
@@ -12,7 +12,12 @@ from app.core.db.redis_cache import get_redis_client
 
 logger = logging.getLogger(__name__)
 
-_SEARCH_RATE_LIMIT_KEY_PREFIX = "rate_limit:search:"
+#: Shared bucket for ``/search``, ``/search-listings``, and ``/parse``.
+_RATE_LIMIT_KEY_PREFIX = "rate_limit:api:"
+
+_RATE_LIMIT_UNAVAILABLE_DETAIL = (
+    "Service temporarily unavailable. Please try again in a few minutes."
+)
 
 
 def _rate_limit_settings() -> tuple[int, int]:
@@ -32,8 +37,24 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
+def _rate_limit_exceeded_detail(max_requests: int, window_seconds: int) -> str:
+    hours = max(1, window_seconds // 3600)
+    return (
+        f"Request limit reached. You can make {max_requests} searches "
+        f"every {hours} hours."
+    )
+
+
+def _raise_rate_limit_unavailable(*, reason: str) -> None:
+    logger.warning(
+        "rate_limiter_unavailable_rejecting",
+        extra={"stage": "rate_limiter", "status": "blocked", "reason": reason},
+    )
+    raise HTTPException(status_code=503, detail=_RATE_LIMIT_UNAVAILABLE_DETAIL)
+
+
 async def ip_rate_limiter(request: Request) -> None:
-    """FastAPI dependency: N search requests per IP per rolling window (see Settings)."""
+    """FastAPI dependency: N paid requests per IP per rolling window (see Settings)."""
     settings = get_settings()
     if not settings.search_rate_limit_enabled:
         logger.debug(
@@ -43,9 +64,12 @@ async def ip_rate_limiter(request: Request) -> None:
         return
 
     max_requests, window_seconds = _rate_limit_settings()
+    fail_closed = settings.search_rate_limit_fail_closed
 
     client = await get_redis_client()
     if client is None:
+        if fail_closed:
+            _raise_rate_limit_unavailable(reason="redis_unavailable")
         logger.warning(
             "rate_limiter_redis_unavailable_allowing_request",
             extra={"stage": "rate_limiter", "status": "bypass"},
@@ -53,7 +77,7 @@ async def ip_rate_limiter(request: Request) -> None:
         return
 
     ip = _client_ip(request)
-    key = f"{_SEARCH_RATE_LIMIT_KEY_PREFIX}{ip}"
+    key = f"{_RATE_LIMIT_KEY_PREFIX}{ip}"
     now = time.time()
     window_start = now - window_seconds
 
@@ -77,10 +101,7 @@ async def ip_rate_limiter(request: Request) -> None:
             )
             raise HTTPException(
                 status_code=429,
-                detail=(
-                    f"Search limit reached. You can make {max_requests} searches "
-                    f"every {window_seconds // 3600} hours."
-                ),
+                detail=_rate_limit_exceeded_detail(max_requests, window_seconds),
             )
 
         member = str(time.time_ns())
@@ -91,6 +112,8 @@ async def ip_rate_limiter(request: Request) -> None:
     except HTTPException:
         raise
     except Exception as exc:
+        if fail_closed:
+            _raise_rate_limit_unavailable(reason=str(exc)[:200])
         logger.warning(
             "rate_limiter_redis_error_allowing_request",
             extra={"stage": "rate_limiter", "status": "bypass", "reason": str(exc)[:200]},

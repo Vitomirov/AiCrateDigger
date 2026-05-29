@@ -2,6 +2,17 @@ import { NextResponse } from "next/server";
 
 import { getServerBackendBase } from "../../../lib/server-backend-url";
 
+function resolveClientIp(request: Request): string | null {
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const first = forwarded.split(",")[0]?.trim();
+    if (first) {
+      return first;
+    }
+  }
+  return request.headers.get("x-real-ip");
+}
+
 export async function POST(request: Request): Promise<NextResponse> {
   const backendBase = getServerBackendBase();
 
@@ -12,10 +23,16 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json({ detail: "Invalid JSON body" }, { status: 400 });
   }
 
+  const clientIp = resolveClientIp(request);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (clientIp) {
+    headers["X-Forwarded-For"] = clientIp;
+  }
+
   try {
     const res = await fetch(`${backendBase}/parse`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       cache: "no-store",
     });

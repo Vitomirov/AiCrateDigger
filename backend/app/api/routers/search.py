@@ -13,25 +13,34 @@ from app.domains.search_pipeline.vinyl_search import run_vinyl_search
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["search"])
 
+_PARSE_FAILED_DETAIL = "Parse could not be completed. Please try again later."
+_SEARCH_FAILED_DETAIL = "Search could not be completed. Please try again later."
+
 
 # -------------------------
 # DEBUG / PARSE ONLY ENDPOINT
 # -------------------------
 @router.post("/parse", response_model=ParsedQuery)
-async def parse_search_query(payload: ParseRequest) -> ParsedQuery:
+async def parse_search_query(
+    payload: ParseRequest,
+    _: None = Depends(ip_rate_limiter),
+) -> ParsedQuery:
     with start_pipeline(debug=get_settings().debug):
         try:
             parsed = await parse_user_query(payload.query)
             return parsed
 
+        except HTTPException:
+            raise
+
         except Exception as exc:
             logger.exception(
                 "parse_endpoint_failed",
-                extra={"stage": "parser", "status": "fail"},
+                extra={"stage": "parser", "status": "fail", "reason": str(exc)[:200]},
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"Parse failed: {exc}",
+                detail=_PARSE_FAILED_DETAIL,
             ) from exc
 
 
@@ -85,11 +94,12 @@ async def _execute_search(
                     "stage": "pipeline",
                     "status": "fail",
                     "request_id": ctx.request_id,
+                    "reason": str(exc)[:200],
                 },
             )
             raise HTTPException(
                 status_code=502,
-                detail=f"Search pipeline failed: {exc}",
+                detail=_SEARCH_FAILED_DETAIL,
             ) from exc
 
 

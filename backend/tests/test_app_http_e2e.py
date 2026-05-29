@@ -24,6 +24,7 @@ os.environ.setdefault("TAVILY_API_KEY", "tv-e2e-dummy-unused")
 os.environ["DATABASE_URL"] = ""
 os.environ["REDIS_URL"] = ""
 os.environ["DEBUG"] = "false"
+os.environ["SEARCH_RATE_LIMIT_ENABLED"] = "false"
 
 from app.core.config import get_settings  # noqa: E402
 
@@ -41,6 +42,8 @@ class TestHTTPAppEdgeCases(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        os.environ["SEARCH_RATE_LIMIT_ENABLED"] = "false"
+        get_settings.cache_clear()
         cls.client = TestClient(app)
 
     @classmethod
@@ -77,6 +80,12 @@ class TestHTTPAppEdgeCases(unittest.TestCase):
     def test_parse_rejects_empty_query_string_with_422(self) -> None:
         """``query`` honours ``min_length=1`` — empty vinyl text is invalid."""
         r = self.client.post("/parse", json={"query": ""})
+        self.assertEqual(r.status_code, 422)
+
+    def test_parse_rejects_query_over_max_length_with_422(self) -> None:
+        """Oversized prompts are rejected before any OpenAI call."""
+        max_len = get_settings().search_query_max_length
+        r = self.client.post("/parse", json={"query": "x" * (max_len + 1)})
         self.assertEqual(r.status_code, 422)
 
     def test_parse_rejects_wrong_query_type_with_422(self) -> None:
@@ -126,7 +135,10 @@ class TestHTTPAppEdgeCases(unittest.TestCase):
         ):
             r = self.client.post("/parse", json={"query": "anything"})
         self.assertEqual(r.status_code, 502)
-        self.assertIn("Parse failed", r.json().get("detail", ""))
+        self.assertEqual(
+            r.json().get("detail"),
+            "Parse could not be completed. Please try again later.",
+        )
 
     def test_search_structured_empty_when_album_unresolved_stubbed(self) -> None:
         """Pipeline short-circuit: zero Tavily listings + machine-readable ``reason``.

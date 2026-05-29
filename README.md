@@ -214,6 +214,9 @@ Use **`NEXT_PUBLIC_BACKEND_URL`** for browser-side calls where applicable, and *
 | `DATABASE_URL` | No* | Postgres (`postgresql+asyncpg://…` or `postgresql://…`) — *Compose supplies default |
 | `REDIS_URL` | No | Search-result cache (7-day TTL); no-ops when unset |
 | `DEBUG` | No | When `true`, `/search` includes full pipeline **`debug`** trace |
+| `SEARCH_RATE_LIMIT_ENABLED` | No | Per-IP limit on `/search`, `/search-listings`, `/parse` (default `true`) |
+| `SEARCH_RATE_LIMIT_FAIL_CLOSED` | No | When `true`, missing Redis returns **503** (set `false` only for local backend-without-Redis) |
+| `SEARCH_QUERY_MAX_LENGTH` | No | Max characters in search/parse body (default **512**) |
 | `LOG_LEVEL` | No | Default `INFO` |
 | `LOG_FORMAT` | No | `human` (local) or **`json`** (aggregators) |
 

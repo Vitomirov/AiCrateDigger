@@ -1,7 +1,8 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.config import get_settings
 from app.domains.query_parser.parse_schema import ParsedQuery as PipelineParsedQuery
 from app.domains.search_pipeline.models.result import ListingResult
 
@@ -28,6 +29,15 @@ class ParseRequest(BaseModel):
         min_length=1,
         description="Raw natural-language user query (any language).",
     )
+
+    @field_validator("query")
+    @classmethod
+    def _validate_query_length(cls, value: str) -> str:
+        max_len = get_settings().search_query_max_length
+        if len(value) > max_len:
+            msg = f"query must be at most {max_len} characters"
+            raise ValueError(msg)
+        return value
 
 
 class SearchResponse(BaseModel):
