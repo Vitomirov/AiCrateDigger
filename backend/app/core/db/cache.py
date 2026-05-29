@@ -30,18 +30,30 @@ def hydrate_cached_pipeline_dict(cached: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_search_cache_key(*, user_query: str, artist: str | None, album_title: str, debug: bool) -> str:
-    """Stable SHA-256 hex for cache identity (debug mode gets a separate slot)."""
-    import hashlib
-
-    parts = (
-        (user_query or "").strip().lower(),
-        (artist or "").strip().lower(),
-        (album_title or "").strip().lower(),
-        "1" if debug else "0",
+def build_search_cache_key(
+    *,
+    format_token: str | None,
+    artist: str | None,
+    album_title: str,
+    country_code: str | None,
+    resolved_city: str | None = None,
+    geo_granularity: str | None = None,
+) -> str:
+    """Postgres cache key — SHA-256 of the canonical Redis cache identity."""
+    from app.core.db.search_cache_key import (
+        build_pipeline_search_cache_key,
+        build_postgres_search_cache_key,
     )
-    raw = "\n".join(parts).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+
+    redis_key = build_pipeline_search_cache_key(
+        format_token=format_token,
+        artist=artist,
+        album=album_title,
+        country_code=country_code,
+        resolved_city=resolved_city,
+        geo_granularity=geo_granularity,
+    )
+    return build_postgres_search_cache_key(redis_cache_key=redis_key)
 
 
 async def get_cached_search_payload(cache_key: str) -> dict[str, Any] | None:

@@ -67,16 +67,9 @@ from fastapi import BackgroundTasks
 from app.domains.engine.extraction import extract_listings
 from app.domains.query_parser.parse_user_query import parse_user_query
 from app.core.config import get_settings
-from app.core.db.cache import (
-    build_search_cache_key,
-    get_cached_search_payload,
-    set_cached_search_payload,
-)
-from app.core.db.redis_cache import (
-    build_redis_search_key,
-    get_cached_search,
-    set_cached_search,
-)
+from app.core.db.cache import get_cached_search_payload, set_cached_search_payload
+from app.core.db.redis_cache import get_cached_search, set_cached_search
+from app.core.db.search_cache_key import build_pipeline_search_cache_keys
 from app.core.db.store_loader import ensure_local_coverage, load_active_stores
 from app.domains.engine.listing_schema import Listing
 from app.domains.search_pipeline.models.result import ListingResult
@@ -575,17 +568,13 @@ async def _run_vinyl_search_inner(
 
     # ---- Stage 3: Redis cache lookup (7-day TTL short-circuit) ---------
     format_token = detect_format_token(parsed.original_query)
-    redis_key = build_redis_search_key(
+    redis_key, pg_key = build_pipeline_search_cache_keys(
         format_token=format_token,
         artist=parsed.artist,
         album=album_title,
         country_code=parsed.country_code,
-    )
-    pg_key = build_search_cache_key(
-        user_query=query,
-        artist=parsed.artist,
-        album_title=album_title,
-        debug=settings.debug,
+        resolved_city=getattr(parsed, "resolved_city", None),
+        geo_granularity=getattr(parsed, "geo_granularity", None),
     )
 
     with stage_timer(

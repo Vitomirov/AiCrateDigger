@@ -20,10 +20,10 @@ Design contract
   cease to be hit and expire via their existing TTL.
 * **No business logic** — only cache key shaping + I/O. The pipeline owns the
   decision of *what* to cache.
-* **Deterministic, human-readable key** — the key format mirrors the spec:
-  ``cratedigger:search:v{N}:{format}:{artist}:{album}:{country_code_or_global}``
-  with lowercase, trimmed, underscore-collapsed values so the same logical
-  query never aliases across casing/whitespace variations.
+* **Deterministic, human-readable key** — built by
+  :func:`app.core.db.search_cache_key.build_pipeline_search_cache_key` from
+  parsed intent (format, artist, album, country, optional city) so paraphrases
+  share a slot when the parser resolves the same fields.
 
 Async-first: all I/O is awaited via ``redis.asyncio``.
 """
@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
 try:
@@ -43,23 +42,15 @@ except Exception:  # pragma: no cover - module absence is handled gracefully
     RedisError = Exception  # type: ignore[assignment,misc]
 
 from app.core.config import get_settings
+from app.core.db.search_cache_key import (
+    PIPELINE_CACHE_SCHEMA_VERSION,
+    build_pipeline_search_cache_key,
+)
 
 logger = logging.getLogger(__name__)
 
-
-#: Monotonic version stamp embedded in every Redis search-cache key.
-#:
-#: BUMP this integer whenever a pipeline behaviour change must invalidate
-#: every cached response (new stage, prefilter rule change, prompt rewrite,
-#: scoring tweak, ListingResult schema change, …). Old keys simply stop
-#: being hit by reads and naturally expire via the existing 7-day TTL —
-#: operators do not need to ``FLUSHALL`` Redis.
-#:
-#: Current bump: ``2`` — locks in the prefilter whitelist injection fix +
-#: Stage 6.5 opportunistic store discovery + the new debug-bypass behaviour.
-#: Anything cached under the ``v1`` (unversioned) key is intentionally
-#: orphaned because it predates the local-shop fixes.
-_PIPELINE_CACHE_SCHEMA_VERSION: int = 2
+# Back-compat alias for purge logic and external imports.
+_PIPELINE_CACHE_SCHEMA_VERSION: int = PIPELINE_CACHE_SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -70,46 +61,23 @@ _client: Any | None = None
 _client_init_failed: bool = False
 
 
-def _normalize_token(value: str | None, *, fallback: str = "any") -> str:
-    """Lowercase + trim + collapse whitespace to ``_`` so the cache key never
-    aliases incorrectly (``" Pink   Floyd "`` and ``"pink_floyd"`` collide).
-
-    Non-alphanumeric characters (other than ``-`` and ``.``) are also folded to
-    ``_`` so user typos like commas or accents do not generate noisy keys.
-    """
-    s = (value or "").strip().lower()
-    if not s:
-        return fallback
-    s = re.sub(r"\s+", "_", s)
-    s = re.sub(r"[^a-z0-9_.\-]", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    return s or fallback
-
-
 def build_redis_search_key(
     *,
     format_token: str | None,
     artist: str | None,
     album: str | None,
     country_code: str | None,
+    resolved_city: str | None = None,
+    geo_granularity: str | None = None,
 ) -> str:
-    """Deterministic, human-readable, schema-versioned cache key.
-
-    Format: ``cratedigger:search:v{N}:{format}:{artist}:{album}:{country|global}``.
-    All segments are lowercase, trimmed, with whitespace replaced by ``_``.
-
-    The ``v{N}`` segment carries :data:`_PIPELINE_CACHE_SCHEMA_VERSION` so a
-    pipeline-behaviour bump (new stage, prefilter rule, scoring change) does
-    not require operators to ``FLUSHALL`` Redis — stale entries are simply
-    orphaned by the new key namespace.
-    """
-    fmt = _normalize_token(format_token, fallback="vinyl")
-    artist_part = _normalize_token(artist, fallback="unknown_artist")
-    album_part = _normalize_token(album, fallback="unknown_album")
-    country_part = _normalize_token(country_code, fallback="global")
-    return (
-        f"cratedigger:search:v{_PIPELINE_CACHE_SCHEMA_VERSION}"
-        f":{fmt}:{artist_part}:{album_part}:{country_part}"
+    """Redis cache key — delegates to :mod:`app.core.db.search_cache_key`."""
+    return build_pipeline_search_cache_key(
+        format_token=format_token,
+        artist=artist,
+        album=album,
+        country_code=country_code,
+        resolved_city=resolved_city,
+        geo_granularity=geo_granularity,
     )
 
 

@@ -51,7 +51,7 @@ class WhitelistStoreORM(Base):
 
 
 class SearchResponseCacheORM(Base):
-    """Repeat-search TTL cache: keyed by normalized query + resolved album."""
+    """Repeat-search TTL cache: keyed by canonical parsed intent (SHA-256 hex)."""
 
     __tablename__ = "search_response_cache"
 
