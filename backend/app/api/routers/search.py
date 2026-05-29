@@ -2,6 +2,7 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
+from app.core.internal_auth import require_internal_api_secret
 from app.core.rate_limiter import ip_rate_limiter
 from app.domains.query_parser.parse_user_query import parse_user_query
 from app.core.config import get_settings
@@ -11,7 +12,13 @@ from app.domains.search_pipeline.pipeline_context import start_pipeline
 from app.domains.search_pipeline.vinyl_search import run_vinyl_search
 
 logger = logging.getLogger(__name__)
-router = APIRouter(tags=["search"])
+router = APIRouter(
+    tags=["search"],
+    dependencies=[
+        Depends(require_internal_api_secret),
+        Depends(ip_rate_limiter),
+    ],
+)
 
 _PARSE_FAILED_DETAIL = "Parse could not be completed. Please try again later."
 _SEARCH_FAILED_DETAIL = "Search could not be completed. Please try again later."
@@ -21,10 +28,7 @@ _SEARCH_FAILED_DETAIL = "Search could not be completed. Please try again later."
 # DEBUG / PARSE ONLY ENDPOINT
 # -------------------------
 @router.post("/parse", response_model=ParsedQuery)
-async def parse_search_query(
-    payload: ParseRequest,
-    _: None = Depends(ip_rate_limiter),
-) -> ParsedQuery:
+async def parse_search_query(payload: ParseRequest) -> ParsedQuery:
     with start_pipeline(debug=get_settings().debug):
         try:
             parsed = await parse_user_query(payload.query)
@@ -107,7 +111,6 @@ async def _execute_search(
 async def search(
     payload: ParseRequest,
     background_tasks: BackgroundTasks,
-    _: None = Depends(ip_rate_limiter),
 ) -> SearchResponse:
     return await _execute_search(payload, background_tasks)
 
@@ -119,6 +122,5 @@ async def search(
 async def search_listings(
     payload: ParseRequest,
     background_tasks: BackgroundTasks,
-    _: None = Depends(ip_rate_limiter),
 ) -> SearchResponse:
     return await _execute_search(payload, background_tasks)

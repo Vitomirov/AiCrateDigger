@@ -178,9 +178,11 @@ docker compose up --build
 
 | Service | URL |
 |---------|-----|
-| Frontend | http://localhost:3000 |
-| Backend API | http://localhost:8000 |
+| Frontend (use this in the browser) | http://localhost:3000 |
+| Backend API | Docker network only — not published on the host by default. Uncomment `ports` in `docker-compose.yml` for `127.0.0.1:8000` debugging. |
 | PostgreSQL (host port) | localhost:**5433** (default; see `docker-compose.yml`) |
+
+Set **`INTERNAL_API_SECRET`** in `.env` (same value for `backend` + `frontend` services). Generate a strong value for production (`openssl rand -hex 32`). The UI calls the API via Next.js `/api/*` proxies, which attach the secret server-side.
 
 ### 3. Backend only (Poetry)
 
@@ -199,7 +201,7 @@ npm install
 npm run dev
 ```
 
-Use **`NEXT_PUBLIC_BACKEND_URL`** for browser-side calls where applicable, and **`BACKEND_URL`** for the Next.js server route proxy (`frontend/app/api/search/route.ts`).
+Use **`BACKEND_URL`** for the Next.js server route proxy (`frontend/app/api/search/route.ts`). **`NEXT_PUBLIC_BACKEND_URL`** is for optional SSR health checks only — do not point browser search traffic at the backend directly.
 
 ---
 
@@ -217,6 +219,7 @@ Use **`NEXT_PUBLIC_BACKEND_URL`** for browser-side calls where applicable, and *
 | `SEARCH_RATE_LIMIT_ENABLED` | No | Per-IP limit on `/search`, `/search-listings`, `/parse` (default `true`) |
 | `SEARCH_RATE_LIMIT_FAIL_CLOSED` | No | When `true`, missing Redis returns **503** (set `false` only for local backend-without-Redis) |
 | `SEARCH_QUERY_MAX_LENGTH` | No | Max characters in search/parse body (default **512**) |
+| `INTERNAL_API_SECRET` | No* | BFF shared secret; same value on backend + frontend. Unset = dev bypass (*set in production) |
 | `LOG_LEVEL` | No | Default `INFO` |
 | `LOG_FORMAT` | No | `human` (local) or **`json`** (aggregators) |
 

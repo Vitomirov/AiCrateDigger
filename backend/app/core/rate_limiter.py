@@ -7,6 +7,7 @@ import time
 
 from fastapi import HTTPException, Request
 
+from app.core.client_ip import resolve_client_ip
 from app.core.config import get_settings
 from app.core.db.redis_cache import get_redis_client
 
@@ -23,18 +24,6 @@ _RATE_LIMIT_UNAVAILABLE_DETAIL = (
 def _rate_limit_settings() -> tuple[int, int]:
     settings = get_settings()
     return settings.search_rate_limit_max_requests, settings.search_rate_limit_window_seconds
-
-
-def _client_ip(request: Request) -> str:
-    """Resolve client IP, preferring the first hop in ``X-Forwarded-For``."""
-    forwarded = request.headers.get("X-Forwarded-For") or request.headers.get("x-forwarded-for")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
 
 
 def _rate_limit_exceeded_detail(max_requests: int, window_seconds: int) -> str:
@@ -76,7 +65,7 @@ async def ip_rate_limiter(request: Request) -> None:
         )
         return
 
-    ip = _client_ip(request)
+    ip = resolve_client_ip(request)
     key = f"{_RATE_LIMIT_KEY_PREFIX}{ip}"
     now = time.time()
     window_start = now - window_seconds

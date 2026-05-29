@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     #: Browser URL for the Next.js UI — used when visitors open the API port by mistake.
     frontend_public_url: str = Field(default="http://localhost:3000")
+    #: Shared with the Next.js BFF (`INTERNAL_API_SECRET`). When unset, paid routes skip this check (local dev).
+    internal_api_secret: str | None = None
 
     debug: bool = False
     #: Env ``SEARCH_RATE_LIMIT_ENABLED``. When ``False``, paid routes skip IP rate limiting.
@@ -149,6 +151,7 @@ class Settings(BaseSettings):
     @field_validator(
         "database_url",
         "redis_url",
+        "internal_api_secret",
         "postgres_user",
         "postgres_password",
         "postgres_db",
