@@ -220,6 +220,11 @@ Use **`BACKEND_URL`** for the Next.js server route proxy (`frontend/app/api/sear
 | `SEARCH_RATE_LIMIT_FAIL_CLOSED` | No | When `true`, missing Redis returns **503** (set `false` only for local backend-without-Redis) |
 | `SEARCH_QUERY_MAX_LENGTH` | No | Max characters in search/parse body (default **512**) |
 | `INTERNAL_API_SECRET` | No* | BFF shared secret; same value on backend + frontend. Unset = dev bypass (*set in production) |
+| `GLOBAL_DAILY_QUOTA_ENABLED` | No | Account-wide Redis daily caps (default `true`) |
+| `GLOBAL_DAILY_QUOTA_FAIL_CLOSED` | No | Block provider calls when Redis is down (default `true`) |
+| `GLOBAL_DAILY_QUOTA_PARSE_MAX` | No | Max OpenAI parses/day — includes every `/search` parse before cache (default **500**, `0` = off) |
+| `GLOBAL_DAILY_QUOTA_TAVILY_MAX` | No | Max Tavily HTTP calls/day (default **200**, `0` = off) |
+| `GLOBAL_DAILY_QUOTA_OPENAI_EXTRACT_MAX` | No | Max extractor + store-discovery LLM calls/day (default **300**, `0` = off) |
 | `LOG_LEVEL` | No | Default `INFO` |
 | `LOG_FORMAT` | No | `human` (local) or **`json`** (aggregators) |
 

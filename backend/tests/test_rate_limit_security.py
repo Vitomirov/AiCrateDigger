@@ -16,6 +16,7 @@ os.environ["SEARCH_RATE_LIMIT_FAIL_CLOSED"] = "true"
 os.environ["SEARCH_RATE_LIMIT_MAX_REQUESTS"] = "2"
 os.environ["SEARCH_RATE_LIMIT_WINDOW_SECONDS"] = "3600"
 os.environ["INTERNAL_API_SECRET"] = ""
+os.environ["GLOBAL_DAILY_QUOTA_ENABLED"] = "false"
 
 from app.core.config import get_settings  # noqa: E402
 
@@ -34,6 +35,7 @@ class TestRateLimitSecurity(unittest.TestCase):
         os.environ["SEARCH_RATE_LIMIT_FAIL_CLOSED"] = "true"
         os.environ["SEARCH_RATE_LIMIT_MAX_REQUESTS"] = "2"
         os.environ["INTERNAL_API_SECRET"] = ""
+        os.environ["GLOBAL_DAILY_QUOTA_ENABLED"] = "false"
         get_settings.cache_clear()
         cls.client = TestClient(app)
         cls.stub = StrictParsedQuery(

@@ -35,6 +35,7 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import get_settings
+from app.core.quota import QuotaExceededError, QuotaUnavailableError, openai_extract_quota_scope
 from app.core.db.database import WhitelistStoreORM, is_database_configured, session_factory
 from app.domains.engine.policies.geo_scope import country_to_region
 from app.domains.engine.policies.store_domain import canonical_store_domain, is_valid_store_host
@@ -326,15 +327,18 @@ async def _llm_extract_candidates(
         "snippets": snippets,
     }
     try:
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": _DISCOVERY_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-        )
+        async with openai_extract_quota_scope():
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": _DISCOVERY_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+            )
+    except (QuotaExceededError, QuotaUnavailableError):
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception(
             "store_discovery_llm_failed",

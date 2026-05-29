@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
 from app.core.internal_auth import require_internal_api_secret
+from app.core.quota import QuotaExceededError, QuotaUnavailableError
 from app.core.rate_limiter import ip_rate_limiter
 from app.domains.query_parser.parse_user_query import parse_user_query
 from app.core.config import get_settings
@@ -89,6 +90,8 @@ async def _execute_search(
             )
 
         except HTTPException:
+            raise
+        except (QuotaExceededError, QuotaUnavailableError):
             raise
 
         except Exception as exc:

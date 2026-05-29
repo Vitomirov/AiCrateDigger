@@ -13,6 +13,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.core.config import get_settings
+from app.core.quota import QuotaKind, assert_quota_available, record_quota_usage
 from app.domains.query_parser.parse_schema import ParsedQuery, ResolutionConfidence
 
 SYSTEM_PROMPT = """You are an extraction-and-geocoding parser for a vinyl \
@@ -221,6 +222,8 @@ def _build_parsed_payload(data: dict[str, Any], query: str) -> dict[str, Any]:
 
 async def parse_user_query(query: str) -> ParsedQuery:
     """Run a single OpenAI call and return the strict ParsedQuery contract."""
+    await assert_quota_available(QuotaKind.PARSE)
+
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -240,4 +243,6 @@ async def parse_user_query(query: str) -> ParsedQuery:
         msg = "Parser returned non-object JSON."
         raise ValueError(msg)
 
-    return ParsedQuery.model_validate(_build_parsed_payload(data, query))
+    parsed = ParsedQuery.model_validate(_build_parsed_payload(data, query))
+    await record_quota_usage(QuotaKind.PARSE)
+    return parsed

@@ -1,10 +1,11 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.core.config import get_settings
+from app.core.quota import QuotaExceededError, QuotaUnavailableError
 from app.core.db.cache import purge_expired_search_cache_rows
 from app.core.db.database import (
     dispose_engine,
@@ -87,6 +88,42 @@ logger.info(
 
 app = FastAPI(title="AiCrateDigg API", version="0.1.0", lifespan=lifespan)
 app.include_router(search_router)
+
+_QUOTA_UNAVAILABLE_DETAIL = (
+    "Service temporarily unavailable. Please try again in a few minutes."
+)
+_QUOTA_EXCEEDED_DETAIL = (
+    "Daily usage limit reached. Please try again tomorrow."
+)
+
+
+@app.exception_handler(QuotaUnavailableError)
+async def quota_unavailable_handler(
+    _request: Request,
+    exc: QuotaUnavailableError,
+) -> JSONResponse:
+    logger.warning(
+        "quota_unavailable",
+        extra={"stage": "global_quota", "reason": exc.reason[:200]},
+    )
+    return JSONResponse(status_code=503, content={"detail": _QUOTA_UNAVAILABLE_DETAIL})
+
+
+@app.exception_handler(QuotaExceededError)
+async def quota_exceeded_handler(
+    _request: Request,
+    exc: QuotaExceededError,
+) -> JSONResponse:
+    logger.info(
+        "quota_exceeded_response",
+        extra={
+            "stage": "global_quota",
+            "kind": exc.kind.value,
+            "current": exc.current,
+            "limit": exc.limit,
+        },
+    )
+    return JSONResponse(status_code=503, content={"detail": _QUOTA_EXCEEDED_DETAIL})
 
 
 @app.get("/", include_in_schema=False)

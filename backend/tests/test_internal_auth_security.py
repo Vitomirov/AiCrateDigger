@@ -15,6 +15,7 @@ os.environ["SEARCH_RATE_LIMIT_ENABLED"] = "false"
 os.environ["SEARCH_RATE_LIMIT_FAIL_CLOSED"] = "false"
 os.environ["SEARCH_RATE_LIMIT_MAX_REQUESTS"] = "10"
 os.environ["INTERNAL_API_SECRET"] = "test-secret-value"
+os.environ["GLOBAL_DAILY_QUOTA_ENABLED"] = "false"
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.client_ip import resolve_client_ip  # noqa: E402

@@ -10,6 +10,7 @@ from openai import AsyncOpenAI
 
 from app.domains.engine.extraction.listing_constants import EXTRACTOR_SYSTEM_PROMPT
 from app.core.config import get_settings
+from app.core.quota import openai_extract_quota_scope
 
 logger = logging.getLogger("app.domains.engine.llm.extract_listings")
 
@@ -37,18 +38,19 @@ async def llm_extract(
         "listings": candidates,
     }
 
-    response = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": EXTRACTOR_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": "json\n" + json.dumps(user_payload, ensure_ascii=False),
-            },
-        ],
-    )
+    async with openai_extract_quota_scope():
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": EXTRACTOR_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": "json\n" + json.dumps(user_payload, ensure_ascii=False),
+                },
+            ],
+        )
 
     raw = response.choices[0].message.content or "{}"
     logger.debug(

@@ -65,6 +65,18 @@ class Settings(BaseSettings):
     search_rate_limit_window_seconds: int = Field(default=86_400, ge=60)
     #: Max characters in ``ParseRequest.query`` (SEARCH_QUERY_MAX_LENGTH).
     search_query_max_length: int = Field(default=512, ge=64, le=4096)
+    #: Account-wide daily caps (UTC midnight reset). ``0`` = unlimited for that bucket.
+    global_daily_quota_enabled: bool = Field(
+        default=True,
+        description="Enable Redis daily counters for parse/Tavily/extract (GLOBAL_DAILY_QUOTA_ENABLED).",
+    )
+    global_daily_quota_fail_closed: bool = Field(
+        default=True,
+        description="Reject provider calls when Redis is unavailable (GLOBAL_DAILY_QUOTA_FAIL_CLOSED).",
+    )
+    global_daily_quota_parse_max: int = Field(default=500, ge=0, le=100_000)
+    global_daily_quota_tavily_max: int = Field(default=200, ge=0, le=100_000)
+    global_daily_quota_openai_extract_max: int = Field(default=300, ge=0, le=100_000)
     log_level: str = "INFO"
     log_format: Literal["human", "json"] = Field(
         default="human",
@@ -128,6 +140,8 @@ class Settings(BaseSettings):
         "search_cache_enabled",
         "search_rate_limit_enabled",
         "search_rate_limit_fail_closed",
+        "global_daily_quota_enabled",
+        "global_daily_quota_fail_closed",
         mode="before",
     )
     @classmethod

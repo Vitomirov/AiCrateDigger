@@ -9,6 +9,7 @@ import random
 import httpx
 
 from app.core.config import get_settings
+from app.core.quota import QuotaKind, assert_quota_available, record_quota_usage
 from app.domains.engine.search.circuit_breaker import get_breaker
 from app.domains.engine.search.constants import RETRYABLE_TAVILY_STATUS, TAVILY_SEARCH_URL
 
@@ -42,6 +43,8 @@ async def fetch_tavily_results_body(
     max_attempts = int(settings.tavily_http_retry_attempts)
     account_max_attempts = max(1, min(2, max_attempts))
     max_wait = float(settings.tavily_http_retry_max_wait_seconds)
+
+    await assert_quota_available(QuotaKind.TAVILY)
 
     for attempt in range(max_attempts):
         try:
@@ -111,6 +114,7 @@ async def fetch_tavily_results_body(
             return None
 
         breaker.record_success()
+        await record_quota_usage(QuotaKind.TAVILY)
         return data
 
     breaker.record_failure(reason="retry_exhausted")

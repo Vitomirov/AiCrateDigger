@@ -26,6 +26,7 @@ os.environ["REDIS_URL"] = ""
 os.environ["DEBUG"] = "false"
 os.environ["SEARCH_RATE_LIMIT_ENABLED"] = "false"
 os.environ["INTERNAL_API_SECRET"] = ""
+os.environ["GLOBAL_DAILY_QUOTA_ENABLED"] = "false"
 
 from app.core.config import get_settings  # noqa: E402
 
@@ -45,6 +46,7 @@ class TestHTTPAppEdgeCases(unittest.TestCase):
     def setUpClass(cls) -> None:
         os.environ["SEARCH_RATE_LIMIT_ENABLED"] = "false"
         os.environ["INTERNAL_API_SECRET"] = ""
+        os.environ["GLOBAL_DAILY_QUOTA_ENABLED"] = "false"
         get_settings.cache_clear()
         cls.client = TestClient(app)
 
