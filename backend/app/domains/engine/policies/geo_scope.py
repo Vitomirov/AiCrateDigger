@@ -8,6 +8,7 @@ Region = Literal[
     "balkans",
     "central_europe",
     "western_europe",
+    "eastern_europe",
     "southern_europe",
     "nordics",
     "uk",
@@ -16,15 +17,17 @@ Region = Literal[
 
 #: Commerce regions used for store filtering. Country-level only.
 COUNTRY_TO_REGION: dict[str, Region] = {
+    # BALKANS
     "RS": "balkans",
-    "HR": "balkans",
-    "SI": "balkans",
     "BA": "balkans",
     "ME": "balkans",
     "MK": "balkans",
     "AL": "balkans",
     "XK": "balkans",
+    "HR": "balkans",
     "BG": "balkans",
+
+    # CENTRAL EUROPE
     "DE": "central_europe",
     "AT": "central_europe",
     "CH": "central_europe",
@@ -32,27 +35,41 @@ COUNTRY_TO_REGION: dict[str, Region] = {
     "SK": "central_europe",
     "HU": "central_europe",
     "PL": "central_europe",
+    "SI": "central_europe",
     "RO": "central_europe",
+
+    # WESTERN EUROPE
     "FR": "western_europe",
     "NL": "western_europe",
     "BE": "western_europe",
     "LU": "western_europe",
     "IE": "western_europe",
+    
+    # UK
     "GB": "uk",
+
+    # EASTERN EUROPE
+    "MD": "eastern_europe",
+
+    # SOUTHERN EUROPE
     "IT": "southern_europe",
     "ES": "southern_europe",
     "PT": "southern_europe",
-    "GR": "southern_europe",
     "MT": "southern_europe",
     "CY": "southern_europe",
+    "GR": "southern_europe",
+
+    # NORDICS
     "SE": "nordics",
     "NO": "nordics",
     "DK": "nordics",
     "FI": "nordics",
     "IS": "nordics",
+
+    # BALTICS
     "EE": "baltics",
     "LV": "baltics",
-    "LT": "baltics",
+    "LT": "baltics"
 }
 
 

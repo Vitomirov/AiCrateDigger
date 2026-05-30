@@ -37,8 +37,6 @@ class StoreEntry:
     #: Ecommerce signal for Tavily domain picking (higher = prefer for product search).
     listing_quality: int = 5
     city: str | None = None
-    latitude: float | None = None
-    longitude: float | None = None
     store_type: StoreType = "regional_ecommerce"
 
 
@@ -288,17 +286,7 @@ ALLOWED_STORES: tuple[StoreEntry, ...] = (
         store_type="local_shop",
     ),
 
-    # ---- Belgium / Czechia ----
-    StoreEntry(
-        "Cactus Music",
-        "cactusmusic.be",
-        "BE",
-        "western_europe",
-        ("EU",),
-        7,
-        listing_quality=5,
-        store_type="local_shop",
-    ),
+    # ----/ Czechia ----
     StoreEntry(
         "Beatshop",
         "beatshop.cz",

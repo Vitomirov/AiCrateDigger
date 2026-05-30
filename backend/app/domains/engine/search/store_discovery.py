@@ -434,7 +434,7 @@ async def save_discovered_stores(
     Tavily/LLM never raise ``UniqueViolationError``. Conflicting rows refresh
     empty/null ``city``, ``country_code``, ``region``, ``store_type`` (when not
     yet set to a known type), and ``is_active``. Never updates ``priority``,
-    ``name``, ``ships_to_json``, ``latitude``, or ``longitude``.
+    ``name``, or ``ships_to_json``.
 
     Returns ``(inserted_domains, updated_domains)`` relative to rows that existed
     before this call (domains present only in this batch).
@@ -469,8 +469,6 @@ async def save_discovered_stores(
                 "priority": _DISCOVERED_PRIORITY,
                 "is_active": True,
                 "city": cand.city,
-                "latitude": None,
-                "longitude": None,
                 "store_type": "local_shop",
             }
         )

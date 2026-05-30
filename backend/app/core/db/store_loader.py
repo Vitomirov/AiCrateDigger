@@ -52,16 +52,6 @@ def _orm_to_entry(row: WhitelistStoreORM) -> StoreEntry:
         city = city.strip() or None
     else:
         city = None
-    lat = getattr(row, "latitude", None)
-    lon = getattr(row, "longitude", None)
-    try:
-        lat_f = float(lat) if lat is not None else None
-    except (TypeError, ValueError):
-        lat_f = None
-    try:
-        lon_f = float(lon) if lon is not None else None
-    except (TypeError, ValueError):
-        lon_f = None
     st_raw = getattr(row, "store_type", None) or "regional_ecommerce"
     st_t = str(st_raw).strip().lower()
     if st_t not in ("local_shop", "regional_ecommerce", "marketplace"):
@@ -77,8 +67,6 @@ def _orm_to_entry(row: WhitelistStoreORM) -> StoreEntry:
         is_active=bool(row.is_active),
         listing_quality=lq,
         city=city,
-        latitude=lat_f,
-        longitude=lon_f,
         store_type=store_type,
     )
 
@@ -110,8 +98,6 @@ async def seed_whitelist_stores_if_empty() -> int:
                     priority=s.priority,
                     is_active=s.is_active,
                     city=s.city,
-                    latitude=s.latitude,
-                    longitude=s.longitude,
                     store_type=s.store_type,
                 )
             )
@@ -165,8 +151,6 @@ async def sync_whitelist_store_catalogue() -> dict[str, int]:
                         priority=entry.priority,
                         is_active=entry.is_active,
                         city=entry.city,
-                        latitude=entry.latitude,
-                        longitude=entry.longitude,
                         store_type=entry.store_type,
                     )
                 )
