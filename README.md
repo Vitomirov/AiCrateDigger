@@ -18,6 +18,7 @@
 
 ## Table of contents
 
+- [Documentation](#documentation)
 - [Why this exists](#why-this-exists)
 - [What it does](#what-it-does)
 - [Architecture](#architecture)
@@ -32,6 +33,12 @@
 - [Testing](#testing)
 - [Status & limitations](#status--limitations)
 - [For recruiters & reviewers](#for-recruiters--reviewers)
+
+---
+
+## Documentation
+
+Full technical documentation lives in **[docs/](./docs/README.md)** — architecture, backend, frontend, database, API reference, configuration, deployment, testing, evaluation, security, and operations.
 
 ---
 
