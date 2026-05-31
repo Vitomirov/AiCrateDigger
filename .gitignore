@@ -17,3 +17,6 @@ build/
 # Docker/OS
 .DS_Store
 *.log
+
+# Chroma DB (legacy — not used)
+chroma_db/

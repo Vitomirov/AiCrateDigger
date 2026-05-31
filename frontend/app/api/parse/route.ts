@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 
 import { buildBackendProxyHeaders } from "../../../lib/backend-proxy-headers";
+import { assertProductionBffReady } from "../../../lib/production-guard";
 import { getServerBackendBase } from "../../../lib/server-backend-url";
 
 export async function POST(request: Request): Promise<NextResponse> {
+  assertProductionBffReady();
   const backendBase = getServerBackendBase();
 
   let body: unknown;

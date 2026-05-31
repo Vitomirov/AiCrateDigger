@@ -1,5 +1,11 @@
-# All service credentials and URLs come from the repo-root `.env` (see `.env.example`).
-# No connection strings are hardcoded here — copy `.env.example` → `.env` before `docker compose up`.
+# Production stack — no bind mounts, hardened defaults, frontend-only public port.
+#
+# Usage:
+#   cp .env.example .env
+#   # Set APP_ENV=production, strong INTERNAL_API_SECRET, real FRONTEND_PUBLIC_URL, keys, etc.
+#   docker compose -f docker-compose.prod.yml up --build -d
+#
+# Local iteration uses docker-compose.yml (APP_ENV=development, dev inspector visible).
 
 services:
 
@@ -9,80 +15,60 @@ services:
       - .env
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
       retries: 8
       start_period: 10s
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
     volumes:
       - redisdata:/data
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 8
       start_period: 5s
+    restart: unless-stopped
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-      target: dev
+      target: production
     env_file:
       - .env
-    # Reachable on the Compose network only (frontend uses BACKEND_URL=http://backend:8000).
-    # For host debugging, uncomment:
-    # ports:
-    #   - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENV: production
     expose:
       - "8000"
-    volumes:
-      - ./backend/app:/app/app
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
-
-  eval:
-    profiles: ["eval"]
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    env_file:
-      - .env
-    command: ["python", "-m", "eval.cli"]
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+    restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      target: dev
+      target: production
     env_file:
       - .env
+    environment:
+      NODE_ENV: production
     ports:
-      - "3000:3000"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-      - /app/.next
+      - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
       backend:
         condition: service_started
+    restart: unless-stopped
 
 volumes:
   pgdata:

@@ -21,11 +21,13 @@ from app.core.db.store_loader import (
     sync_whitelist_store_catalogue,
 )
 from app.core.logging_config import setup_logging
+from app.core.production_guard import validate_production_settings
 from app.api.routers.search import router as search_router
 
 settings = get_settings()
 setup_logging(level=settings.log_level, log_format=settings.log_format)
 logger = logging.getLogger(__name__)
+validate_production_settings(settings)
 
 
 @asynccontextmanager
@@ -78,6 +80,7 @@ logger.info(
     extra={
         "stage": "startup",
         "status": "success",
+        "app_env": settings.app_env,
         "debug": settings.debug,
         "log_level": settings.log_level,
         "log_format": settings.log_format,
@@ -86,7 +89,15 @@ logger.info(
     },
 )
 
-app = FastAPI(title="AiCrateDigg API", version="0.1.0", lifespan=lifespan)
+_expose_api_schema = settings.app_env != "production"
+app = FastAPI(
+    title="AiCrateDigg API",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _expose_api_schema else None,
+    redoc_url="/redoc" if _expose_api_schema else None,
+    openapi_url="/openapi.json" if _expose_api_schema else None,
+)
 app.include_router(search_router)
 
 _QUOTA_UNAVAILABLE_DETAIL = (

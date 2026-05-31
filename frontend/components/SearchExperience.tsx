@@ -9,6 +9,7 @@ import {
   type ListingResultDto,
   type SearchResponseDto,
 } from "../lib/api";
+import { isDevInspectorEnabled } from "../lib/config";
 import { buildPipelineInspectPayload, DevJsonPanel } from "./DevJsonInspector";
 import HugeVinylRecordBg from "./HugeVinylRecord";
 import ListingResultCard from "./ListingResultCard";
@@ -87,6 +88,7 @@ export default function SearchExperience() {
   const results: ListingResultDto[] = payload?.results ?? [];
   const hasHits = results.length > 0;
   const pct = Math.min(100, Math.max(0, progress));
+  const showDevInspector = isDevInspectorEnabled();
 
   const emptyHint = (() => {
     if (!payload || loading || error || results.length > 0) {
@@ -205,7 +207,7 @@ export default function SearchExperience() {
         ) : null}
 
         {/* Dev / debug: parse, pipeline (tavily & stages), listings as JSON */}
-        {hasRunInspect ? (
+        {showDevInspector && hasRunInspect ? (
           <div className="relative z-[2] w-full px-3 pb-3 sm:px-5">
             <p className="mb-2 text-center font-slab text-[0.62rem] font-semibold uppercase tracking-[0.28em] text-crate-cream/50">
               Pipeline inspector
@@ -255,12 +257,12 @@ export default function SearchExperience() {
       </div>
 
       <footer className="relative z-[2] mt-auto shrink-0 px-4 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] pt-3 text-center text-[0.72rem] font-medium uppercase tracking-[0.18em] text-crate-cream/55 sm:text-[0.75rem] sm:pb-[max(0.875rem,env(safe-area-inset-bottom,0px))]">
-        Designed and developed by{" "}
+        <span className="block sm:inline">Designed and developed by</span>{" "}
         <a
           href="https://dejanvitomirov.com"
           target="_blank"
           rel="noopener noreferrer"
-          className="text-crate-gold underline decoration-crate-amber/60 underline-offset-2 transition hover:text-crate-amber"
+          className="block text-crate-gold underline decoration-crate-amber/60 underline-offset-2 transition hover:text-crate-amber sm:inline"
         >
           Dejan Vitomirov
         </a>

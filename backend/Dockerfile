@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim AS base
 
 # Runtime: Postgres + Redis URLs come from the repo-root `.env` via docker-compose `env_file`.
 
@@ -19,4 +19,9 @@ COPY eval ./eval
 
 EXPOSE 8000
 
+# Local Compose: app code bind-mounted for live edits (see docker-compose.yml).
+FROM base AS dev
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+FROM base AS production
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

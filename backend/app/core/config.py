@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     frontend_public_url: str = Field(default="http://localhost:3000")
     #: Shared with the Next.js BFF (`INTERNAL_API_SECRET`). When unset, paid routes skip this check (local dev).
     internal_api_secret: str | None = None
+    #: ``development`` (default) or ``production``. Production enforces security knobs at startup.
+    app_env: Literal["development", "production"] = Field(
+        default="development",
+        description="Runtime mode (APP_ENV). Production fails fast on insecure settings.",
+    )
 
     debug: bool = False
     #: Env ``SEARCH_RATE_LIMIT_ENABLED``. When ``False``, paid routes skip IP rate limiting.
@@ -155,6 +160,12 @@ class Settings(BaseSettings):
             if normalized in ("false", "0", "no", "off"):
                 return False
         return v
+
+    @field_validator("app_env", mode="before")
+    @classmethod
+    def _normalize_app_env(cls, v: object) -> str:
+        s = str(v or "development").strip().lower()
+        return s if s in ("development", "production") else "development"
 
     @field_validator("log_format", mode="before")
     @classmethod
