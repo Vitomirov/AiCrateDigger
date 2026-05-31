@@ -214,14 +214,20 @@ Use unit tests for regression on code changes. Use eval for pipeline quality aft
 
 After deployment or significant changes:
 
-1. Open http://localhost:3000
+1. Open the UI — [https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/) (production) or http://localhost:3000 (local)
 2. Search: `"Pink Floyd Dark Side of the Moon vinyl"`
 3. Verify results or explicit empty state (not a generic error)
 4. Search: `"Radiohead"` (no album) → expect `album_unresolved` messaging
 5. With `DEBUG=true`: verify dev inspector shows pipeline stages
 
 ```bash
+# Local
 curl -s -X POST http://localhost:3000/api/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Pink Floyd Dark Side vinyl"}' | jq '{count: (.results | length), reason}'
+
+# Production (BFF only — no secret required from browser/curl; rate limits apply)
+curl -s -X POST https://aicratedigger.dejanvitomirov.com/api/search \
   -H "Content-Type: application/json" \
   -d '{"query": "Pink Floyd Dark Side vinyl"}' | jq '{count: (.results | length), reason}'
 ```

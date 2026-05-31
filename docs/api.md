@@ -1,8 +1,12 @@
 # API Reference
 
-Base URL (development): `http://localhost:8000` (direct) or `http://localhost:3000/api/*` (via BFF)
+| Environment | Base URL |
+|-------------|----------|
+| **Production (live)** | [https://aicratedigger.dejanvitomirov.com](https://aicratedigger.dejanvitomirov.com) — BFF at `/api/search` and `/api/parse` only |
+| **Development (direct backend)** | `http://localhost:8000` |
+| **Development (via BFF)** | `http://localhost:3000/api/*` |
 
-In production, the backend is not publicly exposed. All client traffic goes through the Next.js BFF at `/api/search` and `/api/parse`.
+In production, the backend is not publicly exposed. All client traffic goes through the Next.js BFF.
 
 OpenAPI/Swagger is available at `/docs` when `APP_ENV=development`. Disabled in production.
 

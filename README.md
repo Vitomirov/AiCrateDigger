@@ -12,12 +12,15 @@
 
 *Portfolio-stage project · end-to-end async pipeline · tests & structured logging*
 
+**Live demo:** [https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/)
+
 </div>
 
 ---
 
 ## Table of contents
 
+- [Live demo](#live-demo)
 - [Documentation](#documentation)
 - [Why this exists](#why-this-exists)
 - [What it does](#what-it-does)
@@ -33,6 +36,14 @@
 - [Testing](#testing)
 - [Status & limitations](#status--limitations)
 - [For recruiters & reviewers](#for-recruiters--reviewers)
+
+---
+
+## Live demo
+
+The app is deployed in production at **[https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/)**. Search traffic goes through the Next.js BFF (`/api/search`, `/api/parse`); the FastAPI backend is not publicly exposed.
+
+To run the same stack locally, see [Quick start](#quick-start) or [docs/deployment.md](./docs/deployment.md).
 
 ---
 
@@ -322,7 +333,7 @@ poetry run python -m unittest discover -s tests -p 'test_*.py' -v
 
 | Topic | Note |
 |-------|------|
-| **Maturity** | **0.1.x — portfolio / demo grade**, not a monetized marketplace |
+| **Maturity** | **0.1.x — portfolio / demo grade** ([live deployment](https://aicratedigger.dejanvitomirov.com/)), not a monetized marketplace |
 | **Migrations** | **SQLAlchemy `create_all`** + targeted `ALTER … IF NOT EXISTS` — plan **Alembic** before multi-environment schema evolution |
 | **Rate limiting / auth** | Not included — rely on edge gateway or private networking for public demos |
 | **Result quality** | Depends on Tavily coverage, snippet richness, and validation thresholds; tuning is expected |
@@ -334,13 +345,13 @@ poetry run python -m unittest discover -s tests -p 'test_*.py' -v
 
 **Suggested reading order (≈15 minutes):**
 
-1. This README  
+1. Try the [live demo](https://aicratedigger.dejanvitomirov.com/) or this README  
 2. `backend/app/domains/search_pipeline/vinyl_search.py` — consolidated orchestration (cache → stores → Tavily → prefilter → extract)  
 3. `backend/app/domains/engine/search/single_call.py` — Tavily query construction and single-call fetch  
 4. `backend/app/domains/engine/search/prefilter.py` — candidate gating before LLM extract  
 5. `backend/tests/` — regression coverage
 
-If you **clone and run Compose with valid keys**, you get a **working vertical slice** suitable for a portfolio conversation about **async Python, LLM boundaries, search UX, and pragmatic tradeoffs**.
+If you **clone and run Compose with valid keys**, you get the same **working vertical slice** as production — suitable for a portfolio conversation about **async Python, LLM boundaries, search UX, and pragmatic tradeoffs**.
 
 ---
 

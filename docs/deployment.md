@@ -2,6 +2,16 @@
 
 AiCrateDigger ships with two Docker Compose configurations: **development** (hot reload, exposed ports) and **production** (hardened, frontend-only public port).
 
+## Live deployment
+
+| | |
+|---|---|
+| **URL** | [https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/) |
+| **Public routes** | `/` (UI), `/api/search`, `/api/parse` (Next.js BFF) |
+| **Backend** | Internal only — not reachable from the internet |
+
+The production stack follows `docker-compose.prod.yml` with a reverse proxy in front of the frontend container. Set `FRONTEND_PUBLIC_URL=https://aicratedigger.dejanvitomirov.com` (or your own domain) when deploying elsewhere.
+
 ---
 
 ## Prerequisites
@@ -208,10 +218,10 @@ See [Evaluation](./evaluation.md).
 The Compose production file exposes the frontend directly. For HTTPS and domain routing, place a reverse proxy in front:
 
 ```nginx
-# Example nginx snippet
+# Example nginx snippet (live deployment uses aicratedigger.dejanvitomirov.com)
 server {
     listen 443 ssl;
-    server_name your-domain.example;
+    server_name aicratedigger.dejanvitomirov.com;
 
     location / {
         proxy_pass http://127.0.0.1:3000;
@@ -223,7 +233,7 @@ server {
 }
 ```
 
-Set `FRONTEND_PUBLIC_URL=https://your-domain.example`.
+Set `FRONTEND_PUBLIC_URL=https://aicratedigger.dejanvitomirov.com` (replace with your domain when self-hosting).
 
 The BFF forwards `X-Forwarded-For` to the backend for rate limiting. Ensure your proxy sets these headers correctly.
 

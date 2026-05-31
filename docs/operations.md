@@ -2,6 +2,8 @@
 
 Guidance for running, monitoring, and troubleshooting AiCrateDigger in development and production.
 
+**Production instance:** [https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/) — verify the home page shows “Backend online” and search returns results or explicit empty states.
+
 ---
 
 ## Health checks

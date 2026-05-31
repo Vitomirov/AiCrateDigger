@@ -210,7 +210,7 @@ DEBUG=false
 INTERNAL_API_SECRET=<openssl rand -hex 32>
 DATABASE_URL=postgresql+asyncpg://...
 REDIS_URL=redis://redis:6379/0
-FRONTEND_PUBLIC_URL=https://your-domain.example
+FRONTEND_PUBLIC_URL=https://aicratedigger.dejanvitomirov.com
 LOG_FORMAT=json
 # Do not set NEXT_PUBLIC_DEV_INSPECTOR
 ```

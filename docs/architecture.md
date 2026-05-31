@@ -209,4 +209,6 @@ On shutdown: dispose SQLAlchemy engine and Redis client.
 | db, redis | none | Internal only |
 | backend workers | 2 Uvicorn workers | `APP_ENV=production` |
 
+**Live deployment:** [https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/) (HTTPS reverse proxy → frontend container).
+
 See [Deployment](./deployment.md) for full instructions.

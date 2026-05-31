@@ -1,5 +1,11 @@
 # Overview
 
+## Live demo
+
+**[https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/)** — production deployment behind HTTPS with the Next.js BFF as the only public entry point. See [Deployment](./deployment.md) for running the stack locally or on your own host.
+
+---
+
 ## Purpose
 
 AiCrateDigger addresses a practical problem: finding a **specific album** in a **specific geography** usually requires visiting many regional record-shop websites individually. The system combines:

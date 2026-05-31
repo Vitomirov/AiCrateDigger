@@ -4,6 +4,8 @@ Technical documentation for **AiCrateDigger** — an AI-assisted search system f
 
 This documentation is organized for engineers onboarding to the codebase, operating a deployment, or extending the pipeline.
 
+**Live demo:** [https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/)
+
 ---
 
 ## Documentation index
@@ -27,6 +29,7 @@ This documentation is organized for engineers onboarding to the codebase, operat
 
 ## Quick links
 
+- **Live app:** [https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/)
 - **Run locally:** [Deployment → Development](./deployment.md#development-environment)
 - **Production checklist:** [Deployment → Production](./deployment.md#production-environment)
 - **API contract:** [API Reference](./api.md)
@@ -53,4 +56,4 @@ This documentation is organized for engineers onboarding to the codebase, operat
 | Frontend tests | Not implemented |
 | CI/CD | Not configured in repository |
 
-This is a portfolio-stage project. Expect evolving APIs and operational hardening rather than semver guarantees on internal modules.
+This is a portfolio-stage project with a [public deployment](https://aicratedigger.dejanvitomirov.com/). Expect evolving APIs and operational hardening rather than semver guarantees on internal modules.

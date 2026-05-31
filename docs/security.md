@@ -256,7 +256,7 @@ Configurable via `TAVILY_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default 2).
 - [ ] `DATABASE_URL` and `REDIS_URL` set
 - [ ] `LOG_FORMAT=json`
 - [ ] HTTPS via reverse proxy
-- [ ] `FRONTEND_PUBLIC_URL` matches public domain
+- [ ] `FRONTEND_PUBLIC_URL` matches public domain (e.g. `https://aicratedigger.dejanvitomirov.com`)
 - [ ] No `NEXT_PUBLIC_DEV_INSPECTOR`
 - [ ] Backend port not publicly exposed
 - [ ] `.env` not in version control
