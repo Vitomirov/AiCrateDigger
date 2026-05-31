@@ -1,4 +1,4 @@
-"""Shared secret between the Next.js BFF and this API (Phase 2)."""
+"""Shared secret between the Next.js BFF and this API."""
 
 from __future__ import annotations
 

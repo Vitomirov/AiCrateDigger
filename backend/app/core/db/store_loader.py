@@ -301,9 +301,9 @@ async def load_active_stores() -> tuple[StoreEntry, ...]:
 
 
 # Default minimum number of ``local_shop`` rows a resolved city should have before
-# the pipeline starts. Below this we trigger on-demand discovery (Tavily + LLM).
-# Strict ``< 2`` policy: as soon as the city has only one indie (or none) on file,
-# we await discovery so the new domains hit Tavily on the SAME request.
+# the pipeline skips on-demand discovery. Below this the pipeline schedules
+# Tavily + LLM discovery in the background (see ``vinyl_search``) so search latency
+# is not blocked; newly upserted domains benefit the next request.
 LOCAL_COVERAGE_THRESHOLD: int = 2
 
 
@@ -325,6 +325,7 @@ async def ensure_local_coverage(
         "before": 0,
         "after": 0,
         "triggered": False,
+        "scheduled": False,
         "discovery": None,
         "skipped_reason": None,
     }
@@ -338,10 +339,7 @@ async def ensure_local_coverage(
 
     # Local import — keeps the discovery module optional at cold start and avoids
     # pulling httpx/openai when ``ensure_local_coverage`` is never called.
-    from app.domains.engine.search.store_discovery import (
-        count_local_shops_in_city,
-        discover_new_stores,
-    )
+    from app.domains.engine.search.store_discovery import count_local_shops_in_city
 
     before = await count_local_shops_in_city(city, country_code)
     summary["before"] = before
@@ -351,7 +349,6 @@ async def ensure_local_coverage(
         return summary
 
     summary["triggered"] = True
-    report = await discover_new_stores(city=city, country_code=country_code)
-    summary["discovery"] = report.as_dict()
-    summary["after"] = await count_local_shops_in_city(city, country_code)
+    summary["scheduled"] = True
+    summary["after"] = before
     return summary

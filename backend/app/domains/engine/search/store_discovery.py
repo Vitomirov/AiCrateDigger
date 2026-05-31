@@ -641,10 +641,9 @@ async def discover_stores_from_snippets(
     drop it as an unknown host without a PDP-shaped URL.
 
     No-op when env keys / DB are missing, or the snippets list is empty.
-    Returns a populated :class:`DiscoveryReport`; the caller is expected to
-    merge :attr:`DiscoveryReport.domains_inserted` /
-    :attr:`DiscoveryReport.domains_updated` into the in-memory prefilter
-    whitelist so they take effect on the *current* request.
+    Returns a populated :class:`DiscoveryReport`. The production pipeline
+    schedules this call in the background; upserted domains affect *future*
+    searches via ``whitelist_stores``.
     """
     report = DiscoveryReport()
     settings = get_settings()

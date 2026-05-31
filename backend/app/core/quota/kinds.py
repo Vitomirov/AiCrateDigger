@@ -1,4 +1,4 @@
-"""Daily quota bucket identifiers (Phase 3 account spend fuse)."""
+"""Daily quota bucket identifiers (account spend limits)."""
 
 from __future__ import annotations
 

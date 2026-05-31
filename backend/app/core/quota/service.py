@@ -1,4 +1,4 @@
-"""UTC daily counters in Redis — account-level spend fuse (Phase 3)."""
+"""UTC daily counters in Redis — account-level spend fuse."""
 
 from __future__ import annotations
 

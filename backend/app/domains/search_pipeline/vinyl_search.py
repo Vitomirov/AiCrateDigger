@@ -9,15 +9,13 @@ in production logs:
 2. Resolve the album anchor (``resolved_album`` or literal ``album``).
 3. Build the deterministic Redis key and short-circuit on a cache **hit**:
    zero Tavily credits, zero further LLM tokens for 7 days.
-4. **Local-shop top-up** (city queries only, **awaited inline**):
-   :func:`ensure_local_coverage` is internally idempotent — it only fires a
-   Tavily + LLM discovery probe when the resolved city has fewer than
-   ``LOCAL_COVERAGE_THRESHOLD`` ``local_shop`` rows in ``whitelist_stores``.
-   We ``await`` it inline (not via ``BackgroundTasks``) so that newly upserted
-   indie domains land in the whitelist **before** stage 5 reads it; otherwise
-   the very first user to search a poorly-covered city (e.g. Porto, smaller
-   Balkans cities) would silently fall back to global giants while the
-   discovered shops only benefit the **next** request.
+4. **Local-shop top-up** (city queries only, **non-blocking**):
+   :func:`ensure_local_coverage` counts ``local_shop`` rows for the resolved
+   city; when below ``LOCAL_COVERAGE_THRESHOLD`` it marks discovery as
+   **scheduled** and the pipeline schedules :func:`discover_new_stores` via
+   ``BackgroundTasks`` (or ``asyncio.create_task`` when tasks are omitted) so
+   Tavily + LLM discovery does not block the user's search. Newly upserted
+   indie domains benefit the **next** request.
 5. Load the active store hosts (curated + discovered) and pass them to the
    pre-filter as a **positive whitelist signal**.
 6. Issue ONE consolidated Tavily call (``max_results`` from
@@ -25,13 +23,11 @@ in production logs:
    ``search_depth="advanced"``) returning a European candidate pool for one
    Tavily credit.
 6.5. **Opportunistic store discovery** (gated by
-   ``Settings.pipeline_opportunistic_store_discovery_enabled``):
+   ``Settings.pipeline_opportunistic_store_discovery_enabled``, **scheduled**):
    when Tavily surfaces unknown-host shop-shaped snippets for the resolved
-   city/country, we LLM-verify them via :func:`store_discovery.discover_stores_from_snippets`
-   and merge the verified hosts into the prefilter whitelist **for this request**.
-   Without this stage, real local shops like ``van-records.com`` or ``rockers.de``
-   were dropped as ``rejected_no_pdp_signal`` AND never written to
-   ``whitelist_stores``, so DBeaver showed zero new rows after every search.
+   city/country, we schedule :func:`store_discovery.discover_stores_from_snippets`
+   in the background so LLM verification + DB upsert do not add latency.
+   Verified hosts enter ``whitelist_stores`` for **future** searches.
 7. Python pre-filter — blacklist noise (YouTube, news portals, …), require
    PDP-shaped URLs from unknown hosts, dedupe per host. Cap to ~10 candidates.
 8. LLM extract + verification via :func:`extract_listings`.
@@ -41,11 +37,10 @@ in production logs:
     the Postgres ``search_response_cache`` table (operator visibility via
     DBeaver / SQL).
 
-Production note: Discovery is awaited inline so the *current* HTTP response
-already trusts any newly-discovered indie shops. The ``BackgroundTasks``
-parameter is preserved on :func:`run_vinyl_search` for forward-compatibility
-(post-response telemetry / cache warming) but is no longer used to defer
-store discovery, which would race the prefilter and silently drop indie URLs.
+Production note: Store discovery is deferred so the consolidated search path
+stays fast. Pass ``BackgroundTasks`` from the route handler so discovery runs
+after the HTTP response; tests/CLI callers without tasks still schedule work
+via ``asyncio.create_task`` (same process, non-blocking for the pipeline).
 
 Fall-back behaviour
 -------------------
@@ -58,7 +53,9 @@ Fall-back behaviour
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -89,6 +86,38 @@ from app.domains.engine.search.single_call import run_consolidated_tavily_search
 logger = logging.getLogger(__name__)
 
 
+async def _run_background_store_discovery(
+    work: Callable[[], Awaitable[object]],
+    *,
+    label: str,
+) -> None:
+    """Execute deferred discovery; log failures without affecting the HTTP response."""
+    try:
+        await work()
+    except Exception:  # noqa: BLE001 — background work must never surface to the client.
+        logger.exception(
+            "background_store_discovery_failed",
+            extra={"stage": "store_discovery", "discovery_kind": label},
+        )
+
+
+def _schedule_background_store_discovery(
+    background_tasks: BackgroundTasks | None,
+    work: Callable[[], Awaitable[object]],
+    *,
+    label: str,
+) -> None:
+    """Run discovery after the response (BackgroundTasks) or concurrently (create_task)."""
+
+    async def _runner() -> None:
+        await _run_background_store_discovery(work, label=label)
+
+    if background_tasks is not None:
+        background_tasks.add_task(_runner)
+        return
+    asyncio.create_task(_runner())
+
+
 # ---------------------------------------------------------------------------
 # Stage helpers
 # ---------------------------------------------------------------------------
@@ -111,19 +140,18 @@ async def _stage_resolve_album_title(parsed: Any) -> str | None:
     return title
 
 
-async def _stage_ensure_local_coverage(parsed: Any) -> dict[str, object]:
-    """Top up indie ``local_shop`` rows in the DB for the resolved city.
+async def _stage_ensure_local_coverage(
+    parsed: Any,
+    *,
+    background_tasks: BackgroundTasks | None,
+) -> dict[str, object]:
+    """Evaluate indie coverage and schedule discovery when the city is thin.
 
     Runs only when the parser resolved a specific city + country. Internally
     idempotent: when ``count_local_shops_in_city(city, cc) >= LOCAL_COVERAGE_THRESHOLD``
     no Tavily / OpenAI traffic is generated — it is just a single ``COUNT(*)``
-    on ``whitelist_stores``. When coverage is insufficient it fires
-    :mod:`app.domains.engine.search.store_discovery` (Tavily + ``gpt-4o-mini``,
-    JSON-only) and upserts new rows so they enter the prefilter whitelist on
-    the **same** HTTP request — fixing the regression where local shops from
-    poorly-covered cities (e.g. Porto, smaller Balkans cities) were dropped
-    by ``rejected_no_pdp_signal`` because discovery had been pushed into a
-    post-response background task.
+    on ``whitelist_stores``. When coverage is insufficient, discovery is
+    scheduled in the background so the search hot path is not blocked.
 
     Returns the coverage summary dict (empty when inputs are missing).
     """
@@ -149,35 +177,20 @@ async def _stage_ensure_local_coverage(parsed: Any) -> dict[str, object]:
             rec.status = "fail"
             rec.error = str(exc)[:240]
             return {"triggered": False, "error": str(exc)[:240]}
+        if coverage.get("scheduled"):
+            from app.domains.engine.search.store_discovery import discover_new_stores
+
+            _schedule_background_store_discovery(
+                background_tasks,
+                lambda: discover_new_stores(city=city, country_code=cc),
+                label="primary",
+            )
         rec.output = coverage
-        disc = coverage.get("discovery") or {}
         if not coverage.get("triggered"):
             rec.status = "empty"
-        elif not (disc.get("inserted") or disc.get("updated")):
-            rec.status = "empty"
+        elif coverage.get("scheduled"):
+            rec.status = "success"
         return coverage
-
-
-def _merge_discovery_domains_into_hosts(
-    known_shop_hosts: frozenset[str],
-    discovery_summary: dict[str, object] | None,
-) -> frozenset[str]:
-    """Union freshly upserted discovery domains into the prefilter whitelist."""
-    if not discovery_summary:
-        return known_shop_hosts
-    disc = discovery_summary.get("discovery")
-    if not isinstance(disc, dict):
-        return known_shop_hosts
-    merged: set[str] = set(known_shop_hosts)
-    for key in ("domains_inserted", "domains_updated"):
-        raw = disc.get(key)
-        if not isinstance(raw, list):
-            continue
-        for dom in raw:
-            canonical = canonical_store_domain(str(dom or ""))
-            if canonical:
-                merged.add(canonical)
-    return frozenset(merged)
 
 
 def _primary_discovery_should_skip_opportunistic(
@@ -240,29 +253,22 @@ def _select_unknown_host_snippets_for_discovery(
     return list(chosen.values())
 
 
-async def _stage_opportunistic_store_discovery(
+def _schedule_opportunistic_store_discovery(
     *,
+    background_tasks: BackgroundTasks | None,
     parsed: Any,
     raw_results: list[dict[str, Any]],
     known_shop_hosts: frozenset[str],
     primary_discovery_summary: dict[str, object] | None = None,
-) -> frozenset[str]:
-    """Verify unknown-host snippets from the *main* Tavily call as local shops.
+) -> None:
+    """Schedule LLM verification of unknown-host snippets from the main Tavily call.
 
-    Real local shops are routinely surfaced by the consolidated artist/album
-    query (e.g. ``van-records.com``, ``supremechaos.de`` for German queries).
-    Before this stage they were dropped by the prefilter as
-    ``rejected_no_pdp_signal`` and **also** never written to ``whitelist_stores``,
-    so every future request had to rediscover them from scratch.
-
-    Returns the (possibly augmented) ``known_shop_hosts`` set so the caller
-    can hand it to the prefilter for the **current** request — closing the
-    loop on the user-visible bug where DBeaver showed no new rows after a
-    search for a poorly-covered city.
+    Upserts run in the background so the prefilter / extractor stages are not
+    blocked. Verified domains benefit subsequent searches via ``whitelist_stores``.
     """
     settings = get_settings()
     if not settings.pipeline_opportunistic_store_discovery_enabled:
-        return known_shop_hosts
+        return
 
     if _primary_discovery_should_skip_opportunistic(primary_discovery_summary):
         city = (getattr(parsed, "resolved_city", None) or "").strip()
@@ -285,12 +291,12 @@ async def _stage_opportunistic_store_discovery(
         ) as rec:
             rec.status = "empty"
             rec.output = {"skipped_reason": "skipped_primary_discovery_triggered"}
-        return known_shop_hosts
+        return
 
     city = (getattr(parsed, "resolved_city", None) or "").strip()
     cc = (getattr(parsed, "country_code", None) or "").strip()
     if not city or not cc:
-        return known_shop_hosts
+        return
 
     snippets = _select_unknown_host_snippets_for_discovery(
         raw_results,
@@ -308,7 +314,7 @@ async def _stage_opportunistic_store_discovery(
                 "min_required": min_required,
             },
         )
-        return known_shop_hosts
+        return
 
     from app.domains.engine.search.store_discovery import discover_stores_from_snippets
 
@@ -318,45 +324,20 @@ async def _stage_opportunistic_store_discovery(
             "city": city,
             "country_code": cc,
             "unknown_host_count": len(snippets),
+            "scheduled": True,
         },
     ) as rec:
-        try:
-            report = await discover_stores_from_snippets(
+        _schedule_background_store_discovery(
+            background_tasks,
+            lambda: discover_stores_from_snippets(
                 city=city,
                 country_code=cc,
                 snippets=snippets,
-            )
-        except Exception as exc:  # noqa: BLE001 — never fail the user's search.
-            logger.exception(
-                "opportunistic_store_discovery_failed",
-                extra={"stage": "store_discovery", "city": city, "country_code": cc},
-            )
-            rec.status = "fail"
-            rec.error = str(exc)[:240]
-            return known_shop_hosts
-        rec.output = report.as_dict()
-        if not (report.inserted or report.updated):
-            rec.status = "empty"
-
-    new_hosts: set[str] = set(known_shop_hosts)
-    for dom in list(report.domains_inserted or ()) + list(report.domains_updated or ()):
-        canonical = canonical_store_domain(dom)
-        if canonical:
-            new_hosts.add(canonical)
-    augmented = frozenset(new_hosts)
-    if len(augmented) != len(known_shop_hosts):
-        logger.info(
-            "opportunistic_store_discovery_merged_into_whitelist",
-            extra={
-                "stage": "store_discovery",
-                "city": city,
-                "country_code": cc,
-                "added_count": len(augmented) - len(known_shop_hosts),
-                "inserted": report.inserted,
-                "updated": report.updated,
-            },
+            ),
+            label="opportunistic",
         )
-    return augmented
+        rec.status = "success"
+        rec.output = {"scheduled": True, "unknown_host_count": len(snippets)}
 
 
 async def _load_active_stores_catalogue() -> tuple[StoreEntry, ...]:
@@ -550,9 +531,9 @@ async def run_vinyl_search(
     Wraps the inner implementation in the Tavily circuit-breaker scope so any
     burst of 432/433 throttling fails fast for the rest of the request.
 
-    Pass ``BackgroundTasks`` from the route handler so Indie store discovery runs
-    after the response returns; omit it for tests or CLI callers (discovery
-    awaits inline inside the caller's event loop instead).
+    Pass ``BackgroundTasks`` from the route handler so store discovery runs after
+    the HTTP response; omit it for tests or CLI callers (discovery is still
+    scheduled via ``asyncio.create_task`` and does not block the pipeline).
     """
     settings = get_settings()
     with tavily_circuit_breaker_scope(
@@ -626,21 +607,14 @@ async def _run_vinyl_search_inner(
                 "reason": None,
             }
 
-    # ---- Stage 4: indie-shop top-up — awaited inline ---------------------
-    # Discovery is idempotent (skipped when coverage already meets threshold)
-    # and MUST complete before stage 5 so freshly upserted indie domains land
-    # in this request's whitelist instead of only the next one's. Backgrounding
-    # this step caused local shops in poorly-covered cities (Porto, smaller
-    # Balkans cities) to be dropped from the prefilter as ``rejected_no_pdp_signal``.
-    primary_discovery_summary = await _stage_ensure_local_coverage(parsed)
-    _ = background_tasks  # reserved for future post-response telemetry / cache warming.
+    # ---- Stage 4: indie-shop coverage check + deferred discovery --------
+    primary_discovery_summary = await _stage_ensure_local_coverage(
+        parsed,
+        background_tasks=background_tasks,
+    )
 
     # ---- Stage 5: load active shop hosts (positive prefilter signal) ---
     known_shop_hosts, trusted_local_shop_hosts = await _load_pipeline_shop_hosts(parsed)
-    known_shop_hosts = _merge_discovery_domains_into_hosts(
-        known_shop_hosts,
-        primary_discovery_summary,
-    )
     logger.info(
         "known_shop_hosts_loaded",
         extra={"stage": "stores", "host_count": len(known_shop_hosts)},
@@ -658,15 +632,9 @@ async def _run_vinyl_search_inner(
     if not raw_results:
         return _empty_response(query, parsed, reason=None)
 
-    # ---- Stage 6.5: opportunistic store discovery -----------------------
-    # Real local shops (``van-records.com``, ``supremechaos.de``, ``rockers.de``)
-    # are routinely surfaced by the main artist/album Tavily call but were
-    # previously dropped by the prefilter as ``rejected_no_pdp_signal`` AND
-    # never persisted into ``whitelist_stores``. We LLM-verify those
-    # unknown-host snippets and merge the verified hosts into THIS request's
-    # whitelist before stage 7 reads it, while also upserting them into the
-    # DB so future searches benefit immediately.
-    known_shop_hosts = await _stage_opportunistic_store_discovery(
+    # ---- Stage 6.5: opportunistic store discovery (scheduled) ------------
+    _schedule_opportunistic_store_discovery(
+        background_tasks=background_tasks,
         parsed=parsed,
         raw_results=raw_results,
         known_shop_hosts=known_shop_hosts,
