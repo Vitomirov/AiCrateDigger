@@ -21,6 +21,15 @@ const EMPTY_REASON_COPY: Record<NonNullable<SearchResponseDto["reason"]>, string
     "Couldn’t resolve which album to hunt — name the release (or spell the artist) so we can search shops.",
 };
 
+/** One-tap examples that teach artist + album + European location. */
+const EXAMPLE_SEARCHES = [
+  "Tool — Aenima in Belgrade",
+  "Metallica - 3rd album In London",
+  "The Wall from Pink Floyd in Poland",
+] as const;
+
+const SEARCH_RECIPE = ["Artist", "Album", "City/Country"] as const;
+
 export default function SearchExperience() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
@@ -31,6 +40,7 @@ export default function SearchExperience() {
   /** After the first Dig, keep JSON panels mounted for debugging. */
   const [hasRunInspect, setHasRunInspect] = useState(false);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const t0 = useRef(0);
 
   const cancelProgress = useCallback(() => {
@@ -100,6 +110,13 @@ export default function SearchExperience() {
     return "Nothing this pass — tweak the title or add a city hint.";
   })();
 
+  const showSearchHints = !query.trim() && !loading;
+
+  const applyExampleSearch = useCallback((example: string) => {
+    setQuery(example);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, []);
+
   return (
     <div className="relative flex min-h-[100dvh] w-full flex-col">
       {/* LP backdrop — fixed so it fills the viewport while the page scrolls with results */}
@@ -137,6 +154,7 @@ export default function SearchExperience() {
                 {/* Vertically centered block: eyebrow above + hint below stay light so field + CTA sit on the optical center */}
                 <div className="flex min-h-0 flex-1 flex-col justify-center gap-2.5 sm:gap-3">
                   <textarea
+                    ref={textareaRef}
                     id="dig-query"
                     rows={2}
                     disabled={loading}
@@ -188,6 +206,43 @@ export default function SearchExperience() {
               </div>
             </div>
           </div>
+
+          {showSearchHints ? (
+            <div
+              className="mt-3 flex w-full max-w-md flex-col items-center gap-2.5 px-2 sm:mt-4 sm:max-w-lg"
+              aria-label="Search tips"
+            >
+              <p className="flex flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 text-[0.56rem] font-bold uppercase tracking-[0.34em] text-crate-cream/65 sm:text-[0.6rem]">
+                {SEARCH_RECIPE.map((part, index) => (
+                  <span key={part} className="inline-flex items-center gap-1.5">
+                    {index > 0 ? (
+                      <span aria-hidden className="text-crate-amber/70">
+                        ·
+                      </span>
+                    ) : null}
+                    <span
+                      className="animate-pulse text-crate-cream/80"
+                      style={{ animationDelay: `${index * 450}ms`, animationDuration: "2.4s" }}
+                    >
+                      {part}
+                    </span>
+                  </span>
+                ))}
+              </p>
+              <div className="flex w-full flex-wrap justify-center gap-2">
+                {EXAMPLE_SEARCHES.map((example) => (
+                  <button
+                    key={example}
+                    type="button"
+                    onClick={() => applyExampleSearch(example)}
+                    className="rounded-full border border-crate-cream/20 bg-black/40 px-3 py-1.5 text-[0.7rem] font-semibold leading-snug text-crate-cream/90 shadow-sm backdrop-blur-[2px] transition hover:border-crate-amber/55 hover:bg-black/55 hover:text-crate-cream active:scale-[0.98] sm:px-3.5 sm:py-2 sm:text-[0.76rem]"
+                  >
+                    {example}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </div>
 
         {/* Status strips — never their own scroll (short copy) */}
