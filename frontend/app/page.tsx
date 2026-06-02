@@ -1,4 +1,4 @@
-import SearchExperience from "../components/SearchExperience";
+import SearchExperience from "@/components/search/SearchExperience";
 import { fetchHealth } from "../lib/api-server";
 
 export default async function HomePage() {

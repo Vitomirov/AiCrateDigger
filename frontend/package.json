@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "dev:nodemon": "nodemon --watch app --watch components --watch lib --watch next.config.mjs --watch tailwind.config.ts --watch postcss.config.js --ignore .next --ignore node_modules --delay 200ms --exec \"next dev -H 0.0.0.0 -p 3000\"",
+    "dev:nodemon": "nodemon --watch app --watch components --watch hooks --watch lib --watch next.config.mjs --watch tailwind.config.ts --watch postcss.config.js --ignore .next --ignore node_modules --delay 200ms --exec \"next dev -H 0.0.0.0 -p 3000\"",
     "build": "next build",
     "start": "next start"
   },

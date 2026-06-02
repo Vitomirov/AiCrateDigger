@@ -22,7 +22,7 @@ type DevJsonPanelProps = {
   loading?: boolean;
 };
 
-export function DevJsonPanel({ title, subtitle, error, data, loading }: DevJsonPanelProps) {
+export default function DevJsonPanel({ title, subtitle, error, data, loading }: DevJsonPanelProps) {
   const [copied, setCopied] = useState(false);
   const bodyText = error
     ? error
@@ -74,22 +74,4 @@ export function DevJsonPanel({ title, subtitle, error, data, loading }: DevJsonP
       </pre>
     </section>
   );
-}
-
-/** Middle column: emphasize tavily / parse stages when `debug` is present. */
-export function buildPipelineInspectPayload(debug: Record<string, unknown> | null | undefined): unknown {
-  if (!debug || typeof debug !== "object") {
-    return {
-      _note:
-        "No `debug` on the search response. Set DEBUG=true on the backend to record tavily, extract, and validate stages.",
-    };
-  }
-  const stages = debug.stages;
-  const trace = debug.trace;
-  const requestId = debug.request_id;
-  return {
-    request_id: requestId,
-    stages,
-    trace,
-  };
 }
