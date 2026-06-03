@@ -18,7 +18,7 @@ lib/            API client, DTO types, display/format helpers
 app/page.tsx (RSC)
   └── SearchExperience (client container)
         ├── useDigSearch → lib/api postSearch
-        ├── DigSearchForm, SearchHero, SearchExampleHints, …
+        ├── DigSearchForm (typewriter examples), SearchHero, …
         └── SearchResultsList → ListingResultCard → lib/listing-display
 ```
 

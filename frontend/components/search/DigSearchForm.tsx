@@ -1,12 +1,15 @@
 "use client";
 
-import type { ChangeEvent, KeyboardEvent, Ref } from "react";
+import { useState } from "react";
+import type { ChangeEvent, KeyboardEvent } from "react";
+
+import { TYPEWRITER_EXAMPLES } from "@/components/search/search-copy";
+import { useTypewriterLoop } from "@/hooks/useTypewriterLoop";
 
 type DigSearchFormProps = {
   query: string;
   loading: boolean;
   progressPct: number;
-  textareaRef: Ref<HTMLTextAreaElement>;
   onQueryChange: (value: string) => void;
   onDig: () => void;
 };
@@ -15,14 +18,16 @@ export default function DigSearchForm({
   query,
   loading,
   progressPct,
-  textareaRef,
   onQueryChange,
   onDig,
 }: DigSearchFormProps) {
+  const [focused, setFocused] = useState(false);
+  const showTypewriter = !focused && !query && !loading;
+  const typewriterText = useTypewriterLoop(TYPEWRITER_EXAMPLES, showTypewriter);
   const pct = progressPct;
 
   return (
-    <div className="mt-3 shrink-0 sm:mt-4">
+    <div className="max-sm:mt-0 mt-3 shrink-0 sm:mt-5">
       <div
         className="relative flex aspect-square w-[min(86.4vmin,calc(19rem*1.2))] flex-col overflow-hidden rounded-full border-[5px] border-crate-gold bg-[rgba(253,243,220,0.97)] shadow-2xl ring-2 ring-black/25 sm:w-[min(91.2vmin,calc(24rem*1.2))] sm:border-[6px] md:w-[min(96vmin,calc(28rem*1.2))]"
       >
@@ -34,22 +39,34 @@ export default function DigSearchForm({
             Search for a record
           </label>
           <div className="flex min-h-0 flex-1 flex-col justify-center gap-2.5 sm:gap-3">
-            <textarea
-              ref={textareaRef}
-              id="dig-query"
-              rows={2}
-              disabled={loading}
-              value={query}
-              onChange={(e: ChangeEvent<HTMLTextAreaElement>) => onQueryChange(e.target.value)}
-              onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  onDig();
-                }
-              }}
-              placeholder={'Tool - Aenima in Belgrade…'}
-              className="box-border h-12 min-h-[3rem] w-full shrink-0 resize-none overflow-y-auto rounded-lg border-[3px] border-crate-rust bg-[#0b0907]/95 px-3 py-2 text-[13px] font-semibold leading-tight text-crate-cream shadow-inner outline-none placeholder:text-crate-cream/45 placeholder:italic focus:border-crate-amber disabled:opacity-55 sm:h-[3.25rem] sm:min-h-[3.25rem] sm:text-[14px] md:h-14 md:min-h-[3.5rem] md:text-[15px]"
-            />
+            <div className="relative shrink-0">
+              <textarea
+                id="dig-query"
+                rows={2}
+                disabled={loading}
+                value={query}
+                onChange={(e: ChangeEvent<HTMLTextAreaElement>) => onQueryChange(e.target.value)}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
+                onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    onDig();
+                  }
+                }}
+                placeholder=""
+                className="box-border h-12 min-h-[3rem] w-full resize-none overflow-y-auto rounded-lg border-[3px] border-crate-rust bg-[#0b0907]/95 px-3 py-2 text-[13px] font-semibold leading-tight text-crate-cream shadow-inner outline-none focus:border-crate-amber disabled:opacity-55 sm:h-[3.25rem] sm:min-h-[3.25rem] sm:text-[14px] md:h-14 md:min-h-[3.5rem] md:text-[15px]"
+              />
+              {showTypewriter ? (
+                <p
+                  aria-hidden
+                  className="pointer-events-none absolute inset-0 overflow-hidden px-3 py-2 text-[13px] font-semibold italic leading-tight text-crate-cream/45 sm:text-[14px] md:text-[15px]"
+                >
+                  {typewriterText}
+                  <span className="animate-pulse text-crate-cream/55">|</span>
+                </p>
+              ) : null}
+            </div>
             <button
               type="button"
               disabled={loading || !query.trim()}

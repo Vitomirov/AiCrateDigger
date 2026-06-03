@@ -1,13 +1,9 @@
 "use client";
 
-import { useCallback, useRef } from "react";
-
 import SearchDevInspector from "@/components/dev/SearchDevInspector";
 import SearchResultsList from "@/components/listing/SearchResultsList";
 import DigSearchForm from "@/components/search/DigSearchForm";
-import SearchExampleHints from "@/components/search/SearchExampleHints";
 import SearchHero from "@/components/search/SearchHero";
-import { EXAMPLE_SEARCHES, SEARCH_RECIPE } from "@/components/search/search-copy";
 import SearchStatusBanner from "@/components/search/SearchStatusBanner";
 import HugeVinylRecordBg from "@/components/ui/HugeVinylRecord";
 import RateLimitModal from "@/components/ui/RateLimitModal";
@@ -29,19 +25,9 @@ export default function SearchExperience() {
     progressPct,
   } = useDigSearch();
 
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const results = payload?.results ?? [];
   const showDevInspector = isDevInspectorEnabled();
   const emptyHint = getEmptySearchMessage(payload, loading, error, results.length);
-  const showSearchHints = !query.trim() && !loading;
-
-  const applyExampleSearch = useCallback(
-    (example: string) => {
-      setQuery(example);
-      requestAnimationFrame(() => textareaRef.current?.focus());
-    },
-    [setQuery],
-  );
 
   return (
     <div className="relative flex min-h-[100dvh] w-full flex-col">
@@ -50,23 +36,18 @@ export default function SearchExperience() {
       </div>
 
       <div className="relative z-[2] flex w-full flex-col">
-        <div className="flex shrink-0 flex-col items-center px-3 pt-3 pb-2 sm:px-5 sm:pt-4 sm:pb-3">
+        <div className="flex shrink-0 flex-col items-center px-3 pt-3 pb-2 max-sm:min-h-[calc(50dvh+43.2vmin+0.75rem)] sm:px-5 sm:pt-4 sm:pb-3">
           <SearchHero />
-          <DigSearchForm
-            query={query}
-            loading={loading}
-            progressPct={progressPct}
-            textareaRef={textareaRef}
-            onQueryChange={setQuery}
-            onDig={() => void dig()}
-          />
-          {showSearchHints ? (
-            <SearchExampleHints
-              examples={EXAMPLE_SEARCHES}
-              recipe={SEARCH_RECIPE}
-              onPickExample={applyExampleSearch}
+          {/* Mobile: label top aligns to record hole; scrolls away with page (not fixed). sm+: normal flow. */}
+          <div className="z-[3] flex w-full justify-center max-sm:absolute max-sm:left-1/2 max-sm:top-[calc(50dvh-43.2vmin)] max-sm:-translate-x-1/2 max-sm:px-3 sm:relative sm:left-auto sm:top-auto sm:translate-x-0">
+            <DigSearchForm
+              query={query}
+              loading={loading}
+              progressPct={progressPct}
+              onQueryChange={setQuery}
+              onDig={() => void dig()}
             />
-          ) : null}
+          </div>
         </div>
 
         {error ? <SearchStatusBanner message={error} variant="error" /> : null}

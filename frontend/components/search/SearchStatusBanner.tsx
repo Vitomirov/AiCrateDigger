@@ -15,7 +15,7 @@ export default function SearchStatusBanner({ message, variant }: SearchStatusBan
   }
 
   return (
-    <div className="shrink-0 px-4 pb-2">
+    <div className="shrink-0 px-4 pb-2 sm:pb-3">
       <p className="rounded-md border border-crate-gold/35 bg-black/65 px-3 py-2 text-center text-[0.78rem] leading-snug text-crate-cream/80">
         {message}
       </p>

@@ -1,8 +1,7 @@
-/** One-tap examples that teach artist + album + European location. */
-export const EXAMPLE_SEARCHES = [
+/** Rotating typewriter demos in the search field (artist · album · place). */
+export const TYPEWRITER_EXAMPLES = [
   "Tool — Aenima in Belgrade",
-  "Metallica - 3rd album In London",
+  "Metallica - 3rd album in London",
   "The Wall from Pink Floyd in Poland",
+  "Some Girls by The Rolling Stones in Paris",
 ] as const;
-
-export const SEARCH_RECIPE = ["Artist", "Album", "City/Country"] as const;

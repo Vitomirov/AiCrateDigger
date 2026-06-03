@@ -65,8 +65,8 @@ export default function RateLimitModal({ open, onClose }: RateLimitModalProps) {
           <p className="text-[0.92rem] font-medium leading-relaxed text-crate-rust">
             Hey there! Glad you are digging for crates with us! To keep AiCrateDigger free and
             protect our API budgets, we limit searches to{" "}
-            <span className="font-bold text-crate-rust">5 requests per 24 hours</span> for
-            anonymous visitors. Grab a coffee, spin a record, and come back tomorrow!
+            <span className="font-bold text-crate-rust">5 requests per 24 hours</span>
+            .Grab a coffee, spin a record, and come back tomorrow!
           </p>
 
           <button
