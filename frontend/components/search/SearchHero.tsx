@@ -1,6 +1,6 @@
 export default function SearchHero() {
   return (
-    <header className="max-w-lg shrink-0 text-center md:max-w-xl">
+    <header className="max-w-lg shrink-0 text-center max-sm:pt-9 md:max-w-xl sm:mt-12">
       <p className="font-slab text-[0.74rem] font-normal uppercase tracking-[0.48em] text-crate-amber sm:text-[1.5rem]">
         find favourite records
       </p>
