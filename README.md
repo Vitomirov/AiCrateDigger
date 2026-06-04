@@ -321,11 +321,13 @@ poetry run python -m unittest tests.test_app_http_e2e -v
 
 `tests/test_app_http_e2e.py` mounts the real FastAPI app and asserts **routing, validation (`422`s), malformed JSON behaviour, mocked `/parse`/`/search` wiring, `/search-listings` alias parity**, and **`/openapi.json`/`/health`** — without calling OpenAI/Tavily/Postgres (DB/Redis URLs are cleared for this module).
 
-For a full **`discover`** run (only this file ships today):
+For the full backend suite:
 
 ```bash
 poetry run python -m unittest discover -s tests -p 'test_*.py' -v
 ```
+
+**CI:** GitHub Actions (`.github/workflows/ci.yml`) runs backend unit tests and a frontend production build on pull requests and pushes to `main`. On push to `main` only, deploy to Lightsail runs **after** both jobs pass — failed tests block production deploy.
 
 ---
 
@@ -335,7 +337,7 @@ poetry run python -m unittest discover -s tests -p 'test_*.py' -v
 |-------|------|
 | **Maturity** | **0.1.x — portfolio / demo grade** ([live deployment](https://aicratedigger.dejanvitomirov.com/)), not a monetized marketplace |
 | **Migrations** | **SQLAlchemy `create_all`** + targeted `ALTER … IF NOT EXISTS` — plan **Alembic** before multi-environment schema evolution |
-| **Rate limiting / auth** | Not included — rely on edge gateway or private networking for public demos |
+| **Rate limiting / auth** | **Included in-app:** Next.js BFF + shared `INTERNAL_API_SECRET`, per-IP rate limits (Redis), global daily quotas on parse/Tavily/extract, and production fail-fast guards. Backend port 8000 is not published in prod Compose — still add edge TLS/WAF/DDoS protection for a public site |
 | **Result quality** | Depends on Tavily coverage, snippet richness, and validation thresholds; tuning is expected |
 | **Legal / ToS** | Uses third-party APIs; review vendor terms before commercial use |
 
@@ -346,10 +348,10 @@ poetry run python -m unittest discover -s tests -p 'test_*.py' -v
 **Suggested reading order (≈15 minutes):**
 
 1. Try the [live demo](https://aicratedigger.dejanvitomirov.com/) or this README  
-2. `backend/app/domains/search_pipeline/vinyl_search.py` — consolidated orchestration (cache → stores → Tavily → prefilter → extract)  
+2. `backend/app/domains/search_pipeline/vinyl_search.py` — consolidated orchestration (cache → stores → Tavily → prefilter → extract); stage helpers under `search_pipeline/stages/`  
 3. `backend/app/domains/engine/search/single_call.py` — Tavily query construction and single-call fetch  
-4. `backend/app/domains/engine/search/prefilter.py` — candidate gating before LLM extract  
-5. `backend/tests/` — regression coverage
+4. `backend/app/domains/engine/search/prefilter/` — candidate gating before LLM extract  
+5. `backend/tests/` — regression coverage (also run in CI)
 
 If you **clone and run Compose with valid keys**, you get the same **working vertical slice** as production — suitable for a portfolio conversation about **async Python, LLM boundaries, search UX, and pragmatic tradeoffs**.
 
