@@ -88,10 +88,10 @@ Production hot path: `run_vinyl_search()` in `backend/app/domains/search_pipelin
 | 1. Parse | `query_parser/parse_user_query.py` | Natural language → `ParsedQuery` |
 | 2. Album resolve | `vinyl_search.py` | `effective_album = resolved_album or album`; exit early if empty |
 | 3. Cache lookup | `core/db/redis_cache.py`, `core/db/cache.py` | Skip provider calls on hit |
-| 4. Local coverage | `engine/search/store_discovery.py` | Background discovery when city shops are thin |
+| 4. Local coverage | `engine/search/store_discovery/` | Background discovery when city shops are thin |
 | 5. Store load | `core/db/store_loader.py` | Active whitelist domains for prefilter/Tavily |
 | 6. Tavily search | `engine/search/single_call.py` | One consolidated web search |
-| 6.5 Opportunistic discovery | `store_discovery.py` | Background upsert of unknown shop hosts from snippets |
+| 6.5 Opportunistic discovery | `store_discovery/` | Background upsert of unknown shop hosts from snippets |
 | 7. Prefilter | `engine/search/prefilter.py` | Blacklist, PDP heuristics, per-host cap |
 | 8. Extract | `engine/extraction/steps/` | Deterministic + LLM listing extraction |
 | 9. Dedupe | `vinyl_search.py` | One listing per host, score sort, cap |
