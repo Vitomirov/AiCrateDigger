@@ -84,10 +84,6 @@ class PipelineContext:
 _current: ContextVar[PipelineContext | None] = ContextVar("pipeline_context", default=None)
 
 
-def get_context() -> PipelineContext | None:
-    return _current.get()
-
-
 def require_context() -> PipelineContext:
     ctx = _current.get()
     if ctx is None:

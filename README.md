@@ -41,7 +41,7 @@
 
 ## Live demo
 
-The app is deployed in production at **[https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/)**. Search traffic goes through the Next.js BFF (`/api/search`, `/api/parse`); the FastAPI backend is not publicly exposed.
+The app is deployed in production at **[https://aicratedigger.dejanvitomirov.com/](https://aicratedigger.dejanvitomirov.com/)**. User-facing search goes through the Next.js BFF (`/api/search`); the FastAPI backend is not publicly exposed.
 
 To run the same stack locally, see [Quick start](#quick-start) or [docs/deployment.md](./docs/deployment.md).
 
@@ -160,9 +160,9 @@ AiCrateDigger/
 │   ├── eval/                       # dataset + CLI harness (edge_cases.json)
 │   └── tests/                      # unittest suite (see Testing)
 ├── frontend/
-│   ├── app/                        # App Router, /api/search & /api/parse proxies
+│   ├── app/                        # App Router, /api/search proxy (+ optional /api/parse)
 │   ├── components/                 # SearchExperience, cards, dev JSON inspector
-│   └── lib/api.ts                  # Typed fetch helpers
+│   └── lib/api.ts                  # Browser client (`postSearch`) + DTO re-exports
 ├── docker-compose.yml
 ├── .env.example                    # Copy to .env — never commit secrets
 └── README.md

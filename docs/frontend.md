@@ -66,7 +66,9 @@ Only one user-facing page. No nested layouts, `loading.tsx`, or `error.tsx`.
 4. Pass through status, content-type, and body
 5. Return 502 on network failure
 
-**Primary UI path:** `SearchExperience` uses only `POST /api/search`. The `/api/parse` route and `postParse()` exist but are not used by any component today.
+**Primary UI path:** `SearchExperience` uses only `POST /api/search` via `postSearch()` in `lib/api.ts`. Parse output is returned inline on the search response (`parsed` on `SearchResponseDto`).
+
+**Parse-only BFF:** `POST /api/parse` (`app/api/parse/route.ts`) proxies to backend `POST /parse` for direct parser access (eval, curl, future tooling). There is no browser helper in `lib/api.ts` — import types from `lib/api-types.ts` if needed.
 
 ---
 
@@ -168,8 +170,9 @@ Same-origin only. No direct browser calls to FastAPI.
 
 ```typescript
 postSearch(query: string): Promise<SearchResponseDto>
-postParse(query: string): Promise<ParsedQueryDto>
 ```
+
+Re-exports `SearchResponseDto`, `ParsedQueryDto`, `ListingResultDto`, and related types from `./api-types` for convenience. Callers that need parse-only HTTP should use `fetch("/api/parse", …)` or add a dedicated helper when required.
 
 **Error handling:**
 

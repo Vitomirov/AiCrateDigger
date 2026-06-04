@@ -42,10 +42,7 @@ except Exception:  # pragma: no cover - module absence is handled gracefully
     RedisError = Exception  # type: ignore[assignment,misc]
 
 from app.core.config import get_settings
-from app.core.db.search_cache_key import (
-    PIPELINE_CACHE_SCHEMA_VERSION,
-    build_pipeline_search_cache_key,
-)
+from app.core.db.search_cache_key import PIPELINE_CACHE_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -59,26 +56,6 @@ _PIPELINE_CACHE_SCHEMA_VERSION: int = PIPELINE_CACHE_SCHEMA_VERSION
 
 _client: Any | None = None
 _client_init_failed: bool = False
-
-
-def build_redis_search_key(
-    *,
-    format_token: str | None,
-    artist: str | None,
-    album: str | None,
-    country_code: str | None,
-    resolved_city: str | None = None,
-    geo_granularity: str | None = None,
-) -> str:
-    """Redis cache key — delegates to :mod:`app.core.db.search_cache_key`."""
-    return build_pipeline_search_cache_key(
-        format_token=format_token,
-        artist=artist,
-        album=album,
-        country_code=country_code,
-        resolved_city=resolved_city,
-        geo_granularity=geo_granularity,
-    )
 
 
 async def get_redis_client() -> Any | None:
@@ -306,7 +283,6 @@ async def purge_stale_pipeline_cache_versions() -> int:
 
 
 __all__ = [
-    "build_redis_search_key",
     "dispose_redis_client",
     "get_cached_search",
     "get_redis_client",

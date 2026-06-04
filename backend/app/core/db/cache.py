@@ -19,43 +19,6 @@ from app.core.db.database import SearchResponseCacheORM, is_database_configured,
 logger = logging.getLogger(__name__)
 
 
-def hydrate_cached_pipeline_dict(cached: dict[str, Any]) -> dict[str, Any]:
-    """Turn JSON cache rows back into :class:`ListingResult` instances for the router."""
-    from app.domains.search_pipeline.models.result import ListingResult
-
-    rows = cached.get("results") or []
-    return {
-        "query": cached.get("query", ""),
-        "results": [ListingResult.model_validate(x) for x in rows],
-    }
-
-
-def build_search_cache_key(
-    *,
-    format_token: str | None,
-    artist: str | None,
-    album_title: str,
-    country_code: str | None,
-    resolved_city: str | None = None,
-    geo_granularity: str | None = None,
-) -> str:
-    """Postgres cache key — SHA-256 of the canonical Redis cache identity."""
-    from app.core.db.search_cache_key import (
-        build_pipeline_search_cache_key,
-        build_postgres_search_cache_key,
-    )
-
-    redis_key = build_pipeline_search_cache_key(
-        format_token=format_token,
-        artist=artist,
-        album=album_title,
-        country_code=country_code,
-        resolved_city=resolved_city,
-        geo_granularity=geo_granularity,
-    )
-    return build_postgres_search_cache_key(redis_cache_key=redis_key)
-
-
 async def get_cached_search_payload(cache_key: str) -> dict[str, Any] | None:
     settings = get_settings()
     if settings.debug:
