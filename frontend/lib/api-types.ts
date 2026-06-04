@@ -1,6 +1,7 @@
 export type HealthResponse = {
   status: string;
   service: string;
+  database_configured: boolean;
 };
 
 export type ListingResultDto = {

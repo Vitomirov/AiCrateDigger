@@ -10,7 +10,7 @@ The backend is a Python 3.11 **FastAPI** application organized by domain. Busine
 
 | Responsibility | Detail |
 |----------------|--------|
-| App factory | FastAPI title `"AiCrateDigg API"`, version `0.1.0` |
+| App factory | FastAPI title `"AiCrateDigger API"`, version `0.1.0` |
 | Lifespan | DB init, store seed/sync, cache purge on startup; engine disposal on shutdown |
 | Production guard | `validate_production_settings()` at import time |
 | OpenAPI | Disabled when `APP_ENV=production` |

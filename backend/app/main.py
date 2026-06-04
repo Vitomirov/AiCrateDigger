@@ -91,7 +91,7 @@ logger.info(
 
 _expose_api_schema = settings.app_env != "production"
 app = FastAPI(
-    title="AiCrateDigg API",
+    title="AiCrateDigger API",
     version="0.1.0",
     lifespan=lifespan,
     docs_url="/docs" if _expose_api_schema else None,

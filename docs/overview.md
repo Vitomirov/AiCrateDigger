@@ -126,4 +126,4 @@ AiCrateDigger/
 
 ## Naming
 
-The project may appear as **AiCrateDigger** or **AiCrateDigg** in code (e.g. API title `"AiCrateDigg API"`). Both refer to the same system.
+The product name is **AiCrateDigger** (API title, docs, and UI metadata use this consistently).

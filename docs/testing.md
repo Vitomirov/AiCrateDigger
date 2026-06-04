@@ -1,6 +1,6 @@
 # Testing
 
-AiCrateDigger has a **backend unit test suite** using Python's stdlib `unittest`. There are **no frontend automated tests** and **no CI pipeline** configured in the repository.
+AiCrateDigger has a **backend unit test suite** using Python's stdlib `unittest`. There are **no frontend automated tests**. **CI** runs backend tests and a frontend production build on every pull request and push to `main`; pushes to `main` also deploy to Lightsail after both jobs pass.
 
 Pipeline quality is additionally validated by an offline **evaluation harness** — see [Evaluation](./evaluation.md).
 
@@ -159,40 +159,42 @@ No test framework is configured. Recommended additions for future work:
 
 ---
 
-## CI recommendations
+## CI pipeline
 
-The repository has no `.github/workflows/`. A minimal CI pipeline would:
+**File:** `.github/workflows/ci.yml`
+
+| Job | Trigger | What it does |
+|-----|---------|--------------|
+| `backend-tests` | PR + push to `main` | Python 3.11, Poetry install, `unittest discover` with dummy API keys and rate limit/quota disabled |
+| `frontend-build` | PR + push to `main` | Node 20, `npm ci`, `npm run build` |
+| `deploy` | Push to `main` only | SSH to Lightsail → `git pull` → `docker compose -f docker-compose.prod.yml up --build -d` |
+
+Failed backend tests or frontend build **block** production deploy.
+
+### CI environment (backend tests)
 
 ```yaml
-# Suggested workflow (not present in repo)
-jobs:
-  backend-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install poetry && cd backend && poetry install
-      - run: cd backend && poetry run python -m unittest discover -s tests -v
-        env:
-          OPENAI_API_KEY: test
-          TAVILY_API_KEY: test
-          DATABASE_URL: ""
-          SEARCH_RATE_LIMIT_ENABLED: "false"
-          GLOBAL_DAILY_QUOTA_ENABLED: "false"
-
-  frontend-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - run: cd frontend && npm ci && npm run build
+OPENAI_API_KEY: test-key
+TAVILY_API_KEY: test-key
+DATABASE_URL: ""
+REDIS_URL: ""
+SEARCH_RATE_LIMIT_ENABLED: "false"
+GLOBAL_DAILY_QUOTA_ENABLED: "false"
 ```
 
-Optional: run eval harness on schedule with secrets (costs API credits).
+### Local parity
+
+Run the same checks CI runs before pushing:
+
+```bash
+# Backend
+cd backend && poetry run python -m unittest discover -s tests -v
+
+# Frontend
+cd frontend && npm ci && npm run build
+```
+
+Optional future work: run eval harness on a schedule with secrets (costs API credits).
 
 ---
 

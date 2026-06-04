@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "aicratedigger-backend"
 version = "0.1.0"
-description = "AiCrateDigg FastAPI backend"
-authors = ["AiCrateDigg Team"]
+description = "AiCrateDigger FastAPI backend"
+authors = ["AiCrateDigger Team"]
 package-mode = false
 packages = [{ include = "app" }]
 

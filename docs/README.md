@@ -20,7 +20,7 @@ This documentation is organized for engineers onboarding to the codebase, operat
 | [API Reference](./api.md) | Integrators | Endpoints, request/response schemas, error codes |
 | [Configuration](./configuration.md) | Dev, ops | Environment variables, settings hierarchy, pipeline knobs |
 | [Deployment](./deployment.md) | Dev, ops | Docker Compose (dev & prod), local development without Docker |
-| [Testing](./testing.md) | Backend | Unit test suite, patterns, CI recommendations |
+| [Testing](./testing.md) | Backend | Unit test suite, patterns, CI pipeline |
 | [Evaluation](./evaluation.md) | Backend, QA | Offline pipeline eval harness, dataset format, CLI usage |
 | [Security](./security.md) | Backend, ops | Production guard, BFF auth, rate limits, quotas |
 | [Operations](./operations.md) | Ops | Logging, health checks, troubleshooting, cost controls |
@@ -54,6 +54,6 @@ This documentation is organized for engineers onboarding to the codebase, operat
 | Node.js | 20 (Docker); 18+ supported for local Next.js |
 | Database migrations | None (Alembic not adopted; schema via `create_all` + inline alters) |
 | Frontend tests | Not implemented |
-| CI/CD | Not configured in repository |
+| CI/CD | GitHub Actions (`.github/workflows/ci.yml`) — backend tests + frontend build on PR/push; deploy to Lightsail on push to `main` |
 
 This is a portfolio-stage project with a [public deployment](https://aicratedigger.dejanvitomirov.com/). Expect evolving APIs and operational hardening rather than semver guarantees on internal modules.

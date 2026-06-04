@@ -1,7 +1,7 @@
 # AiCrateDigger — Cursor Rules
 
 ## Project identity
-AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter natural language; the backend parses intent, searches the web via **Tavily** constrained to a **whitelist of store domains**, extracts structured listings from **snippets**, then deduplicates and returns listing rows. Branding may appear as **AiCrateDigger** or **AiCrateDigg**.
+AI-assisted search for **physical music** (vinyl, CD, cassette). Users enter natural language; the backend parses intent, searches the web via **Tavily** constrained to a **whitelist of store domains**, extracts structured listings from **snippets**, then deduplicates and returns listing rows. Product name: **AiCrateDigger**.
 
 ## Tech stack
 - **Backend:** Python 3.11, FastAPI, Pydantic v2, SQLAlchemy 2.0 (async) + asyncpg, httpx, Poetry

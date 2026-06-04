@@ -359,7 +359,7 @@ If you **clone and run Compose with valid keys**, you get the same **working ver
 
 ## License & naming
 
-Confirm licensing before redistribution. The FastAPI app title may appear as **AiCrateDigg** in metadata while the product name is **AiCrateDigger** — same codebase.
+Confirm licensing before redistribution. Product name: **AiCrateDigger**.
 
 ---
 

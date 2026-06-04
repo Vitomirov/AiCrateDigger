@@ -1,7 +1,7 @@
 """Per-request pipeline trace + stage timer.
 
 Every request creates one `PipelineContext`, stored in a `contextvars.ContextVar`
-so pipeline stages (parser, Tavily, extractor) can read/write it without passing it as a function arg.
+so pipeline stages can read/write it without passing it as a function arg.
 
 Design notes:
 - The context is *request-scoped*: FastAPI awaits the handler inside a fresh
@@ -10,8 +10,17 @@ Design notes:
   start record and a finish record (with duration, status), and pushes a
   compact `StageRecord` into the context so DEBUG mode can echo the whole
   trace back in the HTTP response.
-- Emit conventions (aligned with the task spec):
-      stage     ∈ {parser, tavily, extractor, pipeline}
+- Stage names used in production (non-exhaustive; new stages may be added):
+      pipeline                    — request wrapper (`start_pipeline`)
+      parse                       — LLM query parse
+      album_resolve               — album anchor resolution
+      redis_cache_lookup          — Redis / Postgres cache read
+      store_discovery             — city coverage top-up (blocking check)
+      tavily                      — consolidated Tavily search
+      opportunistic_store_discovery — post-Tavily background discovery
+      prefilter                   — Python candidate gating
+      extractor                   — snippet → listing extraction
+- Status values:
       status    ∈ {success, fail, empty}
 - "empty" is logged at WARNING so stages that return nothing never silently
   slip past a grep.
@@ -29,7 +38,7 @@ from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
-Stage = str  # one of: parser | tavily | extractor | pipeline
+Stage = str  # e.g. parse | tavily | extractor | pipeline | prefilter | …
 Status = str  # one of: success | fail | empty
 
 
@@ -129,8 +138,8 @@ def stage_timer(stage: Stage, *, input: Any = None, logger_: logging.Logger | No
     attach `output`, `status`, `extra`, etc.
 
     Example:
-        with stage_timer("parser", input={"query": q}) as rec:
-            parsed = await parse(q)
+        with stage_timer("parse", input={"query": q}) as rec:
+            parsed = await parse_user_query(q)
             rec.output = parsed.model_dump()
             rec.status = "success"
     """

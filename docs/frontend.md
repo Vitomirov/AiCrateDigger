@@ -16,11 +16,26 @@ frontend/
 │       ├── search/route.ts     # BFF → POST /search
 │       └── parse/route.ts      # BFF → POST /parse
 ├── components/
-│   ├── SearchExperience.tsx    # Main client shell
-│   ├── ListingResultCard.tsx   # Result row
-│   ├── DevJsonInspector.tsx    # Debug JSON panels
-│   ├── HugeVinylRecord.tsx     # Background vinyl SVG
-│   └── RateLimitModal.tsx      # 429 UX
+│   ├── README.md               # Component layout and data-flow notes
+│   ├── search/
+│   │   ├── SearchExperience.tsx    # Main client shell
+│   │   ├── DigSearchForm.tsx       # Search input + submit
+│   │   ├── SearchHero.tsx          # Hero copy
+│   │   ├── SearchStatusBanner.tsx  # Status / empty states
+│   │   └── search-copy.ts          # User-facing copy constants
+│   ├── listing/
+│   │   ├── ListingResultCard.tsx   # Result row
+│   │   └── SearchResultsList.tsx   # Results list wrapper
+│   ├── dev/
+│   │   ├── SearchDevInspector.tsx  # Debug pipeline JSON panels
+│   │   └── DevJsonPanel.tsx        # Copyable JSON block
+│   └── ui/
+│       ├── HugeVinylRecord.tsx     # Background vinyl SVG
+│       └── RateLimitModal.tsx      # 429 UX
+├── hooks/
+│   ├── useDigSearch.ts         # Search state + API call
+│   ├── useRampProgress.ts      # Animated progress bar (UX, not SSE)
+│   └── useTypewriterLoop.ts    # Example query typewriter
 ├── lib/
 │   ├── api.ts                  # Browser client (same-origin)
 │   ├── api-types.ts            # TypeScript DTOs
@@ -28,15 +43,21 @@ frontend/
 │   ├── config.ts               # Browser-safe env helpers
 │   ├── server-backend-url.ts   # Server-only backend URL
 │   ├── backend-proxy-headers.ts
-│   └── production-guard.ts       # Production BFF validation
+│   ├── production-guard.ts     # Production BFF validation
+│   ├── listing-display.ts      # Listing title/price formatting
+│   └── search-empty.ts         # Empty-state copy helpers
 ├── public/
+│   └── lp.png                  # Favicon / app icon
 ├── Dockerfile
 ├── next.config.mjs
 ├── tailwind.config.ts
+├── tsconfig.json               # Path alias: @/* → ./*
 └── package.json
 ```
 
-**Not present:** middleware, path aliases, UI component library (no Shadcn), automated tests.
+**Path alias:** `@/*` maps to the frontend root (see `tsconfig.json`). Example: `import { postSearch } from "@/lib/api"`.
+
+**Not present:** middleware, UI component library (no Shadcn), automated tests, ESLint/Prettier in CI.
 
 ---
 
@@ -101,10 +122,10 @@ sequenceDiagram
 
 ### SearchExperience
 
-**File:** `components/SearchExperience.tsx`  
+**File:** `components/search/SearchExperience.tsx`  
 **Type:** Client component (`"use client"`)
 
-Main application shell:
+Main application shell. Search state and API calls live in `hooks/useDigSearch.ts`; progress animation in `hooks/useRampProgress.ts`.
 
 | State | Purpose |
 |-------|---------|
@@ -115,15 +136,15 @@ Main application shell:
 | `payload` | Last `SearchResponseDto` |
 | `rateLimitOpen` | Rate limit modal visibility |
 
-**Actions:** "Dig That LP" triggers `postSearch(query)`.
+**Actions:** "Dig That LP" triggers `postSearch(query)` via `useDigSearch`.
 
-**Empty states:** `EMPTY_REASON_COPY` maps `album_unresolved` to user-facing copy; generic fallback when no hits.
+**Empty states:** `search-empty.ts` maps `album_unresolved` to user-facing copy; generic fallback when no hits.
 
-**Dev inspector:** Rendered when `isDevInspectorEnabled()` — shows parse, pipeline stages, and results JSON.
+**Dev inspector:** `SearchDevInspector` renders when `isDevInspectorEnabled()` — shows parse, pipeline stages, and results JSON.
 
 ### ListingResultCard
 
-**File:** `components/ListingResultCard.tsx`  
+**File:** `components/listing/ListingResultCard.tsx`  
 **Type:** Server component
 
 Renders one listing:
@@ -133,26 +154,23 @@ Renders one listing:
 - Price, external link
 - `compact` prop for search results list
 
-### DevJsonInspector
+### SearchDevInspector
 
-**File:** `components/DevJsonInspector.tsx`  
+**File:** `components/dev/SearchDevInspector.tsx`  
 **Type:** Client component
 
-Exports:
-
-- `DevJsonPanel` — copyable JSON `<pre>` block
-- `buildPipelineInspectPayload(debug)` — pipeline column formatter
+Debug pipeline JSON panels for development. Uses `DevJsonPanel` (`components/dev/DevJsonPanel.tsx`) for copyable JSON blocks and `lib/search-inspector.ts` for stage formatting.
 
 ### HugeVinylRecord
 
-**File:** `components/HugeVinylRecord.tsx`  
+**File:** `components/ui/HugeVinylRecord.tsx`  
 **Type:** Server component
 
 SVG vinyl platter background with masked center hole. Fixed backdrop in `SearchExperience`.
 
 ### RateLimitModal
 
-**File:** `components/RateLimitModal.tsx`  
+**File:** `components/ui/RateLimitModal.tsx`  
 **Type:** Client component
 
 Modal for HTTP 429 (`RateLimitError`):
