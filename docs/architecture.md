@@ -81,7 +81,7 @@ Browser
 
 ## Pipeline stages
 
-Production hot path: `run_vinyl_search()` in `backend/app/domains/search_pipeline/vinyl_search.py`.
+Production hot path: `run_vinyl_search()` in `backend/app/domains/search_pipeline/vinyl_search.py` (stage helpers in `search_pipeline/stages/`).
 
 | Stage | Module | Purpose |
 |-------|--------|---------|
