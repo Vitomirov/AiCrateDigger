@@ -92,7 +92,7 @@ Production hot path: `run_vinyl_search()` in `backend/app/domains/search_pipelin
 | 5. Store load | `core/db/store_loader.py` | Active whitelist domains for prefilter/Tavily |
 | 6. Tavily search | `engine/search/single_call.py` | One consolidated web search |
 | 6.5 Opportunistic discovery | `store_discovery/` | Background upsert of unknown shop hosts from snippets |
-| 7. Prefilter | `engine/search/prefilter.py` | Blacklist, PDP heuristics, per-host cap |
+| 7. Prefilter | `engine/search/prefilter/` | Blacklist, PDP heuristics, per-host cap |
 | 8. Extract | `engine/extraction/steps/` | Deterministic + LLM listing extraction |
 | 9. Dedupe | `vinyl_search.py` | One listing per host, score sort, cap |
 | 10. Cache write | Redis + Postgres | Persist for repeat queries |

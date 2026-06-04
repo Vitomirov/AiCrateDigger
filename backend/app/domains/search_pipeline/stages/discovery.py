@@ -9,9 +9,9 @@ from fastapi import BackgroundTasks
 
 from app.core.config import get_settings
 from app.domains.engine.search.prefilter import (
-    _host_in_whitelist,
-    _is_blacklisted,
-    _registrable_host,
+    host_in_whitelist,
+    is_blacklisted,
+    registrable_host,
 )
 from app.domains.query_parser.parse_schema import ParsedQuery
 from app.domains.search_pipeline.pipeline_context import stage_timer
@@ -120,10 +120,10 @@ def select_unknown_host_snippets_for_discovery(
         url = str(row.get("url") or "").strip()
         if not url:
             continue
-        host = _registrable_host(url)
-        if host is None or _is_blacklisted(host):
+        host = registrable_host(url)
+        if host is None or is_blacklisted(host):
             continue
-        if _host_in_whitelist(host, known_shop_hosts):
+        if host_in_whitelist(host, known_shop_hosts):
             continue
         if host in chosen:
             continue
