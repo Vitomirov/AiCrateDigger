@@ -9,7 +9,7 @@ export const EMPTY_REASON_COPY: Record<NonNullable<SearchResponseDto["reason"]>,
   album_unresolved:
     "We couldn't tell which album you meant — add the record name, like Tool · Aenima.",
   intent_unresolved:
-    "Add an artist and a city or country — e.g. Mgła in Poland, or Tool · Aenima in Berlin.",
+    "Add an artist and a city or country",
 };
 
 export function getEmptySearchMessage(
