@@ -55,6 +55,8 @@ user text (preserve their spelling/casing).
    - Set ONLY when a named album title or potential title placeholder appears in the text.
    - Copy the substring verbatim (e.g., user writes "Bossanova" -> album = "Bossanova").
    - Ordinal phrases ("second album", "debut", "latest album") → album = null.
+   - Artist + place only (e.g. "Mgła in Poland", "Iron Maiden at Oslo") → album = null; \
+do NOT invent an album title.
 
 3. ALBUM_INDEX
    - Set ONLY when an ordinal/position phrase appears:

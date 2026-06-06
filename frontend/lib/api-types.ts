@@ -34,7 +34,7 @@ export type ParsedQueryDto = {
 
 /** Machine-readable empty-state code emitted by `/search`. Mirrors backend
  *  `models.search_query.SearchEmptyReason`. Keep in sync. */
-export type SearchEmptyReason = "album_unresolved";
+export type SearchEmptyReason = "album_unresolved" | "intent_unresolved";
 
 export type SearchResponseDto = {
   results: ListingResultDto[];

@@ -4,16 +4,51 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.domains.engine.extraction.intent_match import snippet_passes_release_intent
+from app.domains.engine.extraction.intent_match import (
+    snippet_passes_artist_catalog_intent,
+    snippet_passes_release_intent,
+)
+from app.domains.search_pipeline.search_intent import SearchIntent
 from app.domains.engine.extraction.listing_constants import SNIPPET_CHAR_CAP
 from app.domains.engine.extraction.listing_domains import host_matches_whitelist, normalize_domain
+
+
+def _snippet_passes_intent(
+    *,
+    url: str,
+    blob: str,
+    artist_l: str | None,
+    album_l: str | None,
+    host: str | None,
+    search_intent: SearchIntent,
+    snippet_relax_hosts: frozenset[str] | None,
+) -> bool:
+    if search_intent == "artist_catalog":
+        return snippet_passes_artist_catalog_intent(
+            url=url,
+            blob=blob,
+            artist_l=artist_l,
+            host=host,
+            snippet_relax_hosts=snippet_relax_hosts,
+        )
+    if not album_l:
+        return False
+    return snippet_passes_release_intent(
+        url=url,
+        blob=blob,
+        artist_l=artist_l,
+        album_l=album_l,
+        host=host,
+        snippet_relax_hosts=snippet_relax_hosts,
+    )
 
 
 def collect_snippet_candidates(
     raw_results: list[dict[str, Any]],
     *,
     artist_l: str | None,
-    album_l: str,
+    album_l: str | None,
+    search_intent: SearchIntent,
     allowed_hosts: set[str],
     snippet_relax_hosts: frozenset[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -37,12 +72,13 @@ def collect_snippet_candidates(
 
         is_verified_local_shop = domain in allowed_hosts
 
-        if not is_verified_local_shop and not snippet_passes_release_intent(
+        if not is_verified_local_shop and not _snippet_passes_intent(
             url=url,
             blob=blob,
             artist_l=artist_l,
             album_l=album_l,
             host=domain,
+            search_intent=search_intent,
             snippet_relax_hosts=snippet_relax_hosts,
         ):
             dropped_intent += 1

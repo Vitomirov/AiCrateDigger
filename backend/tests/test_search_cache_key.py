@@ -43,7 +43,7 @@ class TestPipelineSearchCacheKey(unittest.TestCase):
         )
         self.assertEqual(
             key,
-            "cratedigger:search:v3:cd:radiohead:ok_computer:ro",
+            "cratedigger:search:v4:cd:radiohead:ok_computer:ro",
         )
 
     def test_city_level_queries_include_city_segment(self) -> None:
@@ -68,6 +68,15 @@ class TestPipelineSearchCacheKey(unittest.TestCase):
         barcelona = build_pipeline_search_cache_key(**base, resolved_city="Barcelona")
         madrid = build_pipeline_search_cache_key(**base, resolved_city="Madrid")
         self.assertNotEqual(barcelona, madrid)
+
+    def test_artist_catalog_uses_catalog_album_segment(self) -> None:
+        key = build_pipeline_search_cache_key(
+            format_token="vinyl",
+            artist="Mgla",
+            album="catalog",
+            country_code="PL",
+        )
+        self.assertEqual(key, "cratedigger:search:v4:vinyl:mgla:catalog:pl")
 
     def test_postgres_key_is_sha256_of_redis_key(self) -> None:
         redis_key = build_pipeline_search_cache_key(

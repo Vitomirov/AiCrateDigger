@@ -9,6 +9,7 @@ import HugeVinylRecordBg from "@/components/ui/HugeVinylRecord";
 import RateLimitModal from "@/components/ui/RateLimitModal";
 import { useDigSearch } from "@/hooks/useDigSearch";
 import { isDevInspectorEnabled } from "@/lib/config";
+import { getArtistCatalogTip } from "@/lib/search-hints";
 import { getEmptySearchMessage } from "@/lib/search-empty";
 
 export default function SearchExperience() {
@@ -28,6 +29,7 @@ export default function SearchExperience() {
   const results = payload?.results ?? [];
   const showDevInspector = isDevInspectorEnabled();
   const emptyHint = getEmptySearchMessage(payload, loading, error, results.length);
+  const catalogTip = getArtistCatalogTip(payload, loading, error);
 
   return (
     <div className="relative flex min-h-[100dvh] w-full flex-col">
@@ -52,6 +54,9 @@ export default function SearchExperience() {
 
         {error ? <SearchStatusBanner message={error} variant="error" /> : null}
         {!error && emptyHint ? <SearchStatusBanner message={emptyHint} variant="info" /> : null}
+        {!error && !emptyHint && catalogTip ? (
+          <SearchStatusBanner message={catalogTip} variant="info" />
+        ) : null}
 
         {showDevInspector && hasRunInspect ? (
           <SearchDevInspector loading={loading} error={error} payload={payload} />

@@ -7,12 +7,17 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.domains.engine.extraction.evidence_alignment import (
+    evidence_blob_matches_artist_catalog,
     evidence_blob_matches_target_release,
     listing_title_grounded_in_evidence,
     looks_like_pure_query_echo_title,
     url_path_evidence_text,
 )
-from app.domains.engine.extraction.intent_match import snippet_passes_release_intent
+from app.domains.engine.extraction.intent_match import (
+    snippet_passes_artist_catalog_intent,
+    snippet_passes_release_intent,
+)
+from app.domains.search_pipeline.search_intent import SearchIntent
 from app.domains.engine.extraction.listing_domains import normalize_domain
 from app.domains.engine.extraction.utils.price_currency import coerce_price_currency
 from app.domains.engine.listing_schema import Listing
@@ -26,9 +31,10 @@ def merge_llm_rows_into_listings(
     candidates: list[dict[str, Any]],
     *,
     artist: str | None,
-    album: str,
+    album: str | None,
     artist_l: str | None,
-    album_l: str,
+    album_l: str | None,
+    search_intent: SearchIntent,
     diagnostic: dict[str, Any],
     snippet_relax_hosts: frozenset[str] | None = None,
 ) -> list[Listing]:
@@ -71,19 +77,32 @@ def merge_llm_rows_into_listings(
         cand = by_url_candidate.get(url) or {}
 
         host = normalize_domain(url)
-        intent_ok = snippet_passes_release_intent(
-            url=url,
-            blob=evidence_blob_lc,
-            artist_l=artist_l,
-            album_l=album_l,
-            host=host,
-            snippet_relax_hosts=snippet_relax_hosts,
-        )
-        evidence_ok = evidence_blob_matches_target_release(
-            evidence_blob_lc,
-            artist=artist,
-            album=album,
-        )
+        if search_intent == "artist_catalog":
+            intent_ok = snippet_passes_artist_catalog_intent(
+                url=url,
+                blob=evidence_blob_lc,
+                artist_l=artist_l,
+                host=host,
+                snippet_relax_hosts=snippet_relax_hosts,
+            )
+            evidence_ok = evidence_blob_matches_artist_catalog(
+                evidence_blob_lc,
+                artist=artist,
+            )
+        else:
+            intent_ok = snippet_passes_release_intent(
+                url=url,
+                blob=evidence_blob_lc,
+                artist_l=artist_l,
+                album_l=album_l or "",
+                host=host,
+                snippet_relax_hosts=snippet_relax_hosts,
+            )
+            evidence_ok = evidence_blob_matches_target_release(
+                evidence_blob_lc,
+                artist=artist,
+                album=album or "",
+            )
         # Prefilter admits any URL on the tier allowlist without intent; merge used to require
         # intent only, so editorial hits (e.g. thevinylfactory.com) became drop_title_gate despite
         # valid evidence. Require evidence for correctness; intent is an extra signal, not the sole gate.
@@ -94,7 +113,7 @@ def merge_llm_rows_into_listings(
             diagnostic["drop_evidence_target_miss_pdd"] += 1
             continue
 
-        if llm_title and looks_like_pure_query_echo_title(
+        if search_intent == "release" and album and llm_title and looks_like_pure_query_echo_title(
             llm_title,
             artist=artist,
             album=album,
@@ -106,17 +125,18 @@ def merge_llm_rows_into_listings(
         if raw_title:
             pick_title = raw_title
             if llm_title and listing_title_grounded_in_evidence(llm_title, evidence_blob_lc, min_ratio=55.0):
-                if album_l in llm_title.lower() and album_l not in raw_title.lower():
+                if album_l and album_l in llm_title.lower() and album_l not in raw_title.lower():
+                    pick_title = llm_title
+                elif search_intent == "artist_catalog":
                     pick_title = llm_title
         elif llm_title:
-            if listing_title_grounded_in_evidence(llm_title, evidence_blob_lc, min_ratio=48.0) and (
-                not looks_like_pure_query_echo_title(
-                    llm_title,
-                    artist=artist,
-                    album=album,
-                    evidence_blob_lc=evidence_blob_lc,
-                )
-            ):
+            echo_ok = search_intent != "release" or not album or not looks_like_pure_query_echo_title(
+                llm_title,
+                artist=artist,
+                album=album or "",
+                evidence_blob_lc=evidence_blob_lc,
+            )
+            if listing_title_grounded_in_evidence(llm_title, evidence_blob_lc, min_ratio=48.0) and echo_ok:
                 pick_title = llm_title
             else:
                 diagnostic["drop_llm_title_ungrounded"] += 1
@@ -125,11 +145,15 @@ def merge_llm_rows_into_listings(
             diagnostic["drop_title_gate"] += 1
             continue
 
-        if looks_like_pure_query_echo_title(
-            pick_title,
-            artist=artist,
-            album=album,
-            evidence_blob_lc=evidence_blob_lc,
+        if (
+            search_intent == "release"
+            and album
+            and looks_like_pure_query_echo_title(
+                pick_title,
+                artist=artist,
+                album=album,
+                evidence_blob_lc=evidence_blob_lc,
+            )
         ):
             diagnostic["drop_query_echo_pick"] += 1
             continue

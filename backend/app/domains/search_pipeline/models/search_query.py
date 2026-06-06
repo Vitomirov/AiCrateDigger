@@ -10,7 +10,7 @@ from app.domains.search_pipeline.models.result import ListingResult
 #: zero results without running Tavily (so the UI can render a precise hint
 #: instead of guessing from an empty list). Extend conservatively — every new
 #: code is a public API surface for the frontend / clients.
-SearchEmptyReason = Literal["album_unresolved"]
+SearchEmptyReason = Literal["album_unresolved", "intent_unresolved"]
 
 
 class ParseRequest(BaseModel):

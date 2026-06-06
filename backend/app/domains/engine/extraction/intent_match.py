@@ -21,6 +21,14 @@ _RELAX_ARTIST_DETAIL_PDP = 52
 _RELAX_ALBUM_PDP_ONLY = 56
 _RELAX_ARTIST_ALBUM_IN_BLOB = 48
 
+# Artist-catalog browse (no album anchor).
+_CATALOG_ARTIST_FUZZY = 58
+_RELAX_CATALOG_ARTIST_FUZZY = 50
+
+_VINYL_BLOB_TOKENS = frozenset(
+    {"vinyl", " lp", "lp ", "record", "schallplatte", "ploca", "vinil", "vinile"}
+)
+
 
 def intent_matches_snippet(
     *,
@@ -71,6 +79,71 @@ def intent_matches_snippet(
     if not folded_artist:
         return True
     return artist_fuzzy_best_vs_blob(folded_artist, folded_blob) >= td_blob_art
+
+
+def _artist_matches_blob(
+    *,
+    folded_artist: str,
+    folded_blob: str,
+    fuzzy_min: float,
+) -> bool:
+    if not folded_artist:
+        return False
+    if artist_substring_in_blob(folded_artist, folded_blob):
+        return True
+    return artist_fuzzy_best_vs_blob(folded_artist, folded_blob) >= fuzzy_min
+
+
+def _blob_suggests_vinyl_product(folded_blob: str) -> bool:
+    return any(tok in folded_blob for tok in _VINYL_BLOB_TOKENS)
+
+
+def intent_matches_artist_catalog_snippet(
+    *,
+    url: str,
+    blob: str,
+    artist_l: str | None,
+    relaxed_indie_candidate: bool = False,
+) -> bool:
+    """Gate whether snippet text plausibly lists vinyl by the hunted artist."""
+    fuzzy_min = _RELAX_CATALOG_ARTIST_FUZZY if relaxed_indie_candidate else _CATALOG_ARTIST_FUZZY
+    folded_blob = ascii_fold(blob)
+    folded_artist = ascii_fold(artist_l) if artist_l else ""
+    if not _artist_matches_blob(
+        folded_artist=folded_artist,
+        folded_blob=folded_blob,
+        fuzzy_min=fuzzy_min,
+    ):
+        return False
+    if url_suggests_product_detail_page(url):
+        return True
+    return _blob_suggests_vinyl_product(folded_blob)
+
+
+def snippet_passes_artist_catalog_intent(
+    *,
+    url: str,
+    blob: str,
+    artist_l: str | None,
+    host: str | None,
+    snippet_relax_hosts: frozenset[str] | None,
+) -> bool:
+    """Artist-catalog gate with optional relaxed pass for curated local_shop hosts."""
+    if intent_matches_artist_catalog_snippet(
+        url=url,
+        blob=blob,
+        artist_l=artist_l,
+        relaxed_indie_candidate=False,
+    ):
+        return True
+    if not snippet_relax_hosts or not host or host not in snippet_relax_hosts:
+        return False
+    return intent_matches_artist_catalog_snippet(
+        url=url,
+        blob=blob,
+        artist_l=artist_l,
+        relaxed_indie_candidate=True,
+    )
 
 
 def snippet_passes_release_intent(

@@ -8,7 +8,10 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from app.domains.engine.extraction.listing_constants import EXTRACTOR_SYSTEM_PROMPT
+from app.domains.engine.extraction.listing_constants import (
+    EXTRACTOR_SYSTEM_PROMPT,
+)
+from app.domains.search_pipeline.search_intent import SearchIntent
 from app.core.config import get_settings
 from app.core.quota import openai_extract_quota_scope
 
@@ -18,6 +21,9 @@ logger = logging.getLogger("app.domains.engine.llm.extract_listings")
 async def llm_extract(
     candidates: list[dict[str, Any]],
     diagnostic: dict[str, Any],
+    *,
+    search_intent: SearchIntent = "release",
+    artist: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Return parsed listing dicts and raw message content string."""
     if not candidates:
@@ -26,15 +32,25 @@ async def llm_extract(
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-    user_payload = {
-        "instructions": (
+    if search_intent == "artist_catalog":
+        instructions = (
+            f"Shopper is browsing vinyl by {artist or 'the artist'} near a location — no album "
+            "was specified. For each listings[] element, set `title` using ONLY substring "
+            "material from that object's `title` + `content` fields. Include whichever album "
+            "the snippet names for that artist's record."
+        )
+    else:
+        instructions = (
             "For each listings[] element, set `title` using ONLY substring material from "
             "that object's `title` + `content` fields. NEVER paste an artist/album that does "
             "not appear verbatim (or clearly as product naming) inside that same snippet blob. "
             "If the band appears without a leading article (e.g. \"Doors\" when the user said "
             "\"The Doors\") but the album title in the snippet is clearly this product, use the "
             "snippet's artist wording — do not invent \"The\"."
-        ),
+        )
+
+    user_payload = {
+        "instructions": instructions,
         "listings": candidates,
     }
 

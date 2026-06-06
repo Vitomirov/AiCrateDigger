@@ -148,6 +148,24 @@ def listing_title_grounded_in_evidence(llm_title: str, evidence_blob_lc: str, *,
     return float(max(fuzz.partial_ratio(lt, folded_blob), fuzz.token_set_ratio(lt, folded_blob))) >= min_ratio
 
 
+def evidence_blob_matches_artist_catalog(
+    evidence_blob_lc: str,
+    *,
+    artist: str | None,
+    artist_partial_min: float = 56.0,
+) -> bool:
+    """Deterministic gate: SERP blob plausibly describes vinyl by the artist."""
+    if not (artist or "").strip():
+        return False
+    b = ascii_fold(evidence_blob_lc)
+    if not b.strip():
+        return False
+    ar = ascii_fold(artist).strip()
+    if artist_substring_in_blob(ar, b):
+        return True
+    return artist_fuzzy_best_vs_blob(ar, b) >= artist_partial_min
+
+
 def evidence_blob_matches_target_release(
     evidence_blob_lc: str,
     *,

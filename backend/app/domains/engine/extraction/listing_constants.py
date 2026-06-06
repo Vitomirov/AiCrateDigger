@@ -45,6 +45,10 @@ OUTPUT SHAPE — one JSON row per INPUT row:
     - ``false`` ONLY if snippet explicitly says sold/out of stock/unavailable/nicht verfügbar.
     - If unclear → ``null`` (don't guess unavailable).
 
+ARTIST-CATALOG MODE (when the shopper named artist + place only):
+- Extract any vinyl/LP product by that artist described in each snippet.
+- The album title must come from snippet text — never from unstated shopper assumptions.
+
 OUTPUT MUST BE JSON ONLY:
 {
   "listings": [

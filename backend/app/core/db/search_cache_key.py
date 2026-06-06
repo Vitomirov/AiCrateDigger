@@ -16,7 +16,7 @@ import hashlib
 import re
 
 #: Bump when pipeline behaviour changes must invalidate every cached response.
-PIPELINE_CACHE_SCHEMA_VERSION: int = 3
+PIPELINE_CACHE_SCHEMA_VERSION: int = 4
 
 
 def normalize_cache_token(value: str | None, *, fallback: str = "any") -> str:

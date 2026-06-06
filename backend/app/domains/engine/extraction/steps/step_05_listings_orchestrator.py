@@ -15,6 +15,7 @@ from app.domains.engine.extraction.steps.step_02_listing_deterministic import (
 )
 from app.domains.engine.extraction.steps.step_03_listing_llm_extract import llm_extract
 from app.domains.engine.extraction.steps.step_04_merge_llm_listings import merge_llm_rows_into_listings
+from app.domains.search_pipeline.search_intent import SearchIntent
 
 logger = logging.getLogger("app.domains.engine.llm.extract_listings")
 
@@ -35,7 +36,8 @@ async def extract_listings(
     raw_results: list[dict[str, Any]],
     *,
     artist: str | None,
-    album: str,
+    album: str | None,
+    search_intent: SearchIntent,
     allowed_domains: set[str],
     snippet_relax_hosts: frozenset[str] | None = None,
 ) -> ExtractListingsReport:
@@ -49,13 +51,20 @@ async def extract_listings(
         "drop_title_gate": 0,
         "drop_pydantic": 0,
         "extraction_mode": None,
+        "search_intent": search_intent,
         "snippet_relaxed_host_hint_count": (
             len(snippet_relax_hosts) if snippet_relax_hosts else 0
         ),
     }
 
-    if not raw_results or not album:
-        diagnostic["empty_reason"] = "no_raw_results_or_album"
+    if not raw_results:
+        diagnostic["empty_reason"] = "no_raw_results"
+        return ExtractListingsReport(listings=[], diagnostic=diagnostic)
+    if search_intent == "release" and not (album or "").strip():
+        diagnostic["empty_reason"] = "no_album_for_release_intent"
+        return ExtractListingsReport(listings=[], diagnostic=diagnostic)
+    if search_intent == "artist_catalog" and not (artist or "").strip():
+        diagnostic["empty_reason"] = "no_artist_for_catalog_intent"
         return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
     allowed = normalize_allowed_domains(allowed_domains)
@@ -64,12 +73,13 @@ async def extract_listings(
         return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
     artist_l = (artist or "").strip().lower() or None
-    album_l = album.strip().lower()
+    album_l = (album or "").strip().lower() or None
 
     candidates, dropped_intent = collect_snippet_candidates(
         raw_results,
         artist_l=artist_l,
         album_l=album_l,
+        search_intent=search_intent,
         allowed_hosts=allowed,
         snippet_relax_hosts=snippet_relax_hosts,
     )
@@ -97,6 +107,7 @@ async def extract_listings(
             candidates,
             artist=artist,
             album=album,
+            search_intent=search_intent,
             snippet_relax_hosts=snippet_relax_hosts,
         )
         diagnostic["final_count"] = len(det)
@@ -116,6 +127,7 @@ async def extract_listings(
                 album=album,
                 artist_l=artist_l,
                 album_l=album_l,
+                search_intent=search_intent,
                 snippet_relax_hosts=snippet_relax_hosts,
             )
             for c in candidates
@@ -125,7 +137,12 @@ async def extract_listings(
             _log_extraction_summary(diagnostic)
             return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
-        extracted, raw_json = await llm_extract(candidates[:LLM_MAX_INPUT], diagnostic)
+        extracted, raw_json = await llm_extract(
+            candidates[:LLM_MAX_INPUT],
+            diagnostic,
+            search_intent=search_intent,
+            artist=artist,
+        )
         diagnostic["llm_rows_returned"] = len(extracted)
         diagnostic["extraction_mode"] = "deterministic_small_batch_llm_fallback"
         if not raw_json.strip() or raw_json.strip() == "{}":
@@ -138,6 +155,7 @@ async def extract_listings(
             album=album,
             artist_l=artist_l,
             album_l=album_l,
+            search_intent=search_intent,
             diagnostic=diagnostic,
             snippet_relax_hosts=snippet_relax_hosts,
         )
@@ -164,6 +182,7 @@ async def extract_listings(
             album=album,
             artist_l=artist_l,
             album_l=album_l,
+            search_intent=search_intent,
             snippet_relax_hosts=snippet_relax_hosts,
         )
         for c in candidates
@@ -175,7 +194,12 @@ async def extract_listings(
         return ExtractListingsReport(listings=[], diagnostic=diagnostic)
 
     diagnostic["extraction_mode"] = "llm"
-    extracted, raw_json = await llm_extract(candidates[:LLM_MAX_INPUT], diagnostic)
+    extracted, raw_json = await llm_extract(
+        candidates[:LLM_MAX_INPUT],
+        diagnostic,
+        search_intent=search_intent,
+        artist=artist,
+    )
     diagnostic["llm_rows_returned"] = len(extracted)
     if not raw_json.strip() or raw_json.strip() == "{}":
         diagnostic["empty_reason"] = "llm_empty_response"
@@ -189,6 +213,7 @@ async def extract_listings(
         album=album,
         artist_l=artist_l,
         album_l=album_l,
+        search_intent=search_intent,
         diagnostic=diagnostic,
         snippet_relax_hosts=snippet_relax_hosts,
     )

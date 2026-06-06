@@ -225,8 +225,8 @@
     {
       "id": "artist_only_unresolved",
       "query": "Miles Davis vinyl",
-      "description": "No album anchor — pipeline must return album_unresolved.",
-      "tags": ["negative", "album_unresolved"],
+      "description": "Artist only, no geo — pipeline must return intent_unresolved.",
+      "tags": ["negative", "intent_unresolved"],
       "mode": "full",
       "expect": {
         "parse": {
@@ -234,7 +234,7 @@
           "fields_absent": ["album", "album_index"]
         },
         "pipeline": {
-          "reason": "album_unresolved",
+          "reason": "intent_unresolved",
           "max_results": 0,
           "stages": {
             "parse": { "required": true, "status_in": ["success"] },

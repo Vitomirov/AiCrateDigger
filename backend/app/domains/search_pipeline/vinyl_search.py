@@ -68,6 +68,11 @@ from app.domains.engine.search import tavily_circuit_breaker_scope
 from app.domains.engine.search.prefilter import prefilter_tavily_results
 from app.domains.engine.search.single_call import run_consolidated_tavily_search
 from app.domains.search_pipeline.pipeline_context import stage_timer
+from app.domains.search_pipeline.search_intent import (
+    cache_album_segment,
+    empty_reason_for_unresolved,
+    resolve_search_intent,
+)
 from app.domains.search_pipeline.stages import cache as cache_stage
 from app.domains.search_pipeline.stages import discovery as discovery_stage
 from app.domains.search_pipeline.stages import parse as parse_stage
@@ -108,17 +113,22 @@ async def _run_vinyl_search_inner(
     # ---- Stage 1: parse -------------------------------------------------
     parsed = await parse_stage.stage_parse(query)
 
-    # ---- Stage 2: resolve album anchor ---------------------------------
-    album_title = await parse_stage.stage_resolve_album_title(parsed)
-    if album_title is None:
-        return cache_stage.empty_response(query, parsed, reason="album_unresolved")
+    # ---- Stage 2: resolve search intent + album anchor -----------------
+    search_intent = resolve_search_intent(parsed)
+    album_title = await parse_stage.stage_resolve_album_title(parsed, search_intent)
+    if search_intent == "unresolved":
+        return cache_stage.empty_response(
+            query,
+            parsed,
+            reason=empty_reason_for_unresolved(parsed),
+        )
 
     # ---- Stage 3: Redis cache lookup (7-day TTL short-circuit) ---------
     format_token = detect_format_token(parsed.original_query)
     redis_key, pg_key = build_pipeline_search_cache_keys(
         format_token=format_token,
         artist=parsed.artist,
-        album=album_title,
+        album=cache_album_segment(intent=search_intent, album=album_title),
         country_code=parsed.country_code,
         resolved_city=parsed.resolved_city,
         geo_granularity=parsed.geo_granularity,
@@ -208,6 +218,7 @@ async def _run_vinyl_search_inner(
             ],
             artist=parsed.artist,
             album=album_title,
+            search_intent=search_intent,
             allowed_domains=allowed_domains,
         )
         rec.output = {

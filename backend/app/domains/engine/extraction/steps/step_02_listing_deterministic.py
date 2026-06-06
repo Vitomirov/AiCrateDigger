@@ -7,10 +7,17 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.domains.engine.extraction.evidence_alignment import (
+    evidence_blob_matches_artist_catalog,
     evidence_blob_matches_target_release,
     url_path_evidence_text,
 )
-from app.domains.engine.extraction.intent_match import intent_matches_snippet, snippet_passes_release_intent
+from app.domains.engine.extraction.intent_match import (
+    intent_matches_artist_catalog_snippet,
+    intent_matches_snippet,
+    snippet_passes_artist_catalog_intent,
+    snippet_passes_release_intent,
+)
+from app.domains.search_pipeline.search_intent import SearchIntent
 from app.domains.engine.extraction.listing_constants import SNIPPET_CHAR_CAP
 from app.domains.engine.extraction.listing_domains import normalize_domain
 from app.domains.engine.extraction.utils.price_currency import sniff_price_currency
@@ -26,9 +33,10 @@ def candidate_has_extractable_evidence_signal(
     raw_title: str,
     raw_content: str,
     artist: str | None,
-    album: str,
+    album: str | None,
     artist_l: str | None,
-    album_l: str,
+    album_l: str | None,
+    search_intent: SearchIntent,
     snippet_relax_hosts: frozenset[str] | None = None,
 ) -> bool:
     """Whether snippet + URL slug plausibly references the target release.
@@ -42,11 +50,34 @@ def candidate_has_extractable_evidence_signal(
     """
     slug_text = url_path_evidence_text(url)
     evidence_lc = (raw_title + " " + raw_content + " " + slug_text).strip().lower()
-    if evidence_blob_matches_target_release(evidence_lc, artist=artist, album=album):
-        return True
-
     domain = normalize_domain(url)
     capped_blob = f"{raw_title} {raw_content}".lower()
+
+    if search_intent == "artist_catalog":
+        if evidence_blob_matches_artist_catalog(evidence_lc, artist=artist):
+            return True
+        if snippet_relax_hosts and domain and domain in snippet_relax_hosts:
+            if snippet_passes_artist_catalog_intent(
+                url=url,
+                blob=capped_blob[:SNIPPET_CHAR_CAP],
+                artist_l=artist_l,
+                host=domain,
+                snippet_relax_hosts=snippet_relax_hosts,
+            ):
+                return True
+        if url_suggests_product_detail_page(url):
+            return intent_matches_artist_catalog_snippet(
+                url=url,
+                blob=evidence_lc,
+                artist_l=artist_l,
+                relaxed_indie_candidate=False,
+            )
+        return False
+
+    if not album or not album_l:
+        return False
+    if evidence_blob_matches_target_release(evidence_lc, artist=artist, album=album):
+        return True
     if snippet_relax_hosts and domain and domain in snippet_relax_hosts:
         if snippet_passes_release_intent(
             url=url,
@@ -73,7 +104,8 @@ def deterministic_listings_from_candidates(
     candidates: list[dict[str, Any]],
     *,
     artist: str | None,
-    album: str,
+    album: str | None,
+    search_intent: SearchIntent,
     snippet_relax_hosts: frozenset[str] | None = None,
 ) -> list[Listing]:
     """Small-batch path: strict SERP evidence (same thresholds as merge/LLM path).
@@ -82,7 +114,7 @@ def deterministic_listings_from_candidates(
     so curated locals stay aligned with ``step_01_snippet_prefilter``.
     """
     artist_l = (artist or "").strip().lower() or None
-    album_l = album.strip().lower()
+    album_l = (album or "").strip().lower() or None
 
     out: list[Listing] = []
     for c in candidates:
@@ -99,6 +131,7 @@ def deterministic_listings_from_candidates(
             album=album,
             artist_l=artist_l,
             album_l=album_l,
+            search_intent=search_intent,
             snippet_relax_hosts=snippet_relax_hosts,
         ):
             continue
