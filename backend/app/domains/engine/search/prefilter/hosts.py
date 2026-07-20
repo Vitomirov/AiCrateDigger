@@ -6,6 +6,9 @@ from urllib.parse import urlparse
 
 from app.domains.engine.search.prefilter.constants import (
     BLACKLIST_HOST_SUBSTRINGS,
+    DIGITAL_MUSIC_HOST_SUBSTRINGS,
+    EVENT_TICKETING_HOST_SUBSTRINGS,
+    MERCH_HOST_SUBSTRINGS,
     NEWS_HOST_SUBSTRINGS,
     WWW_PREFIX_RE,
 )
@@ -25,13 +28,19 @@ def registrable_host(url: str) -> str | None:
 
 
 def is_blacklisted(host: str) -> bool:
-    """``True`` when ``host`` matches any blacklist or news-portal substring."""
+    """``True`` when ``host`` matches any noise, merch, digital, or ticketing substring."""
     if not host:
         return True
     h = host.lower()
     if any(token in h for token in BLACKLIST_HOST_SUBSTRINGS):
         return True
     if any(token in h for token in NEWS_HOST_SUBSTRINGS):
+        return True
+    if any(token in h for token in MERCH_HOST_SUBSTRINGS):
+        return True
+    if any(token in h for token in DIGITAL_MUSIC_HOST_SUBSTRINGS):
+        return True
+    if any(token in h for token in EVENT_TICKETING_HOST_SUBSTRINGS):
         return True
     return False
 

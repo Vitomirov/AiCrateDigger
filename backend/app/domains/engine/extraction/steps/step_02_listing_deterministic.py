@@ -18,7 +18,10 @@ from app.domains.engine.extraction.intent_match import (
     snippet_passes_release_intent,
 )
 from app.domains.search_pipeline.search_intent import SearchIntent
-from app.domains.engine.extraction.listing_constants import SNIPPET_CHAR_CAP
+from app.domains.engine.extraction.listing_constants import (
+    SNIPPET_CHAR_CAP,
+    blob_suggests_merch_or_digital_only,
+)
 from app.domains.engine.extraction.listing_domains import normalize_domain
 from app.domains.engine.extraction.utils.price_currency import sniff_price_currency
 from app.domains.engine.listing_schema import Listing
@@ -52,6 +55,9 @@ def candidate_has_extractable_evidence_signal(
     evidence_lc = (raw_title + " " + raw_content + " " + slug_text).strip().lower()
     domain = normalize_domain(url)
     capped_blob = f"{raw_title} {raw_content}".lower()
+
+    if blob_suggests_merch_or_digital_only(evidence_lc):
+        return False
 
     if search_intent == "artist_catalog":
         if evidence_blob_matches_artist_catalog(evidence_lc, artist=artist):

@@ -138,7 +138,10 @@ async def llm_extract_candidates(
         if not isinstance(r, dict):
             continue
         domain = canonical_store_domain(r.get("domain"))
-        if not domain or domain in DOMAIN_BLACKLIST:
+        # Substring match (not exact-equality): several blacklist entries are
+        # trailing-dot platform stems (e.g. "spreadshirt.") meant to catch every
+        # country-TLD storefront of the same merch/ticketing platform.
+        if not domain or any(token in domain for token in DOMAIN_BLACKLIST):
             continue
         # Reject ``"none"``/``"unknown"``/single-label noise that GPT sometimes
         # invents when no real domain appears in the snippets. Logging here makes

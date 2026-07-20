@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import urlparse
 
+from app.domains.engine.search.prefilter.constants import MERCH_PATH_SUBSTRINGS
 from app.domains.engine.search.prefilter.hosts import (
     host_in_whitelist,
     is_blacklisted,
@@ -14,6 +16,20 @@ from app.domains.engine.search.prefilter.hosts import (
 from app.domains.engine.search.prefilter.signals import looks_like_product_url, result_score
 
 logger = logging.getLogger(__name__)
+
+
+def _url_path_is_merch(url: str) -> bool:
+    """``True`` when the URL path is a merch/apparel/ticket category, not a PDP.
+
+    Checked for EVERY host, including whitelisted shops: a curated record
+    store's own ``/merch/`` or ``/tickets/`` section is still not a physical
+    album listing.
+    """
+    try:
+        path = (urlparse(url).path or "/").lower()
+    except Exception:
+        return False
+    return any(token in path for token in MERCH_PATH_SUBSTRINGS)
 
 
 def prefilter_tavily_results(
@@ -53,6 +69,7 @@ def prefilter_tavily_results(
         "whitelist_size": len(whitelist),
         "missing_url": 0,
         "blacklisted_hosts": 0,
+        "rejected_merch_path": 0,
         "rejected_no_pdp_signal": 0,
         "per_host_capped": 0,
         "kept_count": 0,
@@ -82,6 +99,9 @@ def prefilter_tavily_results(
         if is_blacklisted(host):
             diagnostic["blacklisted_hosts"] += 1
             blacklist_hosts_seen.add(host)
+            continue
+        if _url_path_is_merch(url):
+            diagnostic["rejected_merch_path"] += 1
             continue
 
         is_known_shop = host_in_whitelist(host, whitelist)

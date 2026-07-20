@@ -18,6 +18,7 @@ from app.domains.engine.extraction.intent_match import (
     snippet_passes_release_intent,
 )
 from app.domains.search_pipeline.search_intent import SearchIntent
+from app.domains.engine.extraction.listing_constants import blob_suggests_merch_or_digital_only
 from app.domains.engine.extraction.listing_domains import normalize_domain
 from app.domains.engine.extraction.utils.price_currency import coerce_price_currency
 from app.domains.engine.listing_schema import Listing
@@ -41,6 +42,7 @@ def merge_llm_rows_into_listings(
     diagnostic.setdefault("drop_evidence_target_miss_pdd", 0)
     diagnostic.setdefault("drop_llm_title_ungrounded", 0)
     diagnostic.setdefault("drop_query_echo_pick", 0)
+    diagnostic.setdefault("drop_merch_or_digital", 0)
     diagnostic.setdefault("url_slug_evidence_used", 0)
 
     # Indie PDPs often encode artist+album in the URL slug while the SERP snippet
@@ -71,6 +73,10 @@ def merge_llm_rows_into_listings(
             continue
 
         evidence_blob_lc = by_url_blob.get(url, "").strip().lower()
+
+        if blob_suggests_merch_or_digital_only(evidence_blob_lc):
+            diagnostic["drop_merch_or_digital"] += 1
+            continue
 
         raw_title = (by_url_raw_title.get(url) or "").strip()
         llm_title = str(item.get("title") or "").strip()

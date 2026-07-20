@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.domains.engine.search.prefilter.constants import (
+    DIGITAL_MUSIC_HOST_SUBSTRINGS,
+    EVENT_TICKETING_HOST_SUBSTRINGS,
+    MERCH_HOST_SUBSTRINGS,
+)
+
 TAVILY_TIMEOUT_S = 15.0
 TAVILY_MAX_RESULTS = 10
 #: Conservative-but-not-strangling confidence floor for the LLM verifier.
@@ -13,6 +19,10 @@ TAVILY_MAX_RESULTS = 10
 MIN_CONFIDENCE: float = 0.4
 
 #: Hosts that are never indie record shops — skipped before the LLM call.
+#: Unioned with the merch/digital-download/ticketing substrings from the
+#: prefilter constants so a print-on-demand or digital-only platform can
+#: never be auto-verified into ``whitelist_stores`` as a "local shop" in
+#: the first place.
 DOMAIN_BLACKLIST: frozenset[str] = frozenset(
     {
         "amazon.com",
@@ -45,6 +55,9 @@ DOMAIN_BLACKLIST: frozenset[str] = frozenset(
         "factmag.com",
         "stereogum.com",
     }
+    | set(MERCH_HOST_SUBSTRINGS)
+    | set(DIGITAL_MUSIC_HOST_SUBSTRINGS)
+    | set(EVENT_TICKETING_HOST_SUBSTRINGS)
 )
 
 #: Default merchant trust for a freshly discovered indie. Curated rows from

@@ -9,7 +9,10 @@ from app.domains.engine.extraction.intent_match import (
     snippet_passes_release_intent,
 )
 from app.domains.search_pipeline.search_intent import SearchIntent
-from app.domains.engine.extraction.listing_constants import SNIPPET_CHAR_CAP
+from app.domains.engine.extraction.listing_constants import (
+    SNIPPET_CHAR_CAP,
+    blob_suggests_merch_or_digital_only,
+)
 from app.domains.engine.extraction.listing_domains import host_matches_whitelist, normalize_domain
 
 
@@ -69,6 +72,13 @@ def collect_snippet_candidates(
         raw_title = str(r.get("title") or "").strip()
         raw_content = str(r.get("content") or "")[:SNIPPET_CHAR_CAP]
         blob = f"{raw_title} {raw_content}".lower()
+
+        # Checked unconditionally — even a verified/whitelisted local shop's own
+        # merch or digital-download page is not a buyable physical album, and
+        # verified hosts otherwise bypass the intent gate below entirely.
+        if blob_suggests_merch_or_digital_only(blob):
+            dropped_intent += 1
+            continue
 
         is_verified_local_shop = domain in allowed_hosts
 

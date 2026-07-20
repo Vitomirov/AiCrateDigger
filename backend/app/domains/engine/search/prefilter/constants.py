@@ -84,8 +84,7 @@ BLACKLIST_HOST_SUBSTRINGS: tuple[str, ...] = (
     "etsy.com",
     "allegro.pl",
     "avito.ru",
-    "kupindo.com",
-    # Discogs metadata (we hit the API server-side; the public site is a hub
+    # Discogs metadata (the public site is a hub without consistent buy-now PDP rows for our shop-pool intent).
     # without consistent buy-now PDP rows for our shop-pool intent).
     "discogs.com",
     "vinylhub.com",
@@ -95,6 +94,70 @@ BLACKLIST_HOST_SUBSTRINGS: tuple[str, ...] = (
     "medium.com",
     "boilerroom.tv",
     "ra.co",
+)
+
+#: Print-on-demand / band-merch / poster marketplaces. These sell apparel,
+#: posters, pins and gift items branded with an artist's name — never a
+#: buyable physical album — so an artist-name match alone (e.g. "Mgła Band
+#: Merch & Gifts for Sale") must never survive the noise gate. Trailing-dot
+#: entries cover country-TLD storefronts of the same platform (e.g.
+#: ``spreadshirt.de``, ``spreadshirt.co.uk``).
+MERCH_HOST_SUBSTRINGS: tuple[str, ...] = (
+    "redbubble.com",
+    "teepublic.com",
+    "spreadshirt.",
+    "zazzle.com",
+    "society6.com",
+    "displate.com",
+    "fineartamerica.com",
+    "cafepress.com",
+    "threadless.com",
+    "customink.com",
+    "printful.com",
+    "printify.com",
+    "vograce.com",
+    "gearbubble.com",
+    "represent.com",
+    "bonfire.com",
+    "stickermule.com",
+    "allposters.com",
+    "desenio.com",
+    "merchbar.com",
+    "indiemerchstore.com",
+    "districtlines.com",
+    "hottopic.com",
+    "spencersonline.com",
+)
+
+#: Digital-only download / streaming stores. No physical product ever ships
+#: from these, so a title/artist match here can never satisfy a "buyable
+#: physical copy" intent regardless of format wording in the snippet.
+#: (Bandcamp/Spotify/Deezer/Tidal/Pandora/Apple Music already live in the
+#: main blacklist above — this tuple covers the DJ/electronic-focused
+#: digital retailers that would otherwise slip through.)
+DIGITAL_MUSIC_HOST_SUBSTRINGS: tuple[str, ...] = (
+    "beatport.com",
+    "junodownload.com",
+    "traxsource.com",
+    "7digital.com",
+    "qobuz.com",
+    "hdtracks.com",
+    "napster.com",
+    "anghami.com",
+    "boomplay.com",
+    "audiomack.com",
+)
+
+#: Concert/event ticketing platforms — never sell physical albums, but
+#: frequently outrank shops for "{artist} {country}" style queries.
+EVENT_TICKETING_HOST_SUBSTRINGS: tuple[str, ...] = (
+    "ticketmaster.",
+    "eventbrite.",
+    "livenation.com",
+    "seetickets.",
+    "bandsintown.com",
+    "viagogo.",
+    "stubhub.com",
 )
 
 #: News-portal / general media substrings — substring match anywhere in the
@@ -213,6 +276,36 @@ EDITORIAL_PATH_SUBSTRINGS: tuple[str, ...] = (
     "/tags/",
     "/forum/",
     "/community/",
+)
+
+#: Path fragments that mean "band merch / apparel / event ticket", NOT a
+#: buyable album. Unlike ``EDITORIAL_PATH_SUBSTRINGS`` (soft score demotion),
+#: these are HARD-rejected for every host — including whitelisted shops —
+#: because a legitimate record store's own ``/merch/`` or ``/apparel/``
+#: category page is still not a physical album listing. See
+#: :func:`app.domains.engine.search.prefilter.filter.prefilter_tavily_results`.
+MERCH_PATH_SUBSTRINGS: tuple[str, ...] = (
+    "/merch",
+    "/merchandise",
+    "/apparel",
+    "/clothing",
+    "/t-shirt",
+    "/t-shirts",
+    "/tshirt",
+    "/tshirts",
+    "/hoodie",
+    "/hoodies",
+    "/posters/",
+    "/sticker",
+    "/stickers",
+    "/patches",
+    "/enamel-pin",
+    "/tote-bag",
+    "/phone-case",
+    "/giftshop",
+    "/gift-shop",
+    "/tickets/",
+    "/ticket/",
 )
 
 WWW_PREFIX_RE = re.compile(r"^www\.", re.IGNORECASE)
