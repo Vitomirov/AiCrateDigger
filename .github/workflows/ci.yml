@@ -85,5 +85,8 @@ jobs:
             # Restart the application without shutting down the entire system
             docker compose -f docker-compose.prod.yml up --build -d
 
+            Run ETL pipeline on live production data inside the backend container
+            docker compose -f docker-compose.prod.yml exec -T backend python -m app.domains.analytics.etl
+
             # Clean up old unused Docker build images to prevent disk fill
             docker image prune -f
